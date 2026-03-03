@@ -1,0 +1,142 @@
+data:
+  box_scale: 1.0
+  cameras:
+  - 0
+  - 1
+  drive: 2013_05_28_drive_0000_sync
+  eval: true
+  extent: 15
+  filter_colmap: false
+  images: images
+  point_cloud_path: ../combineColmapVelodyne/output/combined_point_cloud.ply
+  selected_frames:
+  - 250
+  - 490
+  shuffle: true
+  split_test: 8
+  split_train: 1
+  type: KITTI360
+  use_colmap: false
+  use_colmap_pose: false
+  use_mono_depth: false
+  use_mono_normal: false
+  use_semantic: false
+  white_background: false
+data_device: cuda
+debug: false
+eval:
+  eval_test: true
+  eval_train: false
+  quiet: false
+  skip_test: false
+  skip_train: false
+exp_name: kitti360_drive_0000
+gpus:
+- 0
+ip: 127.0.0.1
+loaded_iter: -1
+mode: train
+model:
+  color_correction:
+    mode: image
+    use_mlp: false
+    use_sky: false
+  gaussian:
+    flip_prob: 0.5
+    fourier_dim: 5
+    fourier_scale: 1.0
+    semantic_mode: logits
+    sh_degree: 2
+  nsg:
+    include_bkgd: true
+    include_obj: false
+    include_sky: true
+    opt_track: false
+  pose_correction:
+    mode: image
+  sky:
+    resolution: 1024
+    white_background: true
+  use_color_correction: false
+  use_pose_correction: false
+model_path: /home/lyuk4/GitHub/MyGaussianSplatting/Gaussians/output/kitti360_exp/kitti360_drive_0000
+optim:
+  densification_interval: 100
+  densify_from_iter: 500
+  densify_grad_abs_bkgd: true
+  densify_grad_abs_obj: false
+  densify_grad_threshold: 0.0002
+  densify_grad_threshold_bkgd: 0.0006
+  densify_until_iter: 15000
+  feature_lr: 0.0025
+  lambda_color_correction: 0.0
+  lambda_depth_lidar: 0.1
+  lambda_depth_mono: 0.0
+  lambda_dssim: 0.2
+  lambda_l1: 1.0
+  lambda_normal_mono: 0.0
+  lambda_opacity_sparse: 0.0
+  lambda_pose_correction: 0.0
+  lambda_reg: 0.0
+  lambda_scale_flatten: 0.0
+  lambda_semantic: 0.0
+  lambda_sky: 0.05
+  lambda_sky_scale:
+  - 1
+  - 1
+  max_screen_size: 20
+  min_opacity: 0.005
+  opacity_lr: 0.05
+  opacity_reset_interval: 3000
+  percent_big_ws: 0.1
+  percent_dense: 0.01
+  position_lr_delay_mult: 0.01
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  position_lr_max_steps: 30000
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+  semantic_lr: 0.001
+point_cloud_dir: /home/lyuk4/GitHub/MyGaussianSplatting/Gaussians/output/kitti360_exp/kitti360_drive_0000/point_cloud
+port: 6009
+record_dir: /home/lyuk4/GitHub/MyGaussianSplatting/Gaussians/output/record/kitti360_exp/kitti360_drive_0000
+render:
+  compute_cov3D_python: false
+  concat_cameras: []
+  convert_SHs_python: false
+  coord: world
+  debug: false
+  fps: 24
+  render_normal: false
+  save_image: true
+  save_video: true
+  scaling_modifier: 1.0
+resolution: -1
+resolution_scales:
+- 1
+resume: true
+source_path: /home/lyuk4/GitHub/MyGaussianSplatting/data/kitti360
+task: kitti360_exp
+to_cuda: false
+train:
+  checkpoint_iterations:
+  - 100000
+  - 200000
+  - 300000
+  debug_from: -1
+  detect_anomaly: false
+  importance_sampling: false
+  iterations: 300000
+  quiet: false
+  save_iterations:
+  - 300000
+  start_checkpoint: null
+  test_iterations:
+  - 100000
+  - 200000
+  - 300000
+trained_model_dir: /home/lyuk4/GitHub/MyGaussianSplatting/Gaussians/output/kitti360_exp/kitti360_drive_0000/trained_model
+viewer:
+  frame_id: 0
+workspace: /home/lyuk4/GitHub/MyGaussianSplatting/Gaussians
+

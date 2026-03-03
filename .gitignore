@@ -1,0 +1,8 @@
+*.ply
+*.db
+*.mp4
+*.log
+*.pth
+*.0
+data/
+**/output/

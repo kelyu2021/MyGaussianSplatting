@@ -1,0 +1,75 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  KITTI-360  –  Drive 0000  Gaussian Splatting Config
+#  Adapted from street_gaussians waymo_train_002.yaml
+# ═══════════════════════════════════════════════════════════════════════════
+
+task: kitti360_exp
+source_path: ../data/kitti360                   # relative to Gaussians/
+exp_name: kitti360_drive_0000
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  type: KITTI360
+  white_background: false
+  split_test: 8                                # every 8th frame → test set
+  split_train: 1
+  selected_frames: [250, 490]                  # inclusive frame range
+  cameras: [0, 1]                              # 0 = image_00 (left), 1 = image_01 (right)
+  extent: 15
+  use_colmap: false
+  drive: "2013_05_28_drive_0000_sync"
+  point_cloud_path: ../combineColmapVelodyne/output/combined_point_cloud.ply
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model:
+  gaussian:
+    sh_degree: 2
+    fourier_dim: 5
+    fourier_scale: 1.0
+    flip_prob: 0.5
+  nsg:
+    include_bkgd: true
+    include_obj: false                         # no dynamic-object tracking for KITTI-360
+    include_sky: true
+    opt_track: false
+
+# ── Training ──────────────────────────────────────────────────────────────
+train:
+  iterations: 300000
+  test_iterations: [10000, 20000, 30000, 50000, 75000, 100000]
+  save_iterations: [100000]
+  checkpoint_iterations: [30000, 60000, 100000]
+
+# ── Optimisation ──────────────────────────────────────────────────────────
+optim:
+  densification_interval: 100
+  densify_from_iter: 500
+  densify_grad_threshold_bkgd: 0.0006
+  densify_grad_abs_bkgd: true
+  densify_grad_threshold: 0.0002
+  densify_until_iter: 15000
+  feature_lr: 0.0025
+  max_screen_size: 20
+  min_opacity: 0.005
+  opacity_lr: 0.05
+  opacity_reset_interval: 3000
+  percent_big_ws: 0.1
+  percent_dense: 0.01
+  position_lr_delay_mult: 0.01
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  position_lr_max_steps: 30000
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+
+  lambda_l1: 1.0
+  lambda_dssim: 0.2
+  lambda_sky: 0.05
+  lambda_sky_scale: [1, 1]                     # per camera [cam0, cam1]
+  lambda_reg: 0.0                              # disabled (no object tracking)
+  lambda_depth_lidar: 0.1
+  lambda_color_correction: 0.0
+
+# ── Render ────────────────────────────────────────────────────────────────
+render:
+  fps: 24

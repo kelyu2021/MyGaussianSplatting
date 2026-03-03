@@ -1,0 +1,35 @@
+# ── Core ──────────────────────────────────────────────────────────────────
+torch>=2.0
+torchvision
+
+# ── Config & CLI ──────────────────────────────────────────────────────────
+yacs
+pyyaml
+
+# ── Numerics / geometry ──────────────────────────────────────────────────
+numpy
+scipy
+plyfile
+
+# ── Image / video ─────────────────────────────────────────────────────────
+opencv-python
+Pillow
+imageio
+imageio-ffmpeg
+matplotlib
+
+# ── Training & logging ────────────────────────────────────────────────────
+tqdm
+tensorboard
+
+# ── Sky cubemap (optional – needed for include_sky=true) ──────────────────
+# nvdiffrast          # install from: pip install git+https://github.com/NVlabs/nvdiffrast
+
+# ── Optional ──────────────────────────────────────────────────────────────
+# roma               # only needed for actor tracking (unused in KITTI-360)
+# bidict             # only needed for actor tracking (unused in KITTI-360)
+# lpips              # only needed for evaluation metrics
+
+# ── CUDA submodules (install separately) ──────────────────────────────────
+# diff-gaussian-rasterization   →  pip install submodules/diff-gaussian-rasterization
+# simple-knn                    →  pip install submodules/simple-knn

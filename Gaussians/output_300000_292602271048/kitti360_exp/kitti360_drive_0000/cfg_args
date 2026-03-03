@@ -1,0 +1,1 @@
+Namespace(sh_degree=2, white_background=False, source_path='/home/lyuk4/GitHub/MyGaussianSplatting/data/kitti360', model_path='/home/lyuk4/GitHub/MyGaussianSplatting/Gaussians/output/kitti360_exp/kitti360_drive_0000')

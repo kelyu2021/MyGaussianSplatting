@@ -1,0 +1,1 @@
+python scripts/generateColmapPointCloud.py --data_dir data/kitti360 --colmap_exe "C:\ProgramFiles\colmap-x64-windows-cuda\bin\colmap.exe"
