@@ -66,6 +66,10 @@ def main() -> None:
         "--max_image_size", type=int, default=1024,
         help="Maximum image size for patch match stereo",
     )
+    parser.add_argument(
+        "--gpu_index", type=str, default="0,1",
+        help="Comma-separated GPU indices for patch match stereo (default: 0,1)",
+    )
     args = parser.parse_args()
 
     sparse_ws = Path(args.sparse_dir).resolve()
@@ -87,6 +91,7 @@ def main() -> None:
     print(f"Images:           {images_dir}")
     print(f"Dense output:     {dense_dir}")
     print(f"Max image size:   {args.max_image_size}")
+    print(f"GPU index:        {args.gpu_index}")
     print()
 
     # ── 1. Image undistorter ──────────────────────────────────────────
@@ -108,6 +113,7 @@ def main() -> None:
         "--workspace_format", "COLMAP",
         "--PatchMatchStereo.geom_consistency", "true",
         "--PatchMatchStereo.max_image_size", str(args.max_image_size),
+        "--PatchMatchStereo.gpu_index", args.gpu_index,
     ], desc="Patch match stereo (GPU)")
 
     # ── 3. Stereo fusion ─────────────────────────────────────────────

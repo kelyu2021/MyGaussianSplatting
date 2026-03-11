@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
+from tqdm import tqdm
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -88,7 +90,7 @@ def equirect_to_perspective(
     u = np.arange(face_size, dtype=np.float64) - face_size / 2.0 + 0.5
     v = np.arange(face_size, dtype=np.float64) - face_size / 2.0 + 0.5
     uu, vv = np.meshgrid(u, v)
-    rays = np.stack([uu, vv, np.full_like(uu, f)], axis=-1)  # (H, W, 3)
+    rays = np.stack([uu, -vv, np.full_like(uu, f)], axis=-1)  # (H, W, 3)
 
     # Rotate rays to the world frame
     R = _rotation_matrix(yaw, pitch)
@@ -122,8 +124,15 @@ def extract_frames(video_path: Path, output_dir: Path, fps: float) -> list[Path]
     """Extract frames from a video at a given FPS using OpenCV.
 
     Returns list of saved frame paths, sorted.
+    If frames already exist in output_dir, skip extraction.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = sorted(output_dir.glob("frame_*.png"))
+    if existing:
+        print(f"[extract] Found {len(existing)} existing frames in {output_dir}, skipping extraction")
+        return existing
+
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -135,17 +144,20 @@ def extract_frames(video_path: Path, output_dir: Path, fps: float) -> list[Path]
     print(f"[extract] Video FPS={src_fps:.2f}, total frames={total}, "
           f"extracting every {interval} frames (≈{fps} FPS)")
 
+    expected = total // interval
     saved: list[Path] = []
     idx = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if idx % interval == 0:
-            p = output_dir / f"frame_{idx:06d}.png"
-            cv2.imwrite(str(p), frame)
-            saved.append(p)
-        idx += 1
+    with tqdm(total=expected, desc="Extracting frames", unit="frame") as pbar:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % interval == 0:
+                p = output_dir / f"frame_{idx:06d}.png"
+                cv2.imwrite(str(p), frame)
+                saved.append(p)
+                pbar.update(1)
+            idx += 1
     cap.release()
     print(f"[extract] Saved {len(saved)} frames to {output_dir}")
     return sorted(saved)
@@ -171,19 +183,23 @@ def generate_cubemap_faces(
     images_dir.mkdir(parents=True, exist_ok=True)
     focal = face_size / (2.0 * np.tan(np.radians(fov_deg) / 2.0))
 
+    existing = sorted(images_dir.glob("frame_*_*.png"))
+    if existing:
+        image_names = [p.name for p in existing]
+        print(f"[cubemap] Found {len(image_names)} existing cubemap images, skipping generation")
+        return image_names, focal
+
     image_names: list[str] = []
-    for i, fp in enumerate(frame_paths):
+    for fp in tqdm(frame_paths, desc="Generating cubemap faces", unit="frame"):
         equirect = cv2.imread(str(fp))
         if equirect is None:
-            print(f"[cubemap] WARNING: cannot read {fp}, skipping")
+            tqdm.write(f"[cubemap] WARNING: cannot read {fp}, skipping")
             continue
         for face_name, (yaw, pitch) in CUBEMAP_FACES.items():
             persp = equirect_to_perspective(equirect, face_size, fov_deg, yaw, pitch)
             name = f"{fp.stem}_{face_name}.png"
             cv2.imwrite(str(images_dir / name), persp)
             image_names.append(name)
-        if (i + 1) % 5 == 0 or i == len(frame_paths) - 1:
-            print(f"[cubemap] Processed {i + 1}/{len(frame_paths)} frames")
 
     print(f"[cubemap] Generated {len(image_names)} perspective images "
           f"(face_size={face_size}, focal={focal:.1f})")
@@ -211,6 +227,7 @@ def run_colmap_pipeline(
     images_dir: Path,
     face_size: int,
     focal: float,
+    gpu_index: int = 4,
 ) -> Path:
     """Run the COLMAP sparse reconstruction pipeline.
 
@@ -220,6 +237,14 @@ def run_colmap_pipeline(
     """
     db_path = workspace / "database.db"
     sparse_dir = workspace / "sparse"
+
+    # Clean up previous COLMAP state to avoid corrupted re-runs
+    if db_path.exists():
+        print(f"[COLMAP] Removing old database: {db_path}")
+        db_path.unlink()
+    if sparse_dir.exists():
+        print(f"[COLMAP] Removing old sparse dir: {sparse_dir}")
+        shutil.rmtree(sparse_dir)
     sparse_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. Feature extraction ─────────────────────────────────────────
@@ -230,16 +255,17 @@ def run_colmap_pipeline(
         "--ImageReader.camera_model", "PINHOLE",
         "--ImageReader.single_camera", "1",
         "--ImageReader.camera_params", f"{focal},{focal},{face_size/2},{face_size/2}",
-        "--SiftExtraction.use_gpu", "0",
-        "--SiftExtraction.max_num_features", "8192",
+        "--SiftExtraction.use_gpu", "1",
+        "--SiftExtraction.gpu_index", str(gpu_index),
+        "--SiftExtraction.max_num_features", "4096",
     ], desc="Feature extraction (SIFT)")
 
     # ── 2. Exhaustive matching ─────────────────────────────────────────
-    #   (matches all image pairs — better for 360° cubemap faces)
     run_cmd([
         "colmap", "exhaustive_matcher",
         "--database_path", str(db_path),
-        "--SiftMatching.use_gpu", "0",
+        "--SiftMatching.use_gpu", "1",
+        "--SiftMatching.gpu_index", str(gpu_index),
     ], desc="Exhaustive matching")
 
     # ── 3. Sparse reconstruction (mapper) ─────────────────────────────
@@ -303,6 +329,10 @@ def main() -> None:
         "--fov", type=float, default=90.0,
         help="Field of view for perspective faces in degrees",
     )
+    parser.add_argument(
+        "--gpu", type=int, default=4,
+        help="GPU index for COLMAP SIFT extraction/matching",
+    )
     args = parser.parse_args()
 
     video_path = Path(args.video).resolve()
@@ -348,7 +378,7 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("STEP 3-6: COLMAP sparse reconstruction pipeline")
     print("=" * 60)
-    ply_path = run_colmap_pipeline(colmap_ws, images_dir, args.face_size, focal)
+    ply_path = run_colmap_pipeline(colmap_ws, images_dir, args.face_size, focal, args.gpu)
 
     print("\n" + "=" * 60)
     print("DONE!")

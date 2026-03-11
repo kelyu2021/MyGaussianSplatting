@@ -1,0 +1,76 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  GoPro 360  –  Gaussian Splatting Config
+#
+#  Run from gopro360/ directory:
+#    cd MyGaussianSplatting/gopro360
+#    python train.py --cfg_file configs/gopro360.yaml
+# ═══════════════════════════════════════════════════════════════════════════
+
+task: gopro360_exp
+source_path: output                                # relative to gopro360/ (cwd)
+exp_name: gopro360_10s
+gpus: [4]                                          # use free GPU (0-3 occupied by VLLM)
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  type: GOPRO360
+  white_background: false
+  split_test: 8                                    # every 8th image → test set
+  split_train: 1
+  extent: 15
+  point_cloud_path: colmap/output/dense/fused.ply
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model:
+  gaussian:
+    sh_degree: 3
+    fourier_dim: 5
+    fourier_scale: 1.0
+    flip_prob: 0.5
+  nsg:
+    include_bkgd: true
+    include_obj: false                             # no dynamic objects
+    include_sky: false                             # disable sky (no sky masks available)
+    opt_track: false
+
+# ── Training ──────────────────────────────────────────────────────────────
+train:
+  epochs: 180                                      # 180 epochs × 168 cameras = 30,240 iters
+  iterations: 30000                                # fallback if epochs is 0 or absent
+  test_iterations: [5000, 10000, 15000, 20000, 30000]
+  save_iterations: [30000]
+  checkpoint_iterations: [10000, 20000, 30000]
+
+# ── Optimisation ──────────────────────────────────────────────────────────
+optim:
+  densification_interval: 100
+  densify_from_iter: 500
+  densify_grad_threshold_bkgd: 0.0002
+  densify_grad_abs_bkgd: false
+  densify_grad_threshold: 0.0002
+  densify_until_iter: 15000
+  feature_lr: 0.0025
+  max_screen_size: 20
+  min_opacity: 0.005
+  opacity_lr: 0.05
+  opacity_reset_interval: 3000
+  percent_big_ws: 0.1
+  percent_dense: 0.01
+  position_lr_delay_mult: 0.01
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  position_lr_max_steps: 30000
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+
+  lambda_l1: 1.0
+  lambda_dssim: 0.2
+  lambda_sky: 0.0                                  # no sky masks for GoPro
+  lambda_sky_scale: []
+  lambda_reg: 0.0
+  lambda_depth_lidar: 0.0                          # no LiDAR depth
+  lambda_color_correction: 0.0
+
+# ── Render ────────────────────────────────────────────────────────────────
+render:
+  fps: 24
