@@ -23,3 +23,4 @@ data/
 *.ini
 **/*discard*/
 **/*discard*
+gopro360/colmap/output_v1
