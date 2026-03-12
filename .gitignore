@@ -8,3 +8,16 @@ data/
 **/output/
 *.bin
 *.vis
+**/__pycache__/
+**/submodules/
+**/checkpoints/
+**/logs/
+**/results/
+**/cache/
+**/tmp/
+**/temp/
+**/debug/
+**/debug_*/
+**/debug_*/**
+**/debug_*/**/*
+*.ini
