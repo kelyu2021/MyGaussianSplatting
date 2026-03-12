@@ -262,7 +262,7 @@ def run_colmap_pipeline(
 
     # ── 2. Exhaustive matching ─────────────────────────────────────────
     run_cmd([
-        "colmap", "exhaustive_matcher",
+        "colmap", "sequential_matcher",
         "--database_path", str(db_path),
         "--SiftMatching.use_gpu", "1",
         "--SiftMatching.gpu_index", str(gpu_index),

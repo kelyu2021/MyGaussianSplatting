@@ -21,3 +21,5 @@ data/
 **/debug_*/**
 **/debug_*/**/*
 *.ini
+**/*discard*/
+**/*discard*
