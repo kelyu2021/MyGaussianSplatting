@@ -39,6 +39,7 @@ class GoPro360Dataset:
             split_test=int(cfg.data.get("split_test", 8)),
             mode=cfg.mode,
             workspace=cfg.workspace,
+            mask_dir=cfg.data.get("mask_dir", ""),
         )
 
         # ── Save input PLY & cameras.json (mirrors Dataset behaviour) ─

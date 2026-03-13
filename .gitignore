@@ -5,7 +5,7 @@
 *.pth
 *.0
 data/
-**/output/
+**/*output*/
 *.bin
 *.vis
 **/__pycache__/

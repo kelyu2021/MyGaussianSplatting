@@ -77,6 +77,7 @@ def readGoPro360SceneInfo(
     split_test: int = 8,
     mode: str = "train",
     workspace: str = "",
+    mask_dir: str = "",
     **_kwargs,
 ) -> SceneInfo:
     """Read GoPro 360 COLMAP data and return a ``SceneInfo``.
@@ -194,6 +195,12 @@ def readGoPro360SceneInfo(
 
             image = Image.open(img_path)
             guidance: dict = {}
+
+            # Load mask (sky + roof) if available
+            if mask_dir:
+                mask_path = Path(workspace) / mask_dir / colmap_img.name if workspace else src / mask_dir / colmap_img.name
+                if mask_path.exists():
+                    guidance["mask"] = Image.open(str(mask_path)).convert("L")
 
             cam_info = CameraInfo(
                 uid=uid,

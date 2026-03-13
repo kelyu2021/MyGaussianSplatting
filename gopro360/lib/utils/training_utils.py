@@ -238,9 +238,23 @@ def training_report(
                     if "mask" in vp.guidance
                     else torch.ones_like(gt[0]).bool())
             mask = mask.cuda(non_blocking=True) if not mask.is_cuda else mask
+
+            # ── Save test images to disk ──────────────────────────────
+            save_dir = os.path.join(
+                cfg.model_path, "test_images",
+                f"iteration_{iteration}", vc["split"],
+            )
+            os.makedirs(save_dir, exist_ok=True)
+            name = vp.image_name
+            save_img_torch(img, os.path.join(save_dir, f"{name}_render.png"))
+            save_img_torch(gt,  os.path.join(save_dir, f"{name}_gt.png"))
+            # mask is [H,W] bool → expand to 3-channel float for saving
+            mask_vis = mask.float().unsqueeze(0).expand(3, -1, -1)
+            save_img_torch(mask_vis, os.path.join(save_dir, f"{name}_mask.png"))
+
             l1_tot   += l1_loss(img, gt, mask).mean().double()
             psnr_tot += psnr(img, gt, mask).mean().double()
-            ssim_tot += ssim(img, gt).mean().double()
+            ssim_tot += ssim(img, gt, mask=mask).mean().double()
 
             # LPIPS (perceptual distance)
             if LPIPS_AVAILABLE and _LPIPS_FN is not None:

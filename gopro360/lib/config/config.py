@@ -140,6 +140,7 @@ cfg.data.cameras = [0, 1]
 cfg.data.extent = 15
 cfg.data.drive = '2013_05_28_drive_0000_sync'
 cfg.data.point_cloud_path = ''
+cfg.data.mask_dir = ''
 cfg.data.use_semantic = False
 cfg.data.use_mono_depth = False
 cfg.data.use_mono_normal = False
