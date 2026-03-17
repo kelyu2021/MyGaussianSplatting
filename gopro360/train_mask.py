@@ -182,6 +182,44 @@ def training():
             + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=mask))
         )
 
+        # ── SH higher-order regularisation ────────────────────────────
+        lambda_sh = getattr(optim_args, "lambda_sh_reg", 1e-3)
+        if lambda_sh > 0:
+            sh_rest = gaussians.background._features_rest
+            sh_reg = lambda_sh * (sh_rest ** 2).mean()
+            scalar_dict["sh_reg_loss"] = sh_reg.item()
+            loss += sh_reg
+
+        # ── Sky opacity loss: acc should be 0 where mask is 0 (sky) ──
+        lambda_sky_acc = getattr(optim_args, "lambda_sky_acc", 1e-2)
+        if lambda_sky_acc > 0 and mask is not None:
+            sky_acc_loss = lambda_sky_acc * (acc * (1 - mask)).mean()
+            scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
+            loss += sky_acc_loss
+
+        # ── Depth ranking (monotonicity) loss ─────────────────────────
+        lambda_depth_rank = getattr(optim_args, "lambda_depth_rank", 1e-2)
+        if lambda_depth_rank > 0 and "lidar_depth" in cam.guidance:
+            gt_depth = cam.guidance["lidar_depth"]
+            gt_depth = gt_depth.cuda(non_blocking=True) if not gt_depth.is_cuda else gt_depth
+            # valid = non-sky & non-zero GT depth
+            valid = (gt_depth > 0)
+            if mask is not None:
+                valid = valid & (mask > 0.5)
+            valid_idx = valid.flatten().nonzero(as_tuple=False).squeeze(-1)
+            n_pairs = min(1024, len(valid_idx) // 2)
+            if n_pairs > 0:
+                perm = torch.randperm(len(valid_idx), device=valid_idx.device)[:n_pairs * 2]
+                idx = valid_idx[perm].view(2, n_pairs)
+                gt_flat = gt_depth.flatten()
+                pred_flat = depth.flatten()
+                gt_diff = gt_flat[idx[0]] - gt_flat[idx[1]]
+                pred_diff = pred_flat[idx[0]] - pred_flat[idx[1]]
+                # hinge: penalise when predicted ordering disagrees with GT
+                depth_rank_loss = lambda_depth_rank * torch.relu(-gt_diff * pred_diff).mean()
+                scalar_dict["depth_rank_loss"] = depth_rank_loss.item()
+                loss += depth_rank_loss
+
         # ── Colour-correction regularisation ──────────────────────────
         lambda_cc = getattr(optim_args, "lambda_color_correction", 0.0)
         if lambda_cc > 0 and getattr(gaussians, "use_color_correction", False):

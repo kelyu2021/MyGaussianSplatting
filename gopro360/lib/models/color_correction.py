@@ -10,6 +10,11 @@ from lib.utils.general_utils import get_expon_lr_func, matrix_to_axis_angle
 
 
 class ColorCorrection(nn.Module):
+    """Per-image or per-sensor affine colour transform applied in 2D image space
+    after rasterization. Corrects photometric inconsistencies (exposure, white
+    balance, gain) between frames or cameras — not related to SH coefficients
+    or any 3D scene property."""
+
     def __init__(self, metadata):
         super().__init__()
         self.identity_matrix = torch.eye(4).float().cuda()[:3]  # [3, 4]
@@ -133,9 +138,13 @@ class ColorCorrection(nn.Module):
         return image
 
     def regularization_loss(self, camera: Camera):
+        """L1 penalty pushing both affine transforms toward identity, i.e.
+        encouraging minimal color correction so the Gaussian model explains
+        appearance rather than per-frame color warping."""
         affine_trans = self.get_affine_trans(camera, use_sky=False)
         affine_trans_sky = self.get_affine_trans(camera, use_sky=True)
         
-        loss = torch.abs(affine_trans - self.identity_matrix) + torch.abs(affine_trans_sky - self.identity_matrix)
+        loss = torch.abs(affine_trans - self.identity_matrix) \
+            + torch.abs(affine_trans_sky - self.identity_matrix)
         loss = loss.mean()
         return loss
