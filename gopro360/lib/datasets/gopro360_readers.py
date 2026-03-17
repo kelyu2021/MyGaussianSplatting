@@ -78,6 +78,7 @@ def readGoPro360SceneInfo(
     mode: str = "train",
     workspace: str = "",
     mask_dir: str = "",
+    depth_dir: str = "",
     **_kwargs,
 ) -> SceneInfo:
     """Read GoPro 360 COLMAP data and return a ``SceneInfo``.
@@ -201,6 +202,13 @@ def readGoPro360SceneInfo(
                 mask_path = Path(workspace) / mask_dir / colmap_img.name if workspace else src / mask_dir / colmap_img.name
                 if mask_path.exists():
                     guidance["mask"] = Image.open(str(mask_path)).convert("L")
+
+            # Load Depth Anything V2 depth map (.npy) if available
+            if depth_dir:
+                depth_name = Path(colmap_img.name).stem + ".npy"
+                depth_path = Path(workspace) / depth_dir / depth_name if workspace else src / depth_dir / depth_name
+                if depth_path.exists():
+                    guidance["lidar_depth"] = np.load(str(depth_path))
 
             cam_info = CameraInfo(
                 uid=uid,

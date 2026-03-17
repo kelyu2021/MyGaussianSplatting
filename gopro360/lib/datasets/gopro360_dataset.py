@@ -40,6 +40,7 @@ class GoPro360Dataset:
             mode=cfg.mode,
             workspace=cfg.workspace,
             mask_dir=cfg.data.get("mask_dir", ""),
+            depth_dir=cfg.data.get("depth_dir", ""),
         )
 
         # ── Save input PLY & cameras.json (mirrors Dataset behaviour) ─

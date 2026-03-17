@@ -193,7 +193,7 @@ def training():
         # ── Sky opacity loss: acc should be 0 where mask is 0 (sky) ──
         lambda_sky_acc = getattr(optim_args, "lambda_sky_acc", 1e-2)
         if lambda_sky_acc > 0 and mask is not None:
-            sky_acc_loss = lambda_sky_acc * (acc * (1 - mask)).mean()
+            sky_acc_loss = lambda_sky_acc * (acc * (1 - mask.float())).mean()
             scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
             loss += sky_acc_loss
 

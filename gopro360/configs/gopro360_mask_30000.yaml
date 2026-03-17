@@ -3,13 +3,13 @@
 #
 #  Run from gopro360/ directory:
 #    cd MyGaussianSplatting/gopro360
-#    python train.py --cfg_file configs/gopro360.yaml
+#    python train.py --cfg_file configs/gopro360_mask.yaml
 # ═══════════════════════════════════════════════════════════════════════════
 
-task: gopro360_exp
+task: gopro360_exp_mask
 source_path: colmap/output                         # relative to gopro360/ (cwd)
-exp_name: gopro360_10s
-gpus: [4]                                          # use free GPU (0-3 occupied by VLLM)
+exp_name: gopro360_10s_mask
+gpus: [0,1]                                          # use free GPU (0-3 occupied by VLLM)
 
 # ── Data ──────────────────────────────────────────────────────────────────
 data:
@@ -18,7 +18,9 @@ data:
   split_test: 8                                    # every 8th image → test set
   split_train: 1
   extent: 15
-  point_cloud_path: colmap/output/dense/fused.ply
+  point_cloud_path: colmap/output/dense_mask_relaxed/fused.ply
+  mask_dir: colmap/output/masks_depth                # sky + roof masks (0=masked, 255=valid)
+  depth_dir: colmap/output/depth                     # Depth Anything V2 depth maps (.npy)
 
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
@@ -73,4 +75,4 @@ optim:
 
 # ── Render ────────────────────────────────────────────────────────────────
 render:
-  fps: 24
+  fps: 5

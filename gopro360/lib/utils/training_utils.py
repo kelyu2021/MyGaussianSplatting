@@ -248,8 +248,9 @@ def training_report(
             name = vp.image_name
             save_img_torch(img, os.path.join(save_dir, f"{name}_render.png"))
             save_img_torch(gt,  os.path.join(save_dir, f"{name}_gt.png"))
-            # mask is [H,W] bool → expand to 3-channel float for saving
-            mask_vis = mask.float().unsqueeze(0).expand(3, -1, -1)
+            # mask is [1,H,W] or [H,W] bool → expand to 3-channel float for saving
+            mask_f = mask.float().squeeze(0) if mask.dim() == 3 else mask.float()
+            mask_vis = mask_f.unsqueeze(0).expand(3, -1, -1)
             save_img_torch(mask_vis, os.path.join(save_dir, f"{name}_mask.png"))
 
             l1_tot   += l1_loss(img, gt, mask).mean().double()
