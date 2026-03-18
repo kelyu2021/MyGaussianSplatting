@@ -198,12 +198,20 @@ def training():
             loss += sky_acc_loss
 
         # ── Depth ranking (monotonicity) loss ─────────────────────────
-        lambda_depth_rank = getattr(optim_args, "lambda_depth_rank", 1e-2)
-        if lambda_depth_rank > 0 and "lidar_depth" in cam.guidance:
+        # Depth Anything V2 outputs disparity-like values (larger = closer),
+        # so we invert (1/d) to get a pseudo-depth with larger = farther,
+        # matching the Gaussian renderer's depth convention.
+        lambda_depth_rank = getattr(optim_args, "lambda_depth_rank", 1e-4)
+        depth_rank_warmup = getattr(optim_args, "depth_rank_warmup", 1000)
+        if (lambda_depth_rank > 0
+                and iteration > depth_rank_warmup
+                and "lidar_depth" in cam.guidance):
             gt_depth = cam.guidance["lidar_depth"]
             gt_depth = gt_depth.cuda(non_blocking=True) if not gt_depth.is_cuda else gt_depth
-            # valid = non-sky & non-zero GT depth
-            valid = (gt_depth > 0)
+            # Invert: DA V2 gives disparity (large = close) → 1/d = depth (large = far)
+            gt_depth = 1.0 / gt_depth.clamp(min=1e-3)
+            # valid = non-sky & finite GT depth
+            valid = torch.isfinite(gt_depth) & (gt_depth > 0)
             if mask is not None:
                 valid = valid & (mask > 0.5)
             valid_idx = valid.flatten().nonzero(as_tuple=False).squeeze(-1)
