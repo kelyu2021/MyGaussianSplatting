@@ -89,7 +89,7 @@ cfg.optim.lambda_reg = 0.0
 cfg.optim.lambda_depth_lidar = 0.0
 cfg.optim.lambda_depth_mono = 0.0
 cfg.optim.lambda_normal_mono = 0.0
-cfg.optim.lambda_color_correction = 0.0
+cfg.optim.lambda_color_correction = 0.001
 cfg.optim.lambda_pose_correction = 0.0
 cfg.optim.lambda_scale_flatten = 0.0
 cfg.optim.lambda_opacity_sparse = 0.0
@@ -113,7 +113,7 @@ cfg.model.sky = CN()
 cfg.model.sky.resolution = 1024
 cfg.model.sky.white_background = True
 
-cfg.model.use_color_correction = False
+cfg.model.use_color_correction = True
 cfg.model.color_correction = CN()
 cfg.model.color_correction.mode = 'image'
 cfg.model.color_correction.use_mlp = False

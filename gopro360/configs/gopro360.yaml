@@ -69,7 +69,7 @@ optim:
   lambda_sky_scale: []
   lambda_reg: 0.0
   lambda_depth_lidar: 0.0                          # no LiDAR depth
-  lambda_color_correction: 0.0
+  lambda_color_correction: 0.001
 
 # ── Render ────────────────────────────────────────────────────────────────
 render:

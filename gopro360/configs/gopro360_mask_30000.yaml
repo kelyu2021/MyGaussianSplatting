@@ -19,7 +19,7 @@ data:
   split_train: 1
   extent: 15
   point_cloud_path: colmap/output/dense_mask_relaxed/fused.ply
-  mask_dir: colmap/output/masks_depth                # sky + roof masks (0=masked, 255=valid)
+  mask_dir: colmap/output/masks_roof_depth_sky_mass13k                # sky + roof masks (0=masked, 255=valid)
   depth_dir: colmap/output/depth                     # Depth Anything V2 depth maps (.npy)
 
 # ── Model ─────────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ optim:
   lambda_sky_scale: []
   lambda_reg: 0.0
   lambda_depth_lidar: 0.0                          # no LiDAR depth
-  lambda_color_correction: 0.0
+  lambda_color_correction: 0.005
 
 # ── Render ────────────────────────────────────────────────────────────────
 render:
