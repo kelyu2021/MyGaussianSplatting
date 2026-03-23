@@ -80,6 +80,13 @@ cfg.optim.max_screen_size = 20
 cfg.optim.min_opacity = 0.005
 cfg.optim.percent_big_ws = 0.1
 
+cfg.optim.max_total_gaussians = 10000000
+cfg.optim.hole_seed_interval = 1000
+cfg.optim.hole_seed_until_iter = 50000
+cfg.optim.hole_max_seeds = 30000
+cfg.optim.prune_interval = 5000
+cfg.optim.prune_min_opacity = 0.005
+
 cfg.optim.lambda_l1 = 1.0
 cfg.optim.lambda_dssim = 0.2
 cfg.optim.lambda_sky = 0.0
@@ -89,7 +96,7 @@ cfg.optim.lambda_reg = 0.0
 cfg.optim.lambda_depth_lidar = 0.0
 cfg.optim.lambda_depth_mono = 0.0
 cfg.optim.lambda_normal_mono = 0.0
-cfg.optim.lambda_color_correction = 0.001
+cfg.optim.lambda_color_correction = 0.01
 cfg.optim.lambda_pose_correction = 0.0
 cfg.optim.lambda_scale_flatten = 0.0
 cfg.optim.lambda_opacity_sparse = 0.0
