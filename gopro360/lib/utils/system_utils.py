@@ -22,6 +22,26 @@ def mkdir_p(folder_path):
         else:
             raise
 
-def searchForMaxIteration(folder):
-    saved_iters = [int(fname.split('.')[0].split("_")[-1]) for fname in os.listdir(folder)]
-    return max(saved_iters)
+def searchForMaxCheckpoint(folder):
+    """Find the latest checkpoint number, supporting both epoch_ and iteration_ prefixes.
+
+    Returns (prefix, number) where prefix is 'epoch' or 'iteration'.
+    """
+    best_prefix, best_num = None, -1
+    for fname in os.listdir(folder):
+        name = fname.split('.')[0]  # strip extension
+        for prefix in ('epoch', 'iteration'):
+            if name.startswith(prefix + '_'):
+                try:
+                    num = int(name[len(prefix) + 1:])
+                    if num > best_num or (num == best_num and prefix == 'epoch'):
+                        best_prefix, best_num = prefix, num
+                except ValueError:
+                    pass
+    if best_prefix is None:
+        # Legacy fallback
+        saved = [int(fname.split('.')[0].split("_")[-1]) for fname in os.listdir(folder)]
+        return 'iteration', max(saved)
+    return best_prefix, best_num
+
+searchForMaxIteration = searchForMaxCheckpoint  # backward compat alias

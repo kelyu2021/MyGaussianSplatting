@@ -45,8 +45,8 @@ class MetricCSVLogger:
     """Append-only CSV logger for training losses and evaluation metrics.
 
     Creates two CSV files under ``cfg.model_path``:
-      - ``train_metrics.csv``  – per-iteration training scalars
-      - ``eval_metrics.csv``   – per-evaluation-iteration test/train-view metrics
+      - ``train_metrics.csv``  – per-step training scalars (epoch column)
+      - ``eval_metrics.csv``   – per-evaluation test/train-view metrics (epoch column)
 
     These files can be loaded by ``visualize_metrics.py`` or any plotting tool.
     """
@@ -64,9 +64,9 @@ class MetricCSVLogger:
 
     # -- Training scalars ---------------------------------------------------
 
-    def log_train(self, iteration: int, scalar_dict: dict, extras: dict | None = None):
+    def log_train(self, epoch: float, scalar_dict: dict, extras: dict | None = None):
         """Append one row of training scalars."""
-        row = {"iteration": iteration, **scalar_dict}
+        row = {"epoch": round(epoch, 4), **scalar_dict}
         if extras:
             row.update(extras)
 
@@ -85,11 +85,11 @@ class MetricCSVLogger:
 
     # -- Evaluation scalars -------------------------------------------------
 
-    def log_eval(self, iteration: int, split: str, l1: float, psnr_val: float,
+    def log_eval(self, epoch: float, split: str, l1: float, psnr_val: float,
                  ssim_val: float, n_points: int, lpips_val: float = 0.0):
         """Append one row of evaluation metrics."""
         row = {
-            "iteration": iteration,
+            "epoch": round(epoch, 4),
             "split": split,
             "l1_loss": l1,
             "psnr": psnr_val,
@@ -164,45 +164,26 @@ def prepare_output_and_logger():
 
 def training_report(
     tb_writer,
-    iteration: int,
-    scalar_stats: dict,
-    tensor_stats: dict,
-    testing_iterations: list,
     scene: Scene,
     renderer: StreetGaussianRenderer,
     csv_logger: MetricCSVLogger | None = None,
+    epoch: int | float = 0,
+    step: int = 0,
 ):
-    """Write scalars / histograms to TensorBoard and run test-set eval.
+    """Run full test-set evaluation and log results.
 
     Parameters
     ----------
     tb_writer : SummaryWriter | None
-    iteration : int
-    scalar_stats : dict
-        Scalar losses to log under ``train/``.
-    tensor_stats : dict
-        Tensor histograms to log under ``train/``.
-    testing_iterations : list[int]
-        Iterations at which to run full test-set evaluation.
     scene : Scene
     renderer : StreetGaussianRenderer
     csv_logger : MetricCSVLogger | None
         Optional CSV logger for offline plotting.
+    epoch : int | float
+        Current epoch.  Used for display, CSV logging, and folder naming.
+    step : int
+        Running optimiser step count (used as TensorBoard global_step).
     """
-    # ── Write training scalars every call ─────────────────────────────
-    if tb_writer:
-        try:
-            for k, v in scalar_stats.items():
-                tb_writer.add_scalar(f"train/{k}", v, iteration)
-            for k, v in tensor_stats.items():
-                tb_writer.add_histogram(f"train/{k}", v, iteration)
-        except Exception:
-            print("WARNING: Failed to write to TensorBoard")
-
-    if iteration not in testing_iterations:
-        return
-
-    # ── Full test-set evaluation ──────────────────────────────────────
     torch.cuda.empty_cache()
     n_points = scene.gaussians.get_xyz.shape[0]
 
@@ -229,10 +210,7 @@ def training_report(
             if tb_writer and vi < 5:
                 tag = f"{vc['name']}_{vp.image_name}"
                 tb_writer.add_images(f"{tag}/render", img[None],
-                                     global_step=iteration)
-                if iteration == testing_iterations[0]:
-                    tb_writer.add_images(f"{tag}/ground_truth", gt[None],
-                                         global_step=iteration)
+                                     global_step=step)
 
             mask = (vp.guidance["mask"]
                     if "mask" in vp.guidance
@@ -242,7 +220,7 @@ def training_report(
             # ── Save test images to disk ──────────────────────────────
             save_dir = os.path.join(
                 cfg.model_path, "test_images",
-                f"iteration_{iteration}", vc["split"],
+                f"epoch_{int(epoch)}", vc["split"],
             )
             os.makedirs(save_dir, exist_ok=True)
             name = vp.image_name
@@ -273,29 +251,29 @@ def training_report(
         avg_ssim = (ssim_tot / n).item()
         avg_lpips = lpips_tot / n if n > 0 else 0.0
 
-        print(f"\n[ITER {iteration}] {vc['name']}: "
+        print(f"\n[EPOCH {epoch}] {vc['name']}: "
               f"L1 {avg_l1:.5f}  PSNR {avg_psnr:.4f}  SSIM {avg_ssim:.4f}  "
               f"LPIPS {avg_lpips:.4f}")
         if tb_writer:
-            tb_writer.add_scalar(f"{vc['name']}/l1_loss", avg_l1,   iteration)
-            tb_writer.add_scalar(f"{vc['name']}/psnr",    avg_psnr, iteration)
-            tb_writer.add_scalar(f"{vc['name']}/ssim",    avg_ssim, iteration)
-            tb_writer.add_scalar(f"{vc['name']}/lpips",   avg_lpips, iteration)
+            tb_writer.add_scalar(f"{vc['name']}/l1_loss", avg_l1,   step)
+            tb_writer.add_scalar(f"{vc['name']}/psnr",    avg_psnr, step)
+            tb_writer.add_scalar(f"{vc['name']}/ssim",    avg_ssim, step)
+            tb_writer.add_scalar(f"{vc['name']}/lpips",   avg_lpips, step)
 
         if csv_logger:
-            csv_logger.log_eval(iteration, vc["split"], avg_l1, avg_psnr,
+            csv_logger.log_eval(float(epoch), vc["split"], avg_l1, avg_psnr,
                                 avg_ssim, n_points, avg_lpips)
 
     if tb_writer:
         tb_writer.add_histogram(
-            "test/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            "test/opacity_histogram", scene.gaussians.get_opacity, step)
         tb_writer.add_scalar(
-            "test/points_total", n_points, iteration)
+            "test/points_total", n_points, step)
     torch.cuda.empty_cache()
 
 
 def save_log_images(
-    iteration: int,
+    epoch: int,
     gt_image: torch.Tensor,
     image: torch.Tensor,
     depth: torch.Tensor,
@@ -324,4 +302,4 @@ def save_log_images(
 
     log_dir = os.path.join(cfg.model_path, "log_images")
     os.makedirs(log_dir, exist_ok=True)
-    save_img_torch(vis_img, os.path.join(log_dir, f"{iteration}.jpg"))
+    save_img_torch(vis_img, os.path.join(log_dir, f"epoch_{epoch}.jpg"))

@@ -37,32 +37,40 @@ model:
 
 # ── Training ──────────────────────────────────────────────────────────────
 train:
-  iterations: 300000                                # fallback if epochs is 0 or absent
-  test_iterations: [40000, 80000, 120000, 160000, 200000]
-  save_iterations: [200000]
-  checkpoint_iterations: [40000, 80000, 120000, 160000, 200000]
+  epochs: 1800                                     # ~1800 epochs × 168 cameras ≈ 302,400 iters
+  test_epochs: [240, 480, 720, 960, 1200, 1500, 1800]
+  save_epochs: [1800]
+  checkpoint_epochs: [360, 720, 1080, 1440, 1800]
 
 # ── Optimisation ──────────────────────────────────────────────────────────
 optim:
   densification_interval: 100
-  densify_from_iter: 500
+  densify_from_epoch: 3
   densify_grad_threshold_bkgd: 0.0002
   densify_grad_abs_bkgd: false
   densify_grad_threshold: 0.0002
-  densify_until_iter: 15000
+  densify_until_epoch: 90
   feature_lr: 0.0025
   max_screen_size: 20
   min_opacity: 0.005
   opacity_lr: 0.05
-  opacity_reset_interval: 3000
+  opacity_reset_epoch_interval: 18
   percent_big_ws: 0.1
   percent_dense: 0.01
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 0.00016
-  position_lr_max_steps: 30000
+  position_lr_max_epochs: 1350                     # 75% of training
   rotation_lr: 0.001
   scaling_lr: 0.005
+
+  # ── Gaussian count limits ──
+  max_total_gaussians: 5000000
+  hole_seed_epoch_interval: 6
+  hole_seed_until_epoch: 300
+  hole_max_seeds: 30000
+  prune_epoch_interval: 30
+  prune_min_opacity: 0.005
 
   lambda_l1: 1.0
   lambda_dssim: 0.2

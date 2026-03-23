@@ -14,10 +14,10 @@ python render.py --cfg_file configs/gopro360.yaml --mode trajectory
 
 # with mask
 cd gopro360
-nohup python train_mask.py --cfg_file configs/gopro360_mask_30000.yaml > train_mask.py.30000.log 2>&1 &
-nohup python train_mask.py --cfg_file configs/gopro360_mask_200000.yaml > train_mask.py.200000.log 2>&1 &
-nohup python train_mask.py --cfg_file configs/gopro360_mask_300000.yaml > train_mask.py.300000.log 2>&1 &
-nohup python train_mask.py --cfg_file configs/gopro360_mask_600000.yaml > train_mask.py.600000.log 2>&1 &
+nohup python train_mask.py --cfg_file configs/gopro360_mask_180.yaml > train_mask.py.180.log 2>&1 &
+nohup python train_mask.py --cfg_file configs/gopro360_mask_1200.yaml > train_mask.py.1200.log 2>&1 &
+nohup python train_mask.py --cfg_file configs/gopro360_mask_1800.yaml > train_mask.py.1800.log 2>&1 &
+nohup python train_mask.py --cfg_file configs/gopro360_mask_3600.yaml > train_mask.py.3600.log 2>&1 &
 
 python render.py --cfg_file configs/gopro360_mask.yaml --mode trajectory
 

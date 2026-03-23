@@ -9,7 +9,7 @@ from lib.datasets.dataset import Dataset
 from lib.models.gaussian_model import GaussianModel
 from lib.models.street_gaussian_model import StreetGaussianModel
 from lib.config import cfg
-from lib.utils.system_utils import searchForMaxIteration
+from lib.utils.system_utils import searchForMaxCheckpoint
 
 
 class Scene:
@@ -37,23 +37,30 @@ class Scene:
         else:
             assert os.path.exists(cfg.point_cloud_dir)
             if cfg.loaded_iter == -1:
-                self.loaded_iter = searchForMaxIteration(cfg.point_cloud_dir)
+                self.loaded_prefix, self.loaded_iter = searchForMaxCheckpoint(
+                    cfg.point_cloud_dir)
             else:
                 self.loaded_iter = cfg.loaded_iter
+                # Detect prefix from existing files
+                epoch_path = os.path.join(
+                    cfg.trained_model_dir,
+                    f"epoch_{self.loaded_iter}.pth")
+                self.loaded_prefix = (
+                    'epoch' if os.path.exists(epoch_path) else 'iteration')
 
-            print(f"Loading checkpoint at iteration {self.loaded_iter}")
+            print(f"Loading checkpoint at {self.loaded_prefix} {self.loaded_iter}")
             ckpt_path = os.path.join(
                 cfg.trained_model_dir,
-                f"iteration_{self.loaded_iter}.pth",
+                f"{self.loaded_prefix}_{self.loaded_iter}.pth",
             )
             assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}"
             state_dict = torch.load(ckpt_path, weights_only=False)
             self.gaussians.load_state_dict(state_dict=state_dict)
 
-    def save(self, iteration):
+    def save(self, num, prefix="iteration"):
         pc_path = os.path.join(
             cfg.point_cloud_dir,
-            f"iteration_{iteration}",
+            f"{prefix}_{num}",
             "point_cloud.ply",
         )
         self.gaussians.save_ply(pc_path)

@@ -35,31 +35,30 @@ model:
 
 # ── Training ──────────────────────────────────────────────────────────────
 train:
-  epochs: 180                                      # 180 epochs × 168 cameras = 30,240 iters
-  iterations: 30000                                # fallback if epochs is 0 or absent
-  test_iterations: [5000, 10000, 15000, 20000, 30000]
-  save_iterations: [30000]
-  checkpoint_iterations: [10000, 20000, 30000]
+  epochs: 180                                      # 180 epochs × 168 cameras ≈ 30,240 iters
+  test_epochs: [30, 60, 90, 120, 180]
+  save_epochs: [180]
+  checkpoint_epochs: [60, 120, 180]
 
 # ── Optimisation ──────────────────────────────────────────────────────────
 optim:
   densification_interval: 100
-  densify_from_iter: 500
+  densify_from_epoch: 3
   densify_grad_threshold_bkgd: 0.0002
   densify_grad_abs_bkgd: false
   densify_grad_threshold: 0.0002
-  densify_until_iter: 15000
+  densify_until_epoch: 90
   feature_lr: 0.0025
   max_screen_size: 20
   min_opacity: 0.005
   opacity_lr: 0.05
-  opacity_reset_interval: 3000
+  opacity_reset_epoch_interval: 18
   percent_big_ws: 0.1
   percent_dense: 0.01
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 0.00016
-  position_lr_max_steps: 30000
+  position_lr_max_epochs: 135                      # 75% of training
   rotation_lr: 0.001
   scaling_lr: 0.005
 

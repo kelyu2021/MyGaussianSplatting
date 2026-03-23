@@ -16,18 +16,18 @@ Usage
 Outputs
 -------
     evaluate mode:
-        {model_path}/train/ours_{iter}/{name}_rgb.png
-        {model_path}/train/ours_{iter}/{name}_gt.png
-        {model_path}/train/ours_{iter}/{name}_depth.png
-        {model_path}/train/ours_{iter}/{name}_diff.png
+        {model_path}/train/ours_{prefix}_{num}/{name}_rgb.png
+        {model_path}/train/ours_{prefix}_{num}/{name}_gt.png
+        {model_path}/train/ours_{prefix}_{num}/{name}_depth.png
+        {model_path}/train/ours_{prefix}_{num}/{name}_diff.png
         (same under test/)
 
     trajectory mode:
-        {model_path}/trajectory/ours_{iter}/color.mp4
-        {model_path}/trajectory/ours_{iter}/color_gt.mp4
-        {model_path}/trajectory/ours_{iter}/depth.mp4
-        {model_path}/trajectory/ours_{iter}/diff.mp4
-        {model_path}/trajectory/ours_{iter}/color_bkgd.mp4
+        {model_path}/trajectory/ours_{prefix}_{num}/color.mp4
+        {model_path}/trajectory/ours_{prefix}_{num}/color_gt.mp4
+        {model_path}/trajectory/ours_{prefix}_{num}/depth.mp4
+        {model_path}/trajectory/ours_{prefix}_{num}/diff.mp4
+        {model_path}/trajectory/ours_{prefix}_{num}/color_bkgd.mp4
 """
 
 from __future__ import annotations
@@ -162,9 +162,10 @@ def render_sets():
             splits.append(("test", scene.getTestCameras()))
 
         for split_name, cameras in splits:
+            _tag = f"{scene.loaded_prefix}_{scene.loaded_iter}"
             save_dir = os.path.join(
                 cfg.model_path, split_name,
-                f"ours_{scene.loaded_iter}",
+                f"ours_{_tag}",
             )
             os.makedirs(save_dir, exist_ok=True)
 
@@ -284,7 +285,7 @@ def render_trajectory():
 
         save_dir = os.path.join(
             cfg.model_path, 'trajectory',
-            f"ours_{scene.loaded_iter}",
+            f"ours_{scene.loaded_prefix}_{scene.loaded_iter}",
         )
         os.makedirs(save_dir, exist_ok=True)
 

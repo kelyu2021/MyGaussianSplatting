@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from random import randint, shuffle
+from random import shuffle
 
 # Reduce CUDA memory fragmentation
 os.environ.setdefault(
@@ -48,7 +48,7 @@ from lib.utils.loss_utils import l1_loss, psnr, ssim                    # noqa: 
 from lib.utils.general_utils import safe_state                          # noqa: E402
 from lib.utils.cfg_utils import save_cfg                                # noqa: E402
 from lib.utils.camera_utils import Camera                               # noqa: E402
-from lib.utils.system_utils import searchForMaxIteration                # noqa: E402
+from lib.utils.system_utils import searchForMaxCheckpoint               # noqa: E402
 from lib.models.street_gaussian_renderer import StreetGaussianRenderer  # noqa: E402
 from lib.models.street_gaussian_model import StreetGaussianModel        # noqa: E402
 from lib.models.scene import Scene                                      # noqa: E402
@@ -196,6 +196,11 @@ def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
         # Use median depth of boundary Gaussians (robust to outliers)
         road_depth = bd_depths.median()
 
+        # Compute road-surface y from boundary Gaussians (for clamping)
+        bd_xyz = xyz[bd_global_idx]   # (B, 3)
+        road_y_median = bd_xyz[:, 1].median()
+        road_y_std = bd_xyz[:, 1].std().clamp(min=0.1)
+
         # ── Sample pixels inside the roof mask ────────────────────────
         roof_pixels = roof.nonzero(as_tuple=False)  # (M, 2) — (v, u)
         if len(roof_pixels) > seeds_per_cam:
@@ -213,8 +218,16 @@ def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
         # camera coords → world coords:  X_world = R_c2w @ X_cam - R_c2w @ t_w2c
         world_coords = (R_c2w @ cam_coords.T).T - (R_c2w @ t_w2c).unsqueeze(0)
 
+        # ── Clamp y to road surface ───────────────────────────────────
+        # The roof hole should contain road-level points.  Boundary
+        # Gaussians sit at the road edge, so their median y is the best
+        # reference.  Allow ±2 std to accommodate slight slopes.
+        y_lo = road_y_median - 2.0 * road_y_std
+        y_hi = road_y_median + 2.0 * road_y_std
+        world_coords[:, 1] = world_coords[:, 1].clamp(y_lo, y_hi)
+
         # ── Find nearest boundary Gaussian for each seed (donor) ─────
-        bd_xyz = xyz[bd_global_idx]   # (B, 3)
+        # bd_xyz already computed above for y-clamping
         dists  = torch.cdist(world_coords, bd_xyz)   # (S, B)
         _, nn  = dists.min(dim=1)                     # (S,)
         donors = bd_global_idx[nn]                    # global index
@@ -272,7 +285,6 @@ def _forward_loss_backward_secondary(
     cam: Camera,
     gaussians: StreetGaussianModel,
     optim_args,
-    iteration: int,
     roof_mask_dir: str,
 ):
     """Render + loss + backward on a secondary GPU.
@@ -424,18 +436,14 @@ def _forward_loss_backward_secondary(
 def training():
     """Main training loop for GoPro 360 Gaussian Splatting.
 
-    If ``cfg.train.epochs`` is set, the loop is **epoch-based**: each epoch
-    iterates through every training camera exactly once (shuffled).  Otherwise
-    the legacy iteration-based loop with random sampling is used.
-
-    All densification / LR-schedule thresholds still use the global iteration
-    counter so existing configs remain compatible.
+    The loop is **epoch-based**: each epoch iterates through every training
+    camera exactly once (shuffled).  Epoch-based config values are used
+    directly — no conversion to iterations.
     """
     training_args = cfg.train
     optim_args    = cfg.optim
     data_args     = cfg.data
 
-    start_iter = 0
     tb_writer  = prepare_output_and_logger()
     csv_logger = MetricCSVLogger(cfg.model_path)
 
@@ -443,24 +451,63 @@ def training():
     dataset   = GoPro360Dataset()
     gaussians = StreetGaussianModel(dataset.scene_info.metadata)
     scene     = Scene(gaussians=gaussians, dataset=dataset)
+
+    # ── Epoch-based schedule (used directly, no conversion) ─────────
+    train_cameras = scene.getTrainCameras()
+    cams_per_epoch = len(train_cameras)
+    num_epochs = training_args.epochs
+
+    test_epochs_set       = set(training_args.test_epochs)
+    save_epochs_set       = set(training_args.save_epochs)
+    checkpoint_epochs_set = set(training_args.checkpoint_epochs)
+
+    densify_from_epoch      = optim_args.densify_from_epoch
+    densify_until_epoch     = optim_args.densify_until_epoch
+    opacity_reset_interval  = optim_args.opacity_reset_epoch_interval
+    hole_seed_interval      = optim_args.hole_seed_epoch_interval
+    hole_seed_until_epoch   = optim_args.hole_seed_until_epoch
+    prune_interval_epochs   = optim_args.prune_epoch_interval
+
+    # position_lr_max_steps must be in iterations for the LR scheduler
+    position_lr_max_steps = optim_args.position_lr_max_epochs * cams_per_epoch
+    cfg.optim.position_lr_max_steps = position_lr_max_steps
+
+    print(f"Epoch-based training: {num_epochs} epochs × "
+          f"{cams_per_epoch} cameras/epoch")
+    print(f"  densify:    epoch {densify_from_epoch}–{densify_until_epoch}")
+    print(f"  opacity reset every {opacity_reset_interval} epochs")
+    print(f"  position LR decay over {optim_args.position_lr_max_epochs} epochs")
+    print(f"  hole seeding every {hole_seed_interval}"
+          f" epochs until epoch {hole_seed_until_epoch}")
+    print(f"  pruning every {prune_interval_epochs} epochs")
+    print(f"  test/eval at epochs {sorted(test_epochs_set)}")
+    print(f"  checkpoints at epochs {sorted(checkpoint_epochs_set)}")
+    print(f"  save PLY at epochs {sorted(save_epochs_set)}")
+
+    # ── Now set up optimiser (uses position_lr_max_steps from cfg) ────
     gaussians.training_setup()
 
     # ── Resume from checkpoint ────────────────────────────────────────
+    start_epoch = 0
+    step = 0               # running step counter (for LR scheduler only)
     try:
-        loaded_iter = (searchForMaxIteration(cfg.trained_model_dir)
-                       if cfg.loaded_iter == -1 else cfg.loaded_iter)
+        loaded_prefix, loaded_num = (
+            searchForMaxCheckpoint(cfg.trained_model_dir)
+            if cfg.loaded_iter == -1
+            else ('epoch', cfg.loaded_iter))
         ckpt_path = os.path.join(
-            cfg.trained_model_dir, f"iteration_{loaded_iter}.pth"
+            cfg.trained_model_dir, f"{loaded_prefix}_{loaded_num}.pth"
         )
         state = torch.load(ckpt_path)
-        start_iter = state["iter"]
-        print(f"Resuming from {ckpt_path}  (iter {start_iter})")
+        start_epoch = state.get("epoch", loaded_num)
+        step = state.get("step", state.get("iter", start_epoch * cams_per_epoch))
+        print(f"Resuming from {ckpt_path}  (epoch {start_epoch})")
         gaussians.load_state_dict(state)
     except Exception:
         pass
 
-    print(f"Starting from iteration {start_iter}")
-    save_cfg(cfg, cfg.model_path, epoch=start_iter)
+    print(f"Starting from epoch {start_epoch}")
+    save_cfg(cfg, cfg.model_path, epoch=start_epoch)
 
     renderer = StreetGaussianRenderer()
 
@@ -471,28 +518,8 @@ def training():
     ema_psnr = 0.0
     ema_ssim = 0.0
 
-    # ── Determine loop bounds ─────────────────────────────────────────
-    train_cameras = scene.getTrainCameras()
-    cams_per_epoch = len(train_cameras)
-
-    num_epochs  = training_args.get("epochs", 0)
-    use_epochs  = num_epochs > 0
-
-    if use_epochs:
-        total_iters = num_epochs * cams_per_epoch
-        print(f"Epoch-based training: {num_epochs} epochs × "
-              f"{cams_per_epoch} cameras = {total_iters} iterations")
-    else:
-        total_iters = training_args.iterations
-        print(f"Iteration-based training: {total_iters} iterations "
-              f"({total_iters / cams_per_epoch:.1f} epochs)")
-
-    progress = tqdm(range(start_iter, total_iters), initial=start_iter,
-                    total=total_iters)
-    start_iter += 1
-
-    # Build initial shuffled stack (will be refilled each epoch)
-    viewpoint_stack: list = []
+    progress = tqdm(range(start_epoch, num_epochs), initial=start_epoch,
+                    total=num_epochs, desc="Epochs", unit="ep")
 
     # ── Multi-GPU setup ───────────────────────────────────────────────
     _n_gpus = torch.cuda.device_count()
@@ -501,260 +528,236 @@ def training():
         _roof_mask_dir = getattr(
             data_args, 'roof_mask_dir', 'colmap/output/masks_roof_depth')
         print(f"Multi-GPU training: {_n_gpus} GPUs, "
-              f"{_n_gpus} views per iteration (gradient accumulation)")
+              f"{_n_gpus} views per step (gradient accumulation)")
     else:
         _executor = None
 
-    for iteration in range(start_iter, total_iters + 1):
+    # ══════════════════════════════════════════════════════════════════
+    #  EPOCH LOOP
+    # ══════════════════════════════════════════════════════════════════
+    for epoch in range(start_epoch + 1, num_epochs + 1):
 
-        iter_start.record()
-        gaussians.update_learning_rate(iteration)
+        viewpoint_stack = list(train_cameras)
+        shuffle(viewpoint_stack)
 
-        if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
+        # ── Camera loop (one step per camera) ─────────────────────
+        for cam_idx, cam in enumerate(viewpoint_stack):
+            step += 1
 
-        # ── Get training camera (epoch-aware) ─────────────────────────
-        if not viewpoint_stack:
-            viewpoint_stack = list(train_cameras)
-            shuffle(viewpoint_stack)
+            iter_start.record()
+            gaussians.update_learning_rate(step)
 
-        if use_epochs:
-            cam: Camera = viewpoint_stack.pop(0)      # sequential within epoch
-        else:
-            cam: Camera = viewpoint_stack.pop(         # random (legacy)
-                randint(0, len(viewpoint_stack) - 1)
+            # ── Launch secondary GPU work (multi-GPU) ─────────────────
+            secondary_futures = []
+            if _executor is not None:
+                for gpu_id in range(1, _n_gpus):
+                    # Pick next camera from this epoch's stack (or random)
+                    sec_idx = (cam_idx + gpu_id) % len(viewpoint_stack) \
+                              if viewpoint_stack else 0
+                    sec_cam = (viewpoint_stack[sec_idx]
+                               if viewpoint_stack
+                               else train_cameras[gpu_id % len(train_cameras)])
+                    secondary_futures.append(_executor.submit(
+                        _forward_loss_backward_secondary,
+                        f'cuda:{gpu_id}', sec_cam, gaussians,
+                        optim_args, _roof_mask_dir))
+
+            gt_image = cam.original_image
+            gt_image = gt_image.cuda(non_blocking=True) if not gt_image.is_cuda else gt_image
+
+            # ── Mask (sky + roof) ─────────────────────────────────────
+            if "mask" in cam.guidance:
+                mask = cam.guidance["mask"]
+                mask = mask.cuda(non_blocking=True) if not mask.is_cuda else mask
+            else:
+                mask = None
+
+            # ── Roof-only mask (for separating sky from roof) ─────────
+            roof_mask_dir = getattr(
+                data_args, 'roof_mask_dir', 'colmap/output/masks_roof_depth')
+            roof_mask_2d = _load_roof_mask(
+                cam.image_name + ".png", roof_mask_dir)
+            if roof_mask_2d is None:
+                roof_mask_2d = _load_roof_mask(cam.image_name, roof_mask_dir)
+            if roof_mask_2d is not None:
+                roof_mask_2d = roof_mask_2d.to(gt_image.device)
+                rH, rW = roof_mask_2d.shape
+                iH, iW = gt_image.shape[1], gt_image.shape[2]
+                if rH != iH or rW != iW:
+                    roof_mask_2d = F.interpolate(
+                        roof_mask_2d.float().unsqueeze(0).unsqueeze(0),
+                        size=(iH, iW), mode='nearest'
+                    )[0, 0] > 0.5
+            else:
+                roof_mask_2d = None
+
+            # ── Render ────────────────────────────────────────────────
+            render_pkg = renderer.render(cam, gaussians)
+            image = render_pkg["rgb"]
+            acc   = render_pkg["acc"]
+            depth = render_pkg["depth"]
+            viewspace_pts = render_pkg["viewspace_points"]
+            visibility    = render_pkg["visibility_filter"]
+            radii         = render_pkg["radii"]
+
+            scalar_dict: dict = {}
+
+            # ── RGB loss (L1 + D-SSIM) ───────────────────────────────
+            lambda_l1 = getattr(optim_args, "lambda_l1", 1.0)
+            Ll1 = l1_loss(image, gt_image, mask)
+            scalar_dict["l1_loss"] = Ll1.item()
+
+            loss = (
+                (1.0 - optim_args.lambda_dssim) * lambda_l1 * Ll1
+                + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=mask))
             )
 
-        # ── Launch secondary GPU work (multi-GPU) ─────────────────
-        secondary_futures = []
-        if _executor is not None:
-            for gpu_id in range(1, _n_gpus):
-                if not viewpoint_stack:
-                    viewpoint_stack = list(train_cameras)
-                    shuffle(viewpoint_stack)
-                if use_epochs:
-                    sec_cam = viewpoint_stack.pop(0)
+            # ── SH higher-order regularisation ────────────────────────
+            lambda_sh = getattr(optim_args, "lambda_sh_reg", 1e-3)
+            if lambda_sh > 0:
+                sh_rest = gaussians.background._features_rest
+                sh_reg = lambda_sh * (sh_rest ** 2).mean()
+                scalar_dict["sh_reg_loss"] = sh_reg.item()
+                loss += sh_reg
+
+            # ── Sky opacity loss: acc should be 0 where sky (NOT roof)
+            lambda_sky_acc = getattr(optim_args, "lambda_sky_acc", 1e-2)
+            if lambda_sky_acc > 0 and mask is not None:
+                if roof_mask_2d is not None:
+                    sky_only = (1 - mask.float()) * (1 - roof_mask_2d.float())
                 else:
-                    sec_cam = viewpoint_stack.pop(
-                        randint(0, len(viewpoint_stack) - 1))
-                secondary_futures.append(_executor.submit(
-                    _forward_loss_backward_secondary,
-                    f'cuda:{gpu_id}', sec_cam, gaussians,
-                    optim_args, iteration, _roof_mask_dir))
+                    sky_only = 1 - mask.float()
+                sky_acc_loss = lambda_sky_acc * (acc * sky_only).mean()
+                scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
+                loss += sky_acc_loss
 
-        gt_image = cam.original_image
-        gt_image = gt_image.cuda(non_blocking=True) if not gt_image.is_cuda else gt_image
+            # ── Colour-correction regularisation ──────────────────────
+            lambda_cc = getattr(optim_args, "lambda_color_correction", 0.0)
+            if lambda_cc > 0 and getattr(gaussians, "use_color_correction", False):
+                cc_loss = gaussians.color_correction.regularization_loss(cam)
+                scalar_dict["color_correction_reg_loss"] = cc_loss.item()
+                loss += lambda_cc * cc_loss
 
-        # ── Mask (sky + roof) ─────────────────────────────────────────
-        if "mask" in cam.guidance:
-            mask = cam.guidance["mask"]
-            mask = mask.cuda(non_blocking=True) if not mask.is_cuda else mask
-        else:
-            mask = None
+            scalar_dict["loss"] = loss.item()
 
-        # ── Roof-only mask (for separating sky from roof) ─────────────
-        roof_mask_dir = getattr(
-            data_args, 'roof_mask_dir', 'colmap/output/masks_roof_depth')
-        roof_mask_2d = _load_roof_mask(
-            cam.image_name + ".png", roof_mask_dir)
-        if roof_mask_2d is None:
-            roof_mask_2d = _load_roof_mask(cam.image_name, roof_mask_dir)
-        if roof_mask_2d is not None:
-            roof_mask_2d = roof_mask_2d.to(gt_image.device)  # (H, W) True=roof
-            # Resize to match training image if needed
-            rH, rW = roof_mask_2d.shape
-            iH, iW = gt_image.shape[1], gt_image.shape[2]
-            if rH != iH or rW != iW:
-                roof_mask_2d = F.interpolate(
-                    roof_mask_2d.float().unsqueeze(0).unsqueeze(0),
-                    size=(iH, iW), mode='nearest'
-                )[0, 0] > 0.5
-        else:
-            roof_mask_2d = None
+            # ── Compute SSIM for logging (detached) ──────────────────
+            with torch.no_grad():
+                ssim_val = ssim(image, gt_image, mask=mask).item()
+                scalar_dict["ssim"] = ssim_val
 
-        # ── Render ────────────────────────────────────────────────────
-        render_pkg = renderer.render(cam, gaussians)
-        image = render_pkg["rgb"]
-        acc   = render_pkg["acc"]
-        depth = render_pkg["depth"]
-        viewspace_pts = render_pkg["viewspace_points"]
-        visibility    = render_pkg["visibility_filter"]
-        radii         = render_pkg["radii"]
+            loss.backward()
 
-        scalar_dict: dict = {}
-
-        # ── RGB loss (L1 + D-SSIM) ───────────────────────────────────
-        lambda_l1 = getattr(optim_args, "lambda_l1", 1.0)
-        Ll1 = l1_loss(image, gt_image, mask)
-        scalar_dict["l1_loss"] = Ll1.item()
-
-        loss = (
-            (1.0 - optim_args.lambda_dssim) * lambda_l1 * Ll1
-            + optim_args.lambda_dssim * (1.0 - ssim(image, gt_image, mask=mask))
-        )
-
-        # ── SH higher-order regularisation ────────────────────────────
-        lambda_sh = getattr(optim_args, "lambda_sh_reg", 1e-3)
-        if lambda_sh > 0:
-            sh_rest = gaussians.background._features_rest
-            sh_reg = lambda_sh * (sh_rest ** 2).mean()
-            scalar_dict["sh_reg_loss"] = sh_reg.item()
-            loss += sh_reg
-
-        # ── Sky opacity loss: acc should be 0 where sky (NOT roof) ──
-        # The combined mask has mask=0 for both sky and roof.  We must
-        # NOT penalise accumulation in the roof region — that's where
-        # seeded road Gaussians live and need to keep their opacity.
-        lambda_sky_acc = getattr(optim_args, "lambda_sky_acc", 1e-2)
-        if lambda_sky_acc > 0 and mask is not None:
-            if roof_mask_2d is not None:
-                # sky-only = masked in combined mask AND not roof
-                sky_only = (1 - mask.float()) * (1 - roof_mask_2d.float())
-            else:
-                sky_only = 1 - mask.float()
-            sky_acc_loss = lambda_sky_acc * (acc * sky_only).mean()
-            scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
-            loss += sky_acc_loss
-
-        # ── Depth ranking (monotonicity) loss ─────────────────────────
-        # Depth Anything V2 outputs disparity-like values (larger = closer),
-        # so we invert (1/d) to get a pseudo-depth with larger = farther,
-        # matching the Gaussian renderer's depth convention.
-        # lambda_depth_rank = getattr(optim_args, "lambda_depth_rank", 1e-4)
-        # depth_rank_warmup = getattr(optim_args, "depth_rank_warmup", 1000)
-        # if (lambda_depth_rank > 0
-        #         and iteration > depth_rank_warmup
-        #         and "lidar_depth" in cam.guidance):
-        #     gt_depth = cam.guidance["lidar_depth"]
-        #     gt_depth = gt_depth.cuda(non_blocking=True) if not gt_depth.is_cuda else gt_depth
-        #     # Invert: DA V2 gives disparity (large = close) → 1/d = depth (large = far)
-        #     gt_depth = 1.0 / gt_depth.clamp(min=1e-3)
-        #     # valid = non-sky & finite GT depth
-        #     valid = torch.isfinite(gt_depth) & (gt_depth > 0)
-        #     if mask is not None:
-        #         valid = valid & (mask > 0.5)
-        #     valid_idx = valid.flatten().nonzero(as_tuple=False).squeeze(-1)
-        #     n_pairs = min(1024, len(valid_idx) // 2)
-        #     if n_pairs > 0:
-        #         perm = torch.randperm(len(valid_idx), device=valid_idx.device)[:n_pairs * 2]
-        #         idx = valid_idx[perm].view(2, n_pairs)
-        #         gt_flat = gt_depth.flatten()
-        #         pred_flat = depth.flatten()
-        #         gt_diff = gt_flat[idx[0]] - gt_flat[idx[1]]
-        #         pred_diff = pred_flat[idx[0]] - pred_flat[idx[1]]
-        #         # hinge: penalise when predicted ordering disagrees with GT
-        #         depth_rank_loss = lambda_depth_rank * torch.relu(-gt_diff * pred_diff).mean()
-        #         scalar_dict["depth_rank_loss"] = depth_rank_loss.item()
-        #         loss += depth_rank_loss
-
-        # ── Colour-correction regularisation ──────────────────────────
-        lambda_cc = getattr(optim_args, "lambda_color_correction", 0.0)
-        if lambda_cc > 0 and getattr(gaussians, "use_color_correction", False):
-            cc_loss = gaussians.color_correction.regularization_loss(cam)
-            scalar_dict["color_correction_reg_loss"] = cc_loss.item()
-            loss += lambda_cc * cc_loss
-
-        scalar_dict["loss"] = loss.item()
-
-        # ── Compute SSIM for logging (detached) ──────────────────────
-        with torch.no_grad():
-            ssim_val = ssim(image, gt_image, mask=mask).item()
-            scalar_dict["ssim"] = ssim_val
-
-        loss.backward()
-
-        # ── Accumulate secondary GPU gradients (multi-GPU) ────────
-        if secondary_futures:
-            for future in secondary_futures:
-                sec_grads, _ = future.result()
+            # ── Accumulate secondary GPU gradients (multi-GPU) ────────
+            if secondary_futures:
+                for future in secondary_futures:
+                    sec_grads, _ = future.result()
+                    bg_model = gaussians.background
+                    for pname, grad in sec_grads.items():
+                        param = getattr(bg_model, pname)
+                        if param.grad is not None:
+                            param.grad.add_(grad)
                 bg_model = gaussians.background
-                for pname, grad in sec_grads.items():
+                for pname in _GAUSS_PARAM_NAMES:
                     param = getattr(bg_model, pname)
                     if param.grad is not None:
-                        param.grad.add_(grad)
-            bg_model = gaussians.background
-            for pname in _GAUSS_PARAM_NAMES:
-                param = getattr(bg_model, pname)
-                if param.grad is not None:
-                    param.grad.div_(_n_gpus)
+                        param.grad.div_(_n_gpus)
 
-        iter_end.record()
+            iter_end.record()
 
-        # ── Save log images (every 1 000 iterations) ─────────────────
-        if iteration % 1000 == 0:
-            save_log_images(iteration, gt_image, image, depth, acc)
+            # ── Book-keeping (no grad) ────────────────────────────────
+            with torch.no_grad():
+                tensor_dict: dict = {}
 
-        # ── Book-keeping (no grad) ───────────────────────────────────
+                cur_psnr = psnr(image, gt_image, mask).mean().float()
+                scalar_dict["psnr"] = cur_psnr.item()
+
+                epoch_frac = epoch - 1 + (cam_idx + 1) / cams_per_epoch
+
+                if cam_idx % 10 == 0:
+                    ema_loss = 0.4 * loss.item() + 0.6 * ema_loss
+                    ema_psnr = 0.4 * cur_psnr.item() + 0.6 * ema_psnr
+                    ema_ssim = 0.4 * ssim_val + 0.6 * ema_ssim
+
+                    progress.set_postfix({
+                        "Exp":   f"{cfg.task}-{cfg.exp_name}",
+                        "Loss":  f"{ema_loss:.7f}",
+                        "PSNR":  f"{ema_psnr:.4f}",
+                        "SSIM":  f"{ema_ssim:.4f}",
+                    })
+
+                # ── CSV logging (every 10 cameras) ───────────────────
+                if cam_idx % 10 == 0:
+                    csv_logger.log_train(epoch_frac, scalar_dict, {
+                        "ema_loss": ema_loss,
+                        "ema_psnr": ema_psnr,
+                        "ema_ssim": ema_ssim,
+                    })
+
+                # ── Adaptive density control ──────────────────────────
+                if epoch <= densify_until_epoch:
+                    gaussians.set_visibility(
+                        include_list=list(
+                            set(gaussians.model_name_id.keys()) - {"sky"}
+                        )
+                    )
+                    gaussians.set_max_radii2D(radii, visibility)
+                    gaussians.add_densification_stats(viewspace_pts, visibility)
+
+                    prune_big = epoch > opacity_reset_interval
+                    if (epoch > densify_from_epoch
+                            and cam_idx % optim_args.densification_interval == 0):
+                        s, t = gaussians.densify_and_prune(
+                            max_grad=optim_args.densify_grad_threshold,
+                            min_opacity=optim_args.min_opacity,
+                            prune_big_points=prune_big,
+                        )
+                        scalar_dict.update(s)
+                        tensor_dict.update(t)
+
+                if epoch <= densify_until_epoch:
+                    if (data_args.white_background
+                            and epoch == densify_from_epoch and cam_idx == 0):
+                        gaussians.reset_opacity()
+
+                # ── TensorBoard ───────────────────────────────────────
+                if tb_writer:
+                    try:
+                        for k, v in scalar_dict.items():
+                            tb_writer.add_scalar(f"train/{k}", v, step)
+                        for k, v in tensor_dict.items():
+                            tb_writer.add_histogram(f"train/{k}", v, step)
+                    except Exception:
+                        pass
+
+                # ── Optimiser step ────────────────────────────────────
+                gaussians.update_optimizer()
+
+        # ══════════════════════════════════════════════════════════════
+        #  END OF EPOCH — epoch-level actions
+        # ══════════════════════════════════════════════════════════════
         with torch.no_grad():
-            tensor_dict: dict = {}
-
-            cur_psnr = psnr(image, gt_image, mask).mean().float()
-            scalar_dict["psnr"] = cur_psnr.item()
-
-            if iteration % 10 == 0:
-                ema_loss = 0.4 * loss.item() + 0.6 * ema_loss
-                ema_psnr = 0.4 * cur_psnr.item() + 0.6 * ema_psnr
-                ema_ssim = 0.4 * ssim_val + 0.6 * ema_ssim
-
-                epoch_num = (iteration - 1) // cams_per_epoch + 1
-                progress.set_postfix({
-                    "Exp":   f"{cfg.task}-{cfg.exp_name}",
-                    "Epoch": f"{epoch_num}",
-                    "Loss":  f"{ema_loss:.7f}",
-                    "PSNR":  f"{ema_psnr:.4f}",
-                    "SSIM":  f"{ema_ssim:.4f}",
-                })
             progress.update(1)
 
-            # ── CSV logging (every 10 iterations) ─────────────────────
-            if iteration % 10 == 0:
-                csv_logger.log_train(iteration, scalar_dict, {
-                    "ema_loss": ema_loss,
-                    "ema_psnr": ema_psnr,
-                    "ema_ssim": ema_ssim,
-                })
+            # ── Save log images ───────────────────────────────────────
+            if epoch % 20 == 0:
+                save_log_images(epoch, gt_image, image, depth, acc)
 
             # ── Save PLY snapshot ─────────────────────────────────────
-            if iteration in training_args.save_iterations:
-                print(f"\n[ITER {iteration}] Saving Gaussians")
-                scene.save(iteration)
+            if epoch in save_epochs_set:
+                print(f"\n[EPOCH {epoch}] Saving Gaussians")
+                scene.save(epoch, prefix="epoch")
 
-            # ── Adaptive density control ──────────────────────────────
-            if iteration < optim_args.densify_until_iter:
-                gaussians.set_visibility(
-                    include_list=list(
-                        set(gaussians.model_name_id.keys()) - {"sky"}
-                    )
-                )
-                gaussians.set_max_radii2D(radii, visibility)
-                gaussians.add_densification_stats(viewspace_pts, visibility)
+            # ── Opacity reset ─────────────────────────────────────────
+            if (epoch <= densify_until_epoch
+                    and opacity_reset_interval > 0
+                    and epoch % opacity_reset_interval == 0):
+                gaussians.reset_opacity()
 
-                prune_big = iteration > optim_args.opacity_reset_interval
-                if (iteration > optim_args.densify_from_iter
-                        and iteration % optim_args.densification_interval == 0):
-                    s, t = gaussians.densify_and_prune(
-                        max_grad=optim_args.densify_grad_threshold,
-                        min_opacity=optim_args.min_opacity,
-                        prune_big_points=prune_big,
-                    )
-                    scalar_dict.update(s)
-                    tensor_dict.update(t)
-
-            if iteration < optim_args.densify_until_iter:
-                if iteration % optim_args.opacity_reset_interval == 0:
-                    gaussians.reset_opacity()
-                if (data_args.white_background
-                        and iteration == optim_args.densify_from_iter):
-                    gaussians.reset_opacity()
-
-            # ── Periodic low-opacity pruning (after densification) ─
-            # Reclaims memory from seeded Gaussians that didn't converge.
-            prune_interval = getattr(optim_args, 'prune_interval', 5000)
-            if (iteration > optim_args.densify_until_iter
-                    and prune_interval > 0
-                    and iteration % prune_interval == 0):
-                prune_min_op = getattr(
-                    optim_args, 'prune_min_opacity', 0.005)
+            # ── Periodic low-opacity pruning ──────────────────────────
+            if (epoch > densify_until_epoch
+                    and prune_interval_epochs > 0
+                    and epoch % prune_interval_epochs == 0):
+                prune_min_op = optim_args.prune_min_opacity
                 bg_model = gaussians.background
                 prune_mask = (
                     bg_model.get_opacity < prune_min_op
@@ -764,29 +767,19 @@ def training():
                     bg_model.prune_points(prune_mask)
                     torch.cuda.empty_cache()
                     n_after = bg_model._xyz.shape[0]
-                    print(f"\n[ITER {iteration}] Pruned "
+                    print(f"\n[EPOCH {epoch}] Pruned "
                           f"{n_before - n_after:,} low-opacity "
                           f"Gaussians (total: {n_after:,})")
 
             # ── Seed Gaussians in the roof-hole region ────────────────
-            # Runs independently of densify_until_iter so seeds keep
-            # being injected through the first half of training.
-            hole_seed_interval = getattr(
-                optim_args, 'hole_seed_interval', 1000)
-            hole_seed_until = getattr(
-                optim_args, 'hole_seed_until_iter',
-                min(50000,
-                    max(optim_args.densify_until_iter, total_iters // 4)))
-            just_reset_opacity = (
-                iteration < optim_args.densify_until_iter
-                and iteration % optim_args.opacity_reset_interval == 0
-            )
+            just_reset = (epoch <= densify_until_epoch
+                          and opacity_reset_interval > 0
+                          and epoch % opacity_reset_interval == 0)
             should_seed = (
                 hole_seed_interval > 0
-                and iteration >= 500
-                and iteration < hole_seed_until
-                and (iteration % hole_seed_interval == 0
-                     or just_reset_opacity)
+                and epoch >= densify_from_epoch
+                and epoch < hole_seed_until_epoch
+                and (epoch % hole_seed_interval == 0 or just_reset)
             )
             if should_seed:
                 roof_mask_dir = getattr(
@@ -794,44 +787,36 @@ def training():
                     'colmap/output/masks_roof_depth')
                 n_seeded = seed_hole_gaussians(
                     gaussians, train_cameras,
-                    max_seeds=getattr(
-                        optim_args, 'hole_max_seeds', 70000),
+                    max_seeds=optim_args.hole_max_seeds,
                     roof_mask_dir=roof_mask_dir,
-                    max_total_gaussians=getattr(
-                        optim_args, 'max_total_gaussians', 10_000_000),
+                    max_total_gaussians=optim_args.max_total_gaussians,
                 )
                 n_total = gaussians.background._xyz.shape[0]
                 if n_seeded > 0:
-                    scalar_dict["hole_seeds"] = n_seeded
-                    scalar_dict["total_gaussians"] = n_total
-                    print(f"\n[ITER {iteration}] Seeded "
+                    print(f"\n[EPOCH {epoch}] Seeded "
                           f"{n_seeded} Gaussians in roof hole "
                           f"(total: {n_total:,})")
                     torch.cuda.empty_cache()
 
-            # ── TensorBoard & evaluation ──────────────────────────────
-            training_report(
-                tb_writer, iteration,
-                scalar_dict, tensor_dict,
-                training_args.test_iterations,
-                scene, renderer,                csv_logger=csv_logger,            )
-
-            # ── Optimiser step ────────────────────────────────────────
-            if iteration < total_iters:
-                gaussians.update_optimizer()
+            # ── Test-set evaluation ───────────────────────────────────
+            if epoch in test_epochs_set:
+                training_report(
+                    tb_writer,
+                    scene, renderer,
+                    csv_logger=csv_logger,
+                    epoch=epoch,
+                    step=step,
+                )
 
             # ── Save checkpoint ───────────────────────────────────────
-            # Save at configured iterations AND at end of training
-            should_save = (iteration in training_args.checkpoint_iterations
-                           or iteration == total_iters)
-            if should_save:
-                print(f"\n[ITER {iteration}] Saving Checkpoint")
-                sd = gaussians.save_state_dict(
-                    is_final=(iteration == total_iters)
-                )
-                sd["iter"] = iteration
+            is_final = (epoch == num_epochs)
+            if epoch in checkpoint_epochs_set or is_final:
+                print(f"\n[EPOCH {epoch}] Saving Checkpoint")
+                sd = gaussians.save_state_dict(is_final=is_final)
+                sd["epoch"] = epoch
+                sd["step"] = step
                 ckpt_path = os.path.join(
-                    cfg.trained_model_dir, f"iteration_{iteration}.pth"
+                    cfg.trained_model_dir, f"epoch_{epoch}.pth"
                 )
                 torch.save(sd, ckpt_path)
 

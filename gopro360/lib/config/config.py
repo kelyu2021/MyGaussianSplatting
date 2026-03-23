@@ -46,14 +46,19 @@ cfg.eval.quiet = False
 cfg.train = CN()
 cfg.train.debug_from = -1
 cfg.train.detect_anomaly = False
-cfg.train.test_iterations = [7000, 30000]
-cfg.train.save_iterations = [7000, 30000]
-cfg.train.iterations = 30000
-cfg.train.epochs = 0
+cfg.train.epochs = 1200
 cfg.train.quiet = False
-cfg.train.checkpoint_iterations = [30000]
 cfg.train.start_checkpoint = None
 cfg.train.importance_sampling = False
+# Epoch-based schedule
+cfg.train.test_epochs = []
+cfg.train.save_epochs = []
+cfg.train.checkpoint_epochs = []
+# Legacy iteration keys (kept for train.py / train_without_mask.py compat)
+cfg.train.iterations = 30000
+cfg.train.test_iterations = []
+cfg.train.save_iterations = []
+cfg.train.checkpoint_iterations = []
 
 # ── Optim ─────────────────────────────────────────────────────────────────
 cfg.optim = CN()
@@ -69,9 +74,6 @@ cfg.optim.semantic_lr = 0.001           # ← added default
 
 cfg.optim.percent_dense = 0.01
 cfg.optim.densification_interval = 100
-cfg.optim.opacity_reset_interval = 3000
-cfg.optim.densify_from_iter = 500
-cfg.optim.densify_until_iter = 15000
 cfg.optim.densify_grad_threshold = 0.0002
 cfg.optim.densify_grad_threshold_bkgd = 0.0006
 cfg.optim.densify_grad_abs_bkgd = False
@@ -79,12 +81,24 @@ cfg.optim.densify_grad_abs_obj = False
 cfg.optim.max_screen_size = 20
 cfg.optim.min_opacity = 0.005
 cfg.optim.percent_big_ws = 0.1
-
-cfg.optim.max_total_gaussians = 10000000
+# Epoch-based optim schedule (converted to iters at runtime)
+cfg.optim.densify_from_epoch = 3
+cfg.optim.densify_until_epoch = 90
+cfg.optim.opacity_reset_epoch_interval = 18
+cfg.optim.position_lr_max_epochs = 900
+cfg.optim.hole_seed_epoch_interval = 6
+cfg.optim.hole_seed_until_epoch = 300
+cfg.optim.prune_epoch_interval = 30
+# Legacy iteration keys (kept for train.py / train_without_mask.py compat)
+cfg.optim.densify_from_iter = 500
+cfg.optim.densify_until_iter = 15000
+cfg.optim.opacity_reset_interval = 3000
 cfg.optim.hole_seed_interval = 1000
 cfg.optim.hole_seed_until_iter = 50000
-cfg.optim.hole_max_seeds = 30000
 cfg.optim.prune_interval = 5000
+
+cfg.optim.max_total_gaussians = 10000000
+cfg.optim.hole_max_seeds = 30000
 cfg.optim.prune_min_opacity = 0.005
 
 cfg.optim.lambda_l1 = 1.0

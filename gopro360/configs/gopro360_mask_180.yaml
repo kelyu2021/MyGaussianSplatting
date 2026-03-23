@@ -37,40 +37,40 @@ model:
 
 # ── Training ──────────────────────────────────────────────────────────────
 train:
-  iterations: 200000                                # fallback if epochs is 0 or absent
-  test_iterations: [40000, 80000, 120000, 160000, 200000]
-  save_iterations: [200000]
-  checkpoint_iterations: [40000, 80000, 120000, 160000, 200000]
+  epochs: 180                                      # 180 epochs × 168 cameras ≈ 30,240 iters
+  test_epochs: [30, 60, 90, 120, 180]
+  save_epochs: [180]
+  checkpoint_epochs: [60, 120, 180]
 
 # ── Optimisation ──────────────────────────────────────────────────────────
 optim:
-  densification_interval: 100
-  densify_from_iter: 500
-  densify_grad_threshold_bkgd: 0.0002
+  densification_interval: 50
+  densify_from_epoch: 3
+  densify_grad_threshold_bkgd: 0.0001
   densify_grad_abs_bkgd: false
-  densify_grad_threshold: 0.0002
-  densify_until_iter: 15000
+  densify_grad_threshold: 0.0001
+  densify_until_epoch: 90
   feature_lr: 0.0025
   max_screen_size: 20
   min_opacity: 0.005
   opacity_lr: 0.05
-  opacity_reset_interval: 3000
+  opacity_reset_epoch_interval: 18
   percent_big_ws: 0.1
   percent_dense: 0.01
   position_lr_delay_mult: 0.01
   position_lr_final: 1.6e-06
   position_lr_init: 0.00016
-  position_lr_max_steps: 150000
+  position_lr_max_epochs: 135                      # 75% of training
   rotation_lr: 0.001
   scaling_lr: 0.005
 
   # ── Gaussian count limits ──
-  max_total_gaussians: 5000000              # hard cap on total Gaussians (OOM prevention)
-  hole_seed_interval: 1000                   # seed every N iters
-  hole_seed_until_iter: 50000                # stop seeding after this iter
-  hole_max_seeds: 30000                      # max seeds per seeding round
-  prune_interval: 5000                       # prune low-opacity Gaussians every N iters after densify_until_iter
-  prune_min_opacity: 0.005                   # opacity threshold for post-densification pruning
+  max_total_gaussians: 5000000
+  hole_seed_epoch_interval: 6
+  hole_seed_until_epoch: 120
+  hole_max_seeds: 30000
+  prune_epoch_interval: 30
+  prune_min_opacity: 0.005
 
   lambda_l1: 1.0
   lambda_dssim: 0.2
@@ -78,7 +78,7 @@ optim:
   lambda_sky_scale: []
   lambda_reg: 0.0
   lambda_depth_lidar: 0.0                          # no LiDAR depth
-  lambda_color_correction: 0.01
+  lambda_color_correction: 0.02
 
 # ── Render ────────────────────────────────────────────────────────────────
 render:

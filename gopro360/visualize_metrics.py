@@ -14,11 +14,11 @@ Usage
 
 Generated plots
 ---------------
-  1. ``train_loss.png``        – total loss + L1 loss over iterations
-  2. ``train_psnr.png``        – training EMA PSNR over iterations
-  3. ``eval_metrics.png``      – test-set L1, PSNR, SSIM, LPIPS at eval checkpoints
+  1. ``train_loss.png``        – total loss + L1 loss over epochs
+  2. ``train_psnr.png``        – training EMA PSNR over epochs
+  3. ``eval_metrics.png``      – test-set L1, PSNR, SSIM, LPIPS at eval epochs
   4. ``eval_comparison.png``   – test vs train-view metrics side-by-side
-  5. ``points_over_time.png``  – number of Gaussian points at eval iterations
+  5. ``points_over_time.png``  – number of Gaussian points at eval epochs
   6. ``summary.png``           – combined 2x4 dashboard of all key curves
 
 If ``--save_dir`` is given the figures are saved there; otherwise they are
@@ -115,18 +115,18 @@ def plot_train_loss(train: dict, save_path: str | None = None):
     """Plot total loss and L1 loss curves."""
     _style()
     fig, ax = plt.subplots(figsize=(10, 5))
-    iters = train["iteration"]
+    epochs = train.get("epoch", train.get("iteration"))
 
     if "loss" in train:
-        ax.plot(iters, train["loss"], alpha=0.15, color="C0", linewidth=0.5)
-        ax.plot(iters, ema_smooth(train["loss"]), color="C0",
+        ax.plot(epochs, train["loss"], alpha=0.15, color="C0", linewidth=0.5)
+        ax.plot(epochs, ema_smooth(train["loss"]), color="C0",
                 linewidth=1.5, label="Total Loss (EMA)")
     if "l1_loss" in train:
-        ax.plot(iters, train["l1_loss"], alpha=0.15, color="C1", linewidth=0.5)
-        ax.plot(iters, ema_smooth(train["l1_loss"]), color="C1",
+        ax.plot(epochs, train["l1_loss"], alpha=0.15, color="C1", linewidth=0.5)
+        ax.plot(epochs, ema_smooth(train["l1_loss"]), color="C1",
                 linewidth=1.5, label="L1 Loss (EMA)")
 
-    ax.set_xlabel("Iteration")
+    ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title("Training Losses")
     ax.legend()
@@ -142,16 +142,16 @@ def plot_train_psnr(train: dict, save_path: str | None = None):
     """Plot training PSNR curve."""
     _style()
     fig, ax = plt.subplots(figsize=(10, 5))
-    iters = train["iteration"]
+    epochs = train.get("epoch", train.get("iteration"))
 
     if "ema_psnr" in train:
-        ax.plot(iters, train["ema_psnr"], color="C2", linewidth=1.5, label="EMA PSNR")
+        ax.plot(epochs, train["ema_psnr"], color="C2", linewidth=1.5, label="EMA PSNR")
     if "psnr" in train:
-        ax.plot(iters, train["psnr"], alpha=0.15, color="C2", linewidth=0.5)
-        ax.plot(iters, ema_smooth(train["psnr"]), color="C2",
+        ax.plot(epochs, train["psnr"], alpha=0.15, color="C2", linewidth=0.5)
+        ax.plot(epochs, ema_smooth(train["psnr"]), color="C2",
                 linewidth=1.5, label="PSNR (EMA)")
 
-    ax.set_xlabel("Iteration")
+    ax.set_xlabel("Epoch")
     ax.set_ylabel("PSNR (dB)")
     ax.set_title("Training PSNR")
     ax.legend()
@@ -164,7 +164,7 @@ def plot_train_psnr(train: dict, save_path: str | None = None):
 
 
 def plot_eval_metrics(evals: dict, save_path: str | None = None):
-    """Plot test-set L1, PSNR, SSIM, LPIPS at eval iterations."""
+    """Plot test-set L1, PSNR, SSIM, LPIPS at eval epochs."""
     _style()
     test = evals.get("test", {})
     if not test:
@@ -172,7 +172,7 @@ def plot_eval_metrics(evals: dict, save_path: str | None = None):
         return None
 
     fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
-    iters = test["iteration"]
+    epochs = test.get("epoch", test.get("iteration"))
 
     for ax, key, ylabel, color in zip(
         axes,
@@ -181,9 +181,9 @@ def plot_eval_metrics(evals: dict, save_path: str | None = None):
         ["C0", "C2", "C3", "C5"],
     ):
         if key in test:
-            ax.plot(iters, test[key], marker="o", color=color,
+            ax.plot(epochs, test[key], marker="o", color=color,
                     linewidth=2, markersize=6)
-            ax.set_xlabel("Iteration")
+            ax.set_xlabel("Epoch")
             ax.set_ylabel(ylabel)
             ax.set_title(f"Test {ylabel}")
             ax.xaxis.set_major_locator(MaxNLocator(integer=True))
@@ -209,9 +209,10 @@ def plot_eval_comparison(evals: dict, save_path: str | None = None):
         for split, style, color in [("test", "-o", "C0"), ("train", "--s", "C1")]:
             d = evals.get(split, {})
             if key in d:
-                ax.plot(d["iteration"], d[key], style, color=color,
+                epochs = d.get("epoch", d.get("iteration"))
+                ax.plot(epochs, d[key], style, color=color,
                         linewidth=1.5, markersize=5, label=f"{split} view")
-        ax.set_xlabel("Iteration")
+        ax.set_xlabel("Epoch")
         ax.set_ylabel(ylabel)
         ax.set_title(ylabel)
         ax.legend()
@@ -226,7 +227,7 @@ def plot_eval_comparison(evals: dict, save_path: str | None = None):
 
 
 def plot_points_over_time(evals: dict, save_path: str | None = None):
-    """Plot the number of Gaussian points at each eval iteration."""
+    """Plot the number of Gaussian points at each eval epoch."""
     _style()
     # Use test split (it has n_points logged)
     d = evals.get("test", evals.get("train", {}))
@@ -235,9 +236,10 @@ def plot_points_over_time(evals: dict, save_path: str | None = None):
         return None
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(d["iteration"], d["n_points"] / 1e6, marker="o",
+    epochs = d.get("epoch", d.get("iteration"))
+    ax.plot(epochs, d["n_points"] / 1e6, marker="o",
             color="C4", linewidth=2, markersize=6)
-    ax.set_xlabel("Iteration")
+    ax.set_xlabel("Epoch")
     ax.set_ylabel("Points (millions)")
     ax.set_title("Number of Gaussians Over Training")
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
@@ -251,8 +253,8 @@ def plot_points_over_time(evals: dict, save_path: str | None = None):
 def plot_summary_dashboard(train: dict, evals: dict, save_path: str | None = None):
     """Combined dashboard with all key curves."""
     _style()
-    iters_t = train.get("iteration", np.array([]))
-    has_train_data = len(iters_t) > 0 and ("loss" in train or "l1_loss" in train or "psnr" in train)
+    epochs_t = train.get("epoch", train.get("iteration", np.array([])))
+    has_train_data = len(epochs_t) > 0 and ("loss" in train or "l1_loss" in train or "psnr" in train)
 
     if has_train_data:
         # Full 2x4 layout when training data is available
@@ -261,32 +263,33 @@ def plot_summary_dashboard(train: dict, evals: dict, save_path: str | None = Non
         # (0,0) Total loss
         ax = axes[0, 0]
         if "loss" in train:
-            ax.plot(iters_t, train["loss"], alpha=0.12, color="C0", linewidth=0.5)
-            ax.plot(iters_t, ema_smooth(train["loss"]), color="C0", linewidth=1.5)
-        ax.set_title("Total Loss"); ax.set_xlabel("Iter"); ax.set_ylabel("Loss")
+            ax.plot(epochs_t, train["loss"], alpha=0.12, color="C0", linewidth=0.5)
+            ax.plot(epochs_t, ema_smooth(train["loss"]), color="C0", linewidth=1.5)
+        ax.set_title("Total Loss"); ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
 
         # (0,1) L1 loss
         ax = axes[0, 1]
         if "l1_loss" in train:
-            ax.plot(iters_t, train["l1_loss"], alpha=0.12, color="C1", linewidth=0.5)
-            ax.plot(iters_t, ema_smooth(train["l1_loss"]), color="C1", linewidth=1.5)
-        ax.set_title("L1 Loss"); ax.set_xlabel("Iter"); ax.set_ylabel("Loss")
+            ax.plot(epochs_t, train["l1_loss"], alpha=0.12, color="C1", linewidth=0.5)
+            ax.plot(epochs_t, ema_smooth(train["l1_loss"]), color="C1", linewidth=1.5)
+        ax.set_title("L1 Loss"); ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
 
         # (0,2) Training PSNR
         ax = axes[0, 2]
         if "ema_psnr" in train:
-            ax.plot(iters_t, train["ema_psnr"], color="C2", linewidth=1.5)
+            ax.plot(epochs_t, train["ema_psnr"], color="C2", linewidth=1.5)
         elif "psnr" in train:
-            ax.plot(iters_t, ema_smooth(train["psnr"]), color="C2", linewidth=1.5)
-        ax.set_title("Training PSNR"); ax.set_xlabel("Iter"); ax.set_ylabel("PSNR (dB)")
+            ax.plot(epochs_t, ema_smooth(train["psnr"]), color="C2", linewidth=1.5)
+        ax.set_title("Training PSNR"); ax.set_xlabel("Epoch"); ax.set_ylabel("PSNR (dB)")
 
         # (0,3) Number of points
         ax = axes[0, 3]
         d = evals.get("test", evals.get("train", {}))
         if "n_points" in d:
-            ax.plot(d["iteration"], d["n_points"] / 1e6, "-o",
+            ep = d.get("epoch", d.get("iteration"))
+            ax.plot(ep, d["n_points"] / 1e6, "-o",
                     color="C4", linewidth=2, markersize=5)
-        ax.set_title("Gaussian Points"); ax.set_xlabel("Iter"); ax.set_ylabel("M points")
+        ax.set_title("Gaussian Points"); ax.set_xlabel("Epoch"); ax.set_ylabel("M points")
 
         eval_axes = axes[1]
     else:
@@ -298,18 +301,20 @@ def plot_summary_dashboard(train: dict, evals: dict, save_path: str | None = Non
         for split, style, color in [("test", "-o", "C0"), ("train", "--s", "C1")]:
             d = evals.get(split, {})
             if "l1_loss" in d:
-                ax.plot(d["iteration"], d["l1_loss"], style, color=color,
+                ep = d.get("epoch", d.get("iteration"))
+                ax.plot(ep, d["l1_loss"], style, color=color,
                         linewidth=1.5, markersize=5, label=f"{split}")
-        ax.set_title("Eval L1 Loss"); ax.set_xlabel("Iter"); ax.set_ylabel("L1 Loss")
+        ax.set_title("Eval L1 Loss"); ax.set_xlabel("Epoch"); ax.set_ylabel("L1 Loss")
         ax.legend()
 
         # (0,1) Number of points
         ax = axes[0, 1]
         d = evals.get("test", evals.get("train", {}))
         if "n_points" in d:
-            ax.plot(d["iteration"], d["n_points"] / 1e6, "-o",
+            ep = d.get("epoch", d.get("iteration"))
+            ax.plot(ep, d["n_points"] / 1e6, "-o",
                     color="C4", linewidth=2, markersize=5)
-        ax.set_title("Gaussian Points"); ax.set_xlabel("Iter"); ax.set_ylabel("M points")
+        ax.set_title("Gaussian Points"); ax.set_xlabel("Epoch"); ax.set_ylabel("M points")
 
         # (0,2) empty
         axes[0, 2].axis("off")
@@ -321,27 +326,30 @@ def plot_summary_dashboard(train: dict, evals: dict, save_path: str | None = Non
     for split, style, color in [("test", "-o", "C0"), ("train", "--s", "C1")]:
         d = evals.get(split, {})
         if "psnr" in d:
-            ax.plot(d["iteration"], d["psnr"], style, color=color,
+            ep = d.get("epoch", d.get("iteration"))
+            ax.plot(ep, d["psnr"], style, color=color,
                     linewidth=1.5, markersize=5, label=f"{split}")
-    ax.set_title("Eval PSNR"); ax.set_xlabel("Iter"); ax.set_ylabel("PSNR (dB)")
+    ax.set_title("Eval PSNR"); ax.set_xlabel("Epoch"); ax.set_ylabel("PSNR (dB)")
     ax.legend()
 
     ax = eval_axes[1]
     for split, style, color in [("test", "-o", "C0"), ("train", "--s", "C1")]:
         d = evals.get(split, {})
         if "ssim" in d:
-            ax.plot(d["iteration"], d["ssim"], style, color=color,
+            ep = d.get("epoch", d.get("iteration"))
+            ax.plot(ep, d["ssim"], style, color=color,
                     linewidth=1.5, markersize=5, label=f"{split}")
-    ax.set_title("Eval SSIM"); ax.set_xlabel("Iter"); ax.set_ylabel("SSIM")
+    ax.set_title("Eval SSIM"); ax.set_xlabel("Epoch"); ax.set_ylabel("SSIM")
     ax.legend()
 
     ax = eval_axes[2]
     for split, style, color in [("test", "-o", "C0"), ("train", "--s", "C1")]:
         d = evals.get(split, {})
         if "lpips" in d:
-            ax.plot(d["iteration"], d["lpips"], style, color=color,
+            ep = d.get("epoch", d.get("iteration"))
+            ax.plot(ep, d["lpips"], style, color=color,
                     linewidth=1.5, markersize=5, label=f"{split}")
-    ax.set_title("Eval LPIPS"); ax.set_xlabel("Iter"); ax.set_ylabel("LPIPS")
+    ax.set_title("Eval LPIPS"); ax.set_xlabel("Epoch"); ax.set_ylabel("LPIPS")
     ax.legend()
 
     if has_train_data:
@@ -422,11 +430,11 @@ def main():
 
     print(f"Model path: {model_path}")
     if has_train:
-        n = len(train_data.get("iteration", []))
+        n = len(train_data.get("epoch", train_data.get("iteration", [])))
         print(f"  train_metrics.csv: {n} rows")
     if has_eval:
         for s, d in eval_data.items():
-            n = len(d.get("iteration", []))
+            n = len(d.get("epoch", d.get("iteration", [])))
             print(f"  eval_metrics.csv ({s}): {n} rows")
 
     # Override global smoothing

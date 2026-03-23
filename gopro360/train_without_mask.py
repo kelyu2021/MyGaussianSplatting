@@ -302,11 +302,23 @@ def training():
                     gaussians.reset_opacity()
 
             # ── TensorBoard & evaluation ──────────────────────────────
-            training_report(
-                tb_writer, iteration,
-                scalar_dict, tensor_dict,
-                training_args.test_iterations,
-                scene, renderer,                csv_logger=csv_logger,            )
+            if tb_writer:
+                try:
+                    for k, v in scalar_dict.items():
+                        tb_writer.add_scalar(f"train/{k}", v, iteration)
+                    for k, v in tensor_dict.items():
+                        tb_writer.add_histogram(f"train/{k}", v, iteration)
+                except Exception:
+                    pass
+
+            if iteration in training_args.test_iterations:
+                training_report(
+                    tb_writer,
+                    scene, renderer,
+                    csv_logger=csv_logger,
+                    epoch=iteration,
+                    step=iteration,
+                )
 
             # ── Optimiser step ────────────────────────────────────────
             if iteration < total_iters:
