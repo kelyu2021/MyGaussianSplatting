@@ -65,12 +65,13 @@ optim:
   scaling_lr: 0.005
 
   # ── Gaussian count limits ──
-  max_total_gaussians: 5000000
-  hole_seed_epoch_interval: 6                      # seed every ~6 epochs
-  hole_seed_until_epoch: 300                       # stop seeding at epoch 300 (~50,400 iters)
-  hole_max_seeds: 30000
+  max_total_gaussians: 8000000
+  target_final_gaussians: 8000000
+  hole_seed_epoch_interval: 4                      # seed every ~4 epochs
+  hole_seed_until_epoch: 420                       # stop seeding at epoch 420 (~70,560 iters)
+  hole_max_seeds: 60000
   prune_epoch_interval: 30                         # prune every ~30 epochs
-  prune_min_opacity: 0.005
+  prune_min_opacity: 0.003
 
   lambda_l1: 1.0
   lambda_dssim: 0.2

@@ -151,7 +151,6 @@ def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
     pad = boundary_kernel // 2
 
     all_new_xyz = []
-    all_donor_idx = []    # index into global Gaussian array for colour etc.
 
     for cam, roof_cpu in cam_mask_pairs:
         roof = roof_cpu.to(device)            # (H, W) bool, True=roof
@@ -196,10 +195,7 @@ def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
         # Use median depth of boundary Gaussians (robust to outliers)
         road_depth = bd_depths.median()
 
-        # Compute road-surface y from boundary Gaussians (for clamping)
         bd_xyz = xyz[bd_global_idx]   # (B, 3)
-        road_y_median = bd_xyz[:, 1].median()
-        road_y_std = bd_xyz[:, 1].std().clamp(min=0.1)
 
         # ── Sample pixels inside the roof mask ────────────────────────
         roof_pixels = roof.nonzero(as_tuple=False)  # (M, 2) — (v, u)
@@ -218,51 +214,89 @@ def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
         # camera coords → world coords:  X_world = R_c2w @ X_cam - R_c2w @ t_w2c
         world_coords = (R_c2w @ cam_coords.T).T - (R_c2w @ t_w2c).unsqueeze(0)
 
-        # ── Clamp y to road surface ───────────────────────────────────
-        # The roof hole should contain road-level points.  Boundary
-        # Gaussians sit at the road edge, so their median y is the best
-        # reference.  Allow ±2 std to accommodate slight slopes.
-        y_lo = road_y_median - 2.0 * road_y_std
-        y_hi = road_y_median + 2.0 * road_y_std
-        world_coords[:, 1] = world_coords[:, 1].clamp(y_lo, y_hi)
-
-        # ── Find nearest boundary Gaussian for each seed (donor) ─────
-        # bd_xyz already computed above for y-clamping
-        dists  = torch.cdist(world_coords, bd_xyz)   # (S, B)
-        _, nn  = dists.min(dim=1)                     # (S,)
-        donors = bd_global_idx[nn]                    # global index
+        # ── Snap y to nearest boundary Gaussian's road height ─────────
+        # Use x,z only so altitude differences don't skew matching.
+        seed_xz = world_coords[:, [0, 2]]             # (S, 2)
+        bd_xz   = bd_xyz[:, [0, 2]]                   # (B, 2)
+        dists   = torch.cdist(seed_xz, bd_xz)         # (S, B)
+        _, nn   = dists.min(dim=1)                     # (S,)
+        world_coords[:, 1] = bd_xyz[nn, 1]
 
         all_new_xyz.append(world_coords.cpu())
-        all_donor_idx.append(donors.cpu())
         # Free per-camera GPU tensors
         del roof, cam_pts, depth, px, u, v, vis, vi, u_i, v_i
         del roof_f, dilated, boundary_zone, in_boundary
         del bd_global_idx, bd_depths, roof_pixels, uv1, cam_coords
-        del world_coords, bd_xyz, dists, nn, donors
+        del world_coords, bd_xyz, dists, nn
         torch.cuda.empty_cache()
 
     if not all_new_xyz:
         return 0
 
     new_xyz   = torch.cat(all_new_xyz, dim=0)  # CPU
-    donor_idx = torch.cat(all_donor_idx, dim=0)  # CPU
-
-    # Deduplicate: if seeds from different cameras land on nearly the
-    # same 3D point, keep only one (grid-based dedup)
+    # Cap seed count
     if new_xyz.shape[0] > max_seeds:
         perm    = torch.randperm(new_xyz.shape[0])[:max_seeds]
-        new_xyz   = new_xyz[perm]
-        donor_idx = donor_idx[perm]
+        new_xyz = new_xyz[perm]
 
-    n_to_seed = new_xyz.shape[0]
+    # ── Phase 2: K-NN interpolation from ALL nearby Gaussians ─────────
+    # By searching all road-level Gaussians (not just boundary ones from
+    # one camera), we naturally pick up Gaussians placed / optimised by
+    # other viewpoints that see the same ground area without the roof.
+    K = 4
+    new_xyz_gpu = new_xyz.cuda()
+
+    # Filter existing Gaussians to a road-level y-band around the seeds
+    seed_y_med = new_xyz_gpu[:, 1].median()
+    seed_y_span = (new_xyz_gpu[:, 1].max() - new_xyz_gpu[:, 1].min()).clamp(min=1.0)
+    y_margin = seed_y_span * 0.5
+    road_mask = ((xyz[:, 1] >= seed_y_med - y_margin)
+                 & (xyz[:, 1] <= seed_y_med + y_margin)
+                 & (opacity[:, 0] > 0.05))
+    road_global_idx = road_mask.nonzero(as_tuple=True)[0]
+
+    # Subsample if too large (keep cdist memory bounded)
+    MAX_ROAD = 100_000
+    if len(road_global_idx) > MAX_ROAD:
+        perm = torch.randperm(len(road_global_idx), device=device)[:MAX_ROAD]
+        road_global_idx = road_global_idx[perm]
+
+    road_xz = xyz[road_global_idx][:, [0, 2]]          # (R, 2)
+    seed_xz = new_xyz_gpu[:, [0, 2]]                    # (S, 2)
+
+    # Batched K-NN in horizontal (x, z) plane
+    BATCH = 2000
+    knn_global_list, knn_w_list = [], []
+    for i in range(0, len(seed_xz), BATCH):
+        d = torch.cdist(seed_xz[i:i + BATCH], road_xz)  # (B, R)
+        topk_d, topk_local = d.topk(K, dim=1, largest=False)
+        w = 1.0 / topk_d.clamp(min=1e-6)
+        w = w / w.sum(dim=1, keepdim=True)
+        knn_global_list.append(road_global_idx[topk_local])
+        knn_w_list.append(w)
+        del d
+
+    knn_idx = torch.cat(knn_global_list, dim=0)   # (S, K) global indices
+    knn_w   = torch.cat(knn_w_list, dim=0)         # (S, K) weights
+
+    def _idw_gather(param, idx, w):
+        """Inverse-distance-weighted gather: param(N,*D) idx(S,K) w(S,K)->(S,*D)"""
+        g = param[idx]          # (S, K, *D)
+        ww = w
+        for _ in range(g.dim() - 2):
+            ww = ww.unsqueeze(-1)
+        return (g * ww).sum(dim=1)
+
+    n_to_seed = new_xyz_gpu.shape[0]
     new_tensors = {
-        "xyz":      new_xyz.cuda(),
-        "f_dc":     bg._features_dc[donor_idx].detach().clone().cuda(),
-        "f_rest":   bg._features_rest[donor_idx].detach().clone().cuda(),
-        "opacity":  bg._opacity[donor_idx].detach().clone().cuda(),
-        "scaling":  bg._scaling[donor_idx].detach().clone().cuda(),
-        "rotation": bg._rotation[donor_idx].detach().clone().cuda(),
-        "semantic": bg._semantic[donor_idx].detach().clone().cuda(),
+        "xyz":      new_xyz_gpu,
+        "f_dc":     _idw_gather(bg._features_dc.detach(), knn_idx, knn_w),
+        "f_rest":   _idw_gather(bg._features_rest.detach(), knn_idx, knn_w),
+        "opacity":  _idw_gather(bg._opacity.detach(), knn_idx, knn_w),
+        "scaling":  _idw_gather(bg._scaling.detach(), knn_idx, knn_w),
+        "rotation": F.normalize(
+            _idw_gather(bg._rotation.detach(), knn_idx, knn_w), dim=-1),
+        "semantic": _idw_gather(bg._semantic.detach(), knn_idx, knn_w),
     }
 
     bg.densification_postfix(new_tensors)

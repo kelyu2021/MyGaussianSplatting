@@ -55,7 +55,7 @@ class GaussianModel(nn.Module):
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
-        self.percent_dense = 0
+        self.percent_dense = 0.02
         self.spatial_lr_scale = 0
         self.setup_functions()
     

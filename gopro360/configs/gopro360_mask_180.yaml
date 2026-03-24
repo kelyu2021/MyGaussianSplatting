@@ -65,12 +65,13 @@ optim:
   scaling_lr: 0.005
 
   # ── Gaussian count limits ──
-  max_total_gaussians: 5000000
-  hole_seed_epoch_interval: 6
-  hole_seed_until_epoch: 120
-  hole_max_seeds: 30000
+  max_total_gaussians: 4500000
+  target_final_gaussians: 4000000
+  hole_seed_epoch_interval: 4
+  hole_seed_until_epoch: 150
+  hole_max_seeds: 60000
   prune_epoch_interval: 30
-  prune_min_opacity: 0.005
+  prune_min_opacity: 0.003
 
   lambda_l1: 1.0
   lambda_dssim: 0.2

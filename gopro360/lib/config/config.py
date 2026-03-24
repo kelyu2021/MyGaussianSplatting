@@ -86,8 +86,8 @@ cfg.optim.densify_from_epoch = 3
 cfg.optim.densify_until_epoch = 90
 cfg.optim.opacity_reset_epoch_interval = 18
 cfg.optim.position_lr_max_epochs = 900
-cfg.optim.hole_seed_epoch_interval = 6
-cfg.optim.hole_seed_until_epoch = 300
+cfg.optim.hole_seed_epoch_interval = 4
+cfg.optim.hole_seed_until_epoch = 420
 cfg.optim.prune_epoch_interval = 30
 # Legacy iteration keys (kept for train.py / train_without_mask.py compat)
 cfg.optim.densify_from_iter = 500
@@ -97,9 +97,10 @@ cfg.optim.hole_seed_interval = 1000
 cfg.optim.hole_seed_until_iter = 50000
 cfg.optim.prune_interval = 5000
 
-cfg.optim.max_total_gaussians = 10000000
-cfg.optim.hole_max_seeds = 30000
-cfg.optim.prune_min_opacity = 0.005
+cfg.optim.max_total_gaussians = 4500000
+cfg.optim.target_final_gaussians = 4000000
+cfg.optim.hole_max_seeds = 60000
+cfg.optim.prune_min_opacity = 0.003
 
 cfg.optim.lambda_l1 = 1.0
 cfg.optim.lambda_dssim = 0.2
