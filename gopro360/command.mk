@@ -16,6 +16,7 @@ python render.py --cfg_file configs/gopro360.yaml --mode trajectory
 cd gopro360
 nohup python train_mask.py --cfg_file configs/gopro360_mask_180.yaml > train_mask.py.180.log 2>&1 &
 nohup python train_mask.py --cfg_file configs/gopro360_mask_1200.yaml > train_mask.py.1200.log 2>&1 &
+nohup python train_mask.py --cfg_file configs/gopro360_mask_1500.yaml > train_mask.py.1500.log 2>&1 &
 nohup python train_mask.py --cfg_file configs/gopro360_mask_1800.yaml > train_mask.py.1800.log 2>&1 &
 nohup python train_mask.py --cfg_file configs/gopro360_mask_3600.yaml > train_mask.py.3600.log 2>&1 &
 

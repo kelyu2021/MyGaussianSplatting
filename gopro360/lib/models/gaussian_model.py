@@ -186,6 +186,8 @@ class GaussianModel(nn.Module):
             if 'optimizer' in state_dict:
                 self.optimizer.load_state_dict(state_dict['optimizer'])
 
+            self._sync_auxiliary_tensors()
+
         
     def state_dict(self, is_final=False):
         state_dict = {
@@ -294,6 +296,7 @@ class GaussianModel(nn.Module):
         args = cfg.optim
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 2), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.active_sh_degree = 0
                 
         l = [
@@ -319,6 +322,27 @@ class GaussianModel(nn.Module):
         self.densify_and_prune_list = ['xyz, f_dc, f_rest, opacity, scaling, rotation, semantic']
         self.scalar_dict = dict()
         self.tensor_dict = dict()  
+
+    def _sync_auxiliary_tensors(self):
+        point_count = self._xyz.shape[0]
+        device = self._xyz.device
+
+        def _resize(tensor, trailing_shape):
+            dtype = tensor.dtype if tensor.numel() > 0 else self._xyz.dtype
+            resized = torch.zeros((point_count, *trailing_shape), dtype=dtype, device=device)
+            if tensor.numel() == 0 or tensor.dim() != len(trailing_shape) + 1:
+                return resized
+            if tuple(tensor.shape[1:]) != tuple(trailing_shape):
+                return resized
+
+            copy_count = min(point_count, tensor.shape[0])
+            if copy_count > 0:
+                resized[:copy_count] = tensor[:copy_count].to(device=device, dtype=dtype)
+            return resized
+
+        self.xyz_gradient_accum = _resize(self.xyz_gradient_accum, (2,))
+        self.denom = _resize(self.denom, (1,))
+        self.max_radii2D = _resize(self.max_radii2D, ())
         
     def update_optimizer(self):
         self.optimizer.step()
@@ -406,6 +430,7 @@ class GaussianModel(nn.Module):
         self._opacity = optimizable_tensors["opacity"]
 
     def prune_points(self, mask):
+        self._sync_auxiliary_tensors()
         valid_points_mask = ~mask
         optimizable_tensors = self.prune_optimizer(valid_points_mask, 
             prune_list=['xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation', 'semantic'])
@@ -431,11 +456,8 @@ class GaussianModel(nn.Module):
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._semantic = optimizable_tensors["semantic"]
-        
-        cat_points_num = self.get_xyz.shape[0] - self.xyz_gradient_accum.shape[0]
-        self.xyz_gradient_accum = torch.cat([self.xyz_gradient_accum, torch.zeros(cat_points_num, 2).cuda()], dim=0)
-        self.denom = torch.cat([self.denom, torch.zeros(cat_points_num, 1).cuda()], dim=0)
-        self.max_radii2D = torch.cat([self.max_radii2D, torch.zeros(cat_points_num).cuda()], dim=0)
+
+        self._sync_auxiliary_tensors()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

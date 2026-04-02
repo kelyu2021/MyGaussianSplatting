@@ -1,0 +1,92 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  GoPro 360  –  Gaussian Splatting Resume Config (1200 → 1500)
+#
+#  Run from gopro360/ directory:
+#    cd MyGaussianSplatting/gopro360
+#    python train_mask.py --cfg_file configs/gopro360_mask_resume_1500.yaml
+# ═══════════════════════════════════════════════════════════════════════════
+
+task: gopro360_exp_mask
+source_path: colmap/output
+exp_name: gopro360_10s_mask                         # keep same exp_name to resume the existing run directory
+loaded_iter: 1200                                   # resume from trained_model/epoch_1200.pth
+gpus: [0,1]
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  type: GOPRO360
+  white_background: false
+  split_test: 8
+  split_train: 1
+  extent: 15
+  point_cloud_path: colmap/output/dense_mask_relaxed/fused.ply
+  mask_dir: colmap/output/masks_roof_depth_sky_mass13k
+  depth_dir: colmap/output/depth
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model:
+  gaussian:
+    sh_degree: 3
+    fourier_dim: 5
+    fourier_scale: 1.0
+    flip_prob: 0.5
+  nsg:
+    include_bkgd: true
+    include_obj: false
+    include_sky: false
+    opt_track: false
+
+# ── Training ──────────────────────────────────────────────────────────────
+train:
+  epochs: 1500                                      # continue 300 more epochs from the 1200 checkpoint
+  test_epochs: [1260, 1320, 1380, 1440, 1500]
+  save_epochs: [1500]
+  checkpoint_epochs: [1260, 1320, 1380, 1440, 1500]
+
+# ── Optimisation ──────────────────────────────────────────────────────────
+optim:
+  densification_interval: 100
+  densify_from_epoch: 3
+  densify_grad_threshold_bkgd: 0.0002
+  densify_grad_abs_bkgd: false
+  densify_grad_threshold: 0.0002
+  densify_until_epoch: 90
+  feature_lr: 0.0025
+  max_screen_size: 20
+  min_opacity: 0.005
+  opacity_lr: 0.05
+  opacity_reset_epoch_interval: 18
+  percent_big_ws: 0.1
+  percent_dense: 0.01
+  position_lr_delay_mult: 0.01
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  position_lr_max_epochs: 1500                      # extend xyz LR horizon for the continuation phase
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+
+  max_total_gaussians: 8000000
+  target_final_gaussians: 8000000
+  hole_seed_epoch_interval: 4
+  hole_seed_until_epoch: 1500                       # keep hole seeding active for the entire continuation run
+  hole_virtual_view_alphas: [0.25, 0.5, 0.75]
+  hole_virtual_max_cameras: 48
+  hole_virtual_max_frame_gap: 2
+  hole_multiview_support_cameras: 12
+  hole_multiview_support_frame_gap: 48
+  hole_seed_min_opacity: 0.08
+  hole_max_seeds: 60000
+  prune_epoch_interval: 30
+  prune_min_opacity: 0.003
+
+  lambda_l1: 1.0
+  lambda_dssim: 0.2
+  lambda_sky: 0.0
+  lambda_sky_scale: []
+  lambda_reg: 0.0
+  lambda_depth_lidar: 0.0
+  lambda_color_correction: 0.01
+
+# ── Render ────────────────────────────────────────────────────────────────
+render:
+  fps: 5

@@ -88,6 +88,12 @@ cfg.optim.opacity_reset_epoch_interval = 18
 cfg.optim.position_lr_max_epochs = 900
 cfg.optim.hole_seed_epoch_interval = 4
 cfg.optim.hole_seed_until_epoch = 420
+cfg.optim.hole_virtual_view_alphas = [0.25, 0.5, 0.75]
+cfg.optim.hole_virtual_max_cameras = 48
+cfg.optim.hole_virtual_max_frame_gap = 2
+cfg.optim.hole_multiview_support_cameras = 12
+cfg.optim.hole_multiview_support_frame_gap = 48
+cfg.optim.hole_seed_min_opacity = 0.08
 cfg.optim.prune_epoch_interval = 30
 # Legacy iteration keys (kept for train.py / train_without_mask.py compat)
 cfg.optim.densify_from_iter = 500

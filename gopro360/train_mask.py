@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+import copy
 from pathlib import Path
 from random import shuffle
 
@@ -45,9 +46,10 @@ sys.path.insert(0, str(_SCRIPT_DIR))
 # ── Library imports (all from gopro360/lib/) ─────────────────────────────
 from lib.config import cfg                                              # noqa: E402
 from lib.utils.loss_utils import l1_loss, psnr, ssim                    # noqa: E402
-from lib.utils.general_utils import safe_state                          # noqa: E402
+from lib.utils.general_utils import inverse_sigmoid, safe_state         # noqa: E402
 from lib.utils.cfg_utils import save_cfg                                # noqa: E402
 from lib.utils.camera_utils import Camera                               # noqa: E402
+from lib.utils.sh_utils import RGB2SH                                   # noqa: E402
 from lib.utils.system_utils import searchForMaxCheckpoint               # noqa: E402
 from lib.models.street_gaussian_renderer import StreetGaussianRenderer  # noqa: E402
 from lib.models.street_gaussian_model import StreetGaussianModel        # noqa: E402
@@ -92,11 +94,284 @@ def _load_roof_mask(image_name: str, roof_mask_dir: str,
     return roof
 
 
+def _roof_mask_candidate_names(cam: Camera) -> list[str]:
+    """Return candidate roof-mask filenames for a real or virtual camera."""
+    names: list[str] = []
+
+    def _add(name: str | None):
+        if not name:
+            return
+        stem = Path(name).stem
+        names.append(f"{stem}.png")
+        names.append(stem)
+
+    _add(getattr(cam, "image_name", None))
+
+    meta = getattr(cam, "meta", {}) or {}
+    for src_name in meta.get("roof_mask_source_names", []):
+        _add(src_name)
+
+    deduped: list[str] = []
+    seen = set()
+    for name in names:
+        if name not in seen:
+            deduped.append(name)
+            seen.add(name)
+    return deduped
+
+
+def _get_roof_mask_for_camera(cam: Camera, roof_mask_dir: str) -> torch.Tensor | None:
+    for candidate in _roof_mask_candidate_names(cam):
+        roof = _load_roof_mask(candidate, roof_mask_dir)
+        if roof is not None:
+            return roof
+    return None
+
+
+def _camera_to_c2w(cam: Camera) -> np.ndarray:
+    w2c = np.eye(4, dtype=np.float32)
+    w2c[:3, :3] = cam.R.T
+    w2c[:3, 3] = np.asarray(cam.T, dtype=np.float32)
+    return np.linalg.inv(w2c)
+
+
+def _project_to_rotation(matrix: np.ndarray) -> np.ndarray:
+    u, _, vt = np.linalg.svd(matrix)
+    rot = u @ vt
+    if np.linalg.det(rot) < 0:
+        u[:, -1] *= -1.0
+        rot = u @ vt
+    return rot.astype(np.float32)
+
+
+def _interpolate_c2w(cam_a: Camera, cam_b: Camera, alpha: float) -> np.ndarray:
+    c2w_a = _camera_to_c2w(cam_a)
+    c2w_b = _camera_to_c2w(cam_b)
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[:3, 3] = (1.0 - alpha) * c2w_a[:3, 3] + alpha * c2w_b[:3, 3]
+    blended_rot = (1.0 - alpha) * c2w_a[:3, :3] + alpha * c2w_b[:3, :3]
+    c2w[:3, :3] = _project_to_rotation(blended_rot)
+    return c2w
+
+
+def _make_virtual_hole_seed_camera(cam_a: Camera, cam_b: Camera, alpha: float) -> Camera:
+    """Create a pose-interpolated camera used only for hole seeding."""
+    new_cam = copy.deepcopy(cam_a)
+    new_cam.set_extrinsic(_interpolate_c2w(cam_a, cam_b, alpha))
+
+    meta = dict(getattr(new_cam, "meta", {}) or {})
+    meta["is_virtual_hole_seed"] = True
+    meta["roof_mask_source_names"] = [cam_a.image_name, cam_b.image_name]
+    new_cam.meta = meta
+
+    alpha_tag = int(round(alpha * 1000.0))
+    new_cam.image_name = (
+        f"{cam_a.image_name}__virt__{cam_b.image_name}__{alpha_tag:03d}"
+    )
+    return new_cam
+
+
+def build_virtual_hole_seed_cameras(
+    train_cameras,
+    alphas,
+    max_virtual_cameras=0,
+    max_frame_gap=2,
+):
+    """Interpolate neighboring training poses to seed holes from extra viewpoints."""
+    if not alphas or max_virtual_cameras == 0:
+        return []
+
+    grouped: dict[int, list[tuple[int, Camera]]] = {}
+    for cam in train_cameras:
+        meta = getattr(cam, "meta", {}) or {}
+        frame_idx = meta.get("frame_idx")
+        face_id = meta.get("cam")
+        if frame_idx is None or face_id is None:
+            continue
+        grouped.setdefault(face_id, []).append((frame_idx, cam))
+
+    virtual_cameras = []
+    for face_cams in grouped.values():
+        face_cams.sort(key=lambda item: item[0])
+        for (frame_a, cam_a), (frame_b, cam_b) in zip(face_cams, face_cams[1:]):
+            frame_gap = frame_b - frame_a
+            if frame_gap <= 0 or frame_gap > max_frame_gap:
+                continue
+            for alpha in alphas:
+                if alpha <= 0.0 or alpha >= 1.0:
+                    continue
+                virtual_cameras.append(
+                    _make_virtual_hole_seed_camera(cam_a, cam_b, alpha)
+                )
+
+    if max_virtual_cameras > 0 and len(virtual_cameras) > max_virtual_cameras:
+        step = max(1, len(virtual_cameras) // max_virtual_cameras)
+        virtual_cameras = virtual_cameras[::step][:max_virtual_cameras]
+
+    return virtual_cameras
+
+
+def _prepare_2d_mask(mask_tensor, height: int, width: int, device: str):
+    if mask_tensor is None:
+        return None
+
+    mask_2d = mask_tensor
+    if not isinstance(mask_2d, torch.Tensor):
+        mask_2d = torch.as_tensor(mask_2d)
+    if mask_2d.ndim == 3:
+        mask_2d = mask_2d[0]
+    mask_2d = mask_2d.to(device)
+
+    if mask_2d.shape[-2:] != (height, width):
+        mask_2d = F.interpolate(
+            mask_2d.float().unsqueeze(0).unsqueeze(0),
+            size=(height, width),
+            mode="nearest",
+        )[0, 0]
+
+    return mask_2d > 0.5
+
+
+def _build_support_valid_mask(cam: Camera, roof_mask_dir: str, device: str):
+    height, width = int(cam.image_height), int(cam.image_width)
+    valid_mask = None
+
+    if "mask" in cam.guidance:
+        valid_mask = _prepare_2d_mask(cam.guidance["mask"], height, width, device)
+
+    roof_mask = _get_roof_mask_for_camera(cam, roof_mask_dir)
+    if roof_mask is not None:
+        roof_mask = _prepare_2d_mask(roof_mask, height, width, device)
+        valid_mask = (~roof_mask) if valid_mask is None else (valid_mask & ~roof_mask)
+
+    return valid_mask
+
+
+def _select_support_cameras(
+    source_cam: Camera,
+    train_cameras,
+    max_support_cameras: int,
+    max_support_frame_gap: int,
+):
+    source_meta = getattr(source_cam, "meta", {}) or {}
+    source_frame = source_meta.get("frame_idx")
+    source_face = source_meta.get("cam")
+
+    scored = []
+    for candidate in train_cameras:
+        if candidate is source_cam:
+            continue
+
+        candidate_meta = getattr(candidate, "meta", {}) or {}
+        candidate_frame = candidate_meta.get("frame_idx")
+        candidate_face = candidate_meta.get("cam")
+
+        if source_frame is not None and candidate_frame is not None:
+            frame_gap = abs(candidate_frame - source_frame)
+            if max_support_frame_gap > 0 and frame_gap > max_support_frame_gap:
+                continue
+        else:
+            frame_gap = 0
+
+        face_penalty = 0 if source_face == candidate_face else 1
+        scored.append(((face_penalty, frame_gap, candidate.id), candidate))
+
+    scored.sort(key=lambda item: item[0])
+    return [cam for _, cam in scored[:max_support_cameras]]
+
+
+@torch.no_grad()
+def _sample_seed_rgb_from_support_views(
+    seed_xyz: torch.Tensor,
+    source_cam: Camera,
+    train_cameras,
+    roof_mask_dir: str,
+    device: str,
+    max_support_cameras: int,
+    max_support_frame_gap: int,
+):
+    support_cameras = _select_support_cameras(
+        source_cam,
+        train_cameras,
+        max_support_cameras=max_support_cameras,
+        max_support_frame_gap=max_support_frame_gap,
+    )
+    if not support_cameras:
+        return None, None
+
+    num_seeds = seed_xyz.shape[0]
+    rgb_accum = torch.zeros((num_seeds, 3), dtype=torch.float32, device=device)
+    weight_accum = torch.zeros((num_seeds, 1), dtype=torch.float32, device=device)
+    source_meta = getattr(source_cam, "meta", {}) or {}
+    source_frame = source_meta.get("frame_idx")
+
+    for support_cam in support_cameras:
+        height, width = int(support_cam.image_height), int(support_cam.image_width)
+        image = support_cam.original_image.to(device, non_blocking=True)
+        valid_mask = _build_support_valid_mask(support_cam, roof_mask_dir, device)
+
+        R_c2w = torch.tensor(support_cam.R, dtype=torch.float32, device=device)
+        R_w2c = R_c2w.T
+        t_w2c = torch.tensor(support_cam.T, dtype=torch.float32, device=device)
+        K = (support_cam.K.to(device).float()
+             if isinstance(support_cam.K, torch.Tensor)
+             else torch.tensor(support_cam.K, dtype=torch.float32, device=device))
+
+        cam_pts = seed_xyz @ R_w2c.T + t_w2c.unsqueeze(0)
+        depth = cam_pts[:, 2]
+        px = (K @ cam_pts.T).T
+        u = px[:, 0] / depth.clamp(min=1e-6)
+        v = px[:, 1] / depth.clamp(min=1e-6)
+
+        visible = (
+            (depth > 0.1)
+            & (u >= 0)
+            & (u < width)
+            & (v >= 0)
+            & (v < height)
+        )
+        keep = visible.nonzero(as_tuple=True)[0]
+        if keep.numel() == 0:
+            continue
+
+        u_i = u[keep].round().long().clamp(0, width - 1)
+        v_i = v[keep].round().long().clamp(0, height - 1)
+
+        if valid_mask is not None:
+            pixel_valid = valid_mask[v_i, u_i]
+            if not pixel_valid.any():
+                continue
+            keep = keep[pixel_valid]
+            u_i = u_i[pixel_valid]
+            v_i = v_i[pixel_valid]
+
+        rgb = image[:, v_i, u_i].permute(1, 0)
+        weight = 1.0 / depth[keep].clamp(min=1.0)
+
+        support_meta = getattr(support_cam, "meta", {}) or {}
+        support_frame = support_meta.get("frame_idx")
+        if source_frame is not None and support_frame is not None:
+            frame_gap = abs(support_frame - source_frame)
+            weight = weight / (1.0 + 0.05 * frame_gap)
+
+        rgb_accum[keep] += rgb * weight.unsqueeze(1)
+        weight_accum[keep] += weight.unsqueeze(1)
+
+    valid_rgb = weight_accum[:, 0] > 0
+    if not valid_rgb.any():
+        return None, None
+
+    rgb = torch.zeros_like(rgb_accum)
+    rgb[valid_rgb] = rgb_accum[valid_rgb] / weight_accum[valid_rgb]
+    return rgb.clamp(0.0, 1.0), valid_rgb
+
+
 @torch.no_grad()
 def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
                         max_seeds=70000, boundary_kernel=21,
                         roof_mask_dir="colmap/output/masks_roof_depth",
-                        max_total_gaussians=10_000_000):
+                        max_total_gaussians=10_000_000,
+                        seed_cameras=None):
     """Seed new Gaussians in the roof-hole region during training.
 
     Instead of shifting boundary Gaussians toward an abstract centroid,
@@ -132,10 +407,9 @@ def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
 
     # ── Cameras with roof masks ──────────────────────────────────────
     cam_mask_pairs = []
-    for c in train_cameras:
-        roof = _load_roof_mask(c.image_name + ".png", roof_mask_dir)
-        if roof is None:
-            roof = _load_roof_mask(c.image_name, roof_mask_dir)
+    candidate_cameras = seed_cameras if seed_cameras is not None else train_cameras
+    for c in candidate_cameras:
+        roof = _get_roof_mask_for_camera(c, roof_mask_dir)
         if roof is not None and roof.any():
             cam_mask_pairs.append((c, roof))
     if not cam_mask_pairs:
@@ -149,8 +423,12 @@ def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
     # Budget per camera
     seeds_per_cam = max(100, max_seeds // len(cam_mask_pairs))
     pad = boundary_kernel // 2
+    max_support_cameras = int(getattr(cfg.optim, "hole_multiview_support_cameras", 12))
+    max_support_frame_gap = int(getattr(cfg.optim, "hole_multiview_support_frame_gap", 48))
 
     all_new_xyz = []
+    all_new_rgb = []
+    all_new_rgb_valid = []
 
     for cam, roof_cpu in cam_mask_pairs:
         roof = roof_cpu.to(device)            # (H, W) bool, True=roof
@@ -222,22 +500,41 @@ def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
         _, nn   = dists.min(dim=1)                     # (S,)
         world_coords[:, 1] = bd_xyz[nn, 1]
 
+        seed_rgb, seed_rgb_valid = _sample_seed_rgb_from_support_views(
+            world_coords,
+            source_cam=cam,
+            train_cameras=train_cameras,
+            roof_mask_dir=roof_mask_dir,
+            device=device,
+            max_support_cameras=max_support_cameras,
+            max_support_frame_gap=max_support_frame_gap,
+        )
+        if seed_rgb is None or seed_rgb_valid is None:
+            seed_rgb = torch.zeros((world_coords.shape[0], 3), dtype=torch.float32)
+            seed_rgb_valid = torch.zeros(world_coords.shape[0], dtype=torch.bool)
+
         all_new_xyz.append(world_coords.cpu())
+        all_new_rgb.append(seed_rgb.cpu())
+        all_new_rgb_valid.append(seed_rgb_valid.cpu())
         # Free per-camera GPU tensors
         del roof, cam_pts, depth, px, u, v, vis, vi, u_i, v_i
         del roof_f, dilated, boundary_zone, in_boundary
         del bd_global_idx, bd_depths, roof_pixels, uv1, cam_coords
-        del world_coords, bd_xyz, dists, nn
+        del world_coords, bd_xyz, dists, nn, seed_rgb, seed_rgb_valid
         torch.cuda.empty_cache()
 
     if not all_new_xyz:
         return 0
 
     new_xyz   = torch.cat(all_new_xyz, dim=0)  # CPU
+    new_rgb = torch.cat(all_new_rgb, dim=0)
+    new_rgb_valid = torch.cat(all_new_rgb_valid, dim=0)
     # Cap seed count
     if new_xyz.shape[0] > max_seeds:
         perm    = torch.randperm(new_xyz.shape[0])[:max_seeds]
         new_xyz = new_xyz[perm]
+        new_rgb = new_rgb[perm]
+        new_rgb_valid = new_rgb_valid[perm]
 
     # ── Phase 2: K-NN interpolation from ALL nearby Gaussians ─────────
     # By searching all road-level Gaussians (not just boundary ones from
@@ -288,15 +585,44 @@ def seed_hole_gaussians(gaussians, train_cameras, device="cuda",
         return (g * ww).sum(dim=1)
 
     n_to_seed = new_xyz_gpu.shape[0]
+    new_features_dc = _idw_gather(bg._features_dc.detach(), knn_idx, knn_w)
+    new_features_rest = _idw_gather(bg._features_rest.detach(), knn_idx, knn_w)
+    new_opacity = _idw_gather(bg._opacity.detach(), knn_idx, knn_w)
+    new_scaling = _idw_gather(bg._scaling.detach(), knn_idx, knn_w)
+    new_rotation = F.normalize(
+        _idw_gather(bg._rotation.detach(), knn_idx, knn_w), dim=-1)
+    new_semantic = _idw_gather(bg._semantic.detach(), knn_idx, knn_w)
+
+    new_rgb_gpu = new_rgb.to(device)
+    new_rgb_valid_gpu = new_rgb_valid.to(device)
+    if new_rgb_valid_gpu.any():
+        multiview_dc = RGB2SH(new_rgb_gpu).unsqueeze(1)
+        new_features_dc = torch.where(
+            new_rgb_valid_gpu[:, None, None],
+            multiview_dc,
+            new_features_dc,
+        )
+
+        min_seed_opacity = float(getattr(cfg.optim, "hole_seed_min_opacity", 0.08))
+        seed_opacity = torch.sigmoid(new_opacity)
+        seed_opacity = torch.maximum(
+            seed_opacity,
+            torch.full_like(seed_opacity, min_seed_opacity),
+        )
+        new_opacity = torch.where(
+            new_rgb_valid_gpu[:, None],
+            inverse_sigmoid(seed_opacity.clamp(max=0.999)),
+            new_opacity,
+        )
+
     new_tensors = {
         "xyz":      new_xyz_gpu,
-        "f_dc":     _idw_gather(bg._features_dc.detach(), knn_idx, knn_w),
-        "f_rest":   _idw_gather(bg._features_rest.detach(), knn_idx, knn_w),
-        "opacity":  _idw_gather(bg._opacity.detach(), knn_idx, knn_w),
-        "scaling":  _idw_gather(bg._scaling.detach(), knn_idx, knn_w),
-        "rotation": F.normalize(
-            _idw_gather(bg._rotation.detach(), knn_idx, knn_w), dim=-1),
-        "semantic": _idw_gather(bg._semantic.detach(), knn_idx, knn_w),
+        "f_dc":     new_features_dc,
+        "f_rest":   new_features_rest,
+        "opacity":  new_opacity,
+        "scaling":  new_scaling,
+        "rotation": new_rotation,
+        "semantic": new_semantic,
     }
 
     bg.densification_postfix(new_tensors)
@@ -475,32 +801,50 @@ def training():
     directly — no conversion to iterations.
     """
     training_args = cfg.train
-    optim_args    = cfg.optim
-    data_args     = cfg.data
+    optim_args = cfg.optim
+    data_args = cfg.data
 
-    tb_writer  = prepare_output_and_logger()
+    tb_writer = prepare_output_and_logger()
     csv_logger = MetricCSVLogger(cfg.model_path)
 
     # ── Data & model ──────────────────────────────────────────────────
-    dataset   = GoPro360Dataset()
+    dataset = GoPro360Dataset()
     gaussians = StreetGaussianModel(dataset.scene_info.metadata)
-    scene     = Scene(gaussians=gaussians, dataset=dataset)
+    scene = Scene(gaussians=gaussians, dataset=dataset)
 
     # ── Epoch-based schedule (used directly, no conversion) ─────────
     train_cameras = scene.getTrainCameras()
     cams_per_epoch = len(train_cameras)
     num_epochs = training_args.epochs
 
-    test_epochs_set       = set(training_args.test_epochs)
-    save_epochs_set       = set(training_args.save_epochs)
+    hole_virtual_alphas = [
+        float(alpha)
+        for alpha in getattr(optim_args, "hole_virtual_view_alphas", [])
+    ]
+    hole_virtual_max_cameras = int(
+        getattr(optim_args, "hole_virtual_max_cameras", 0)
+    )
+    hole_virtual_max_frame_gap = int(
+        getattr(optim_args, "hole_virtual_max_frame_gap", 2)
+    )
+    virtual_seed_cameras = build_virtual_hole_seed_cameras(
+        train_cameras,
+        alphas=hole_virtual_alphas,
+        max_virtual_cameras=hole_virtual_max_cameras,
+        max_frame_gap=hole_virtual_max_frame_gap,
+    )
+    hole_seed_cameras = train_cameras + virtual_seed_cameras
+
+    test_epochs_set = set(training_args.test_epochs)
+    save_epochs_set = set(training_args.save_epochs)
     checkpoint_epochs_set = set(training_args.checkpoint_epochs)
 
-    densify_from_epoch      = optim_args.densify_from_epoch
-    densify_until_epoch     = optim_args.densify_until_epoch
-    opacity_reset_interval  = optim_args.opacity_reset_epoch_interval
-    hole_seed_interval      = optim_args.hole_seed_epoch_interval
-    hole_seed_until_epoch   = optim_args.hole_seed_until_epoch
-    prune_interval_epochs   = optim_args.prune_epoch_interval
+    densify_from_epoch = optim_args.densify_from_epoch
+    densify_until_epoch = optim_args.densify_until_epoch
+    opacity_reset_interval = optim_args.opacity_reset_epoch_interval
+    hole_seed_interval = optim_args.hole_seed_epoch_interval
+    hole_seed_until_epoch = optim_args.hole_seed_until_epoch
+    prune_interval_epochs = optim_args.prune_epoch_interval
 
     # position_lr_max_steps must be in iterations for the LR scheduler
     position_lr_max_steps = optim_args.position_lr_max_epochs * cams_per_epoch
@@ -513,6 +857,9 @@ def training():
     print(f"  position LR decay over {optim_args.position_lr_max_epochs} epochs")
     print(f"  hole seeding every {hole_seed_interval}"
           f" epochs until epoch {hole_seed_until_epoch}")
+    if virtual_seed_cameras:
+        print("  hole seeding viewpoints: "
+              f"{len(train_cameras)} real + {len(virtual_seed_cameras)} virtual")
     print(f"  pruning every {prune_interval_epochs} epochs")
     print(f"  test/eval at epochs {sorted(test_epochs_set)}")
     print(f"  checkpoints at epochs {sorted(checkpoint_epochs_set)}")
@@ -812,7 +1159,7 @@ def training():
             should_seed = (
                 hole_seed_interval > 0
                 and epoch >= densify_from_epoch
-                and epoch < hole_seed_until_epoch
+                and epoch <= hole_seed_until_epoch
                 and (epoch % hole_seed_interval == 0 or just_reset)
             )
             if should_seed:
@@ -824,6 +1171,7 @@ def training():
                     max_seeds=optim_args.hole_max_seeds,
                     roof_mask_dir=roof_mask_dir,
                     max_total_gaussians=optim_args.max_total_gaussians,
+                    seed_cameras=hole_seed_cameras,
                 )
                 n_total = gaussians.background._xyz.shape[0]
                 if n_seeded > 0:

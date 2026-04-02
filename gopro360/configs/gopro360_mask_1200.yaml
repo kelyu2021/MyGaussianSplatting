@@ -68,7 +68,13 @@ optim:
   max_total_gaussians: 8000000
   target_final_gaussians: 8000000
   hole_seed_epoch_interval: 4                      # seed every ~4 epochs
-  hole_seed_until_epoch: 420                       # stop seeding at epoch 420 (~70,560 iters)
+  hole_seed_until_epoch: 1140                      # keep seeding through late training so roof-hole points keep getting refreshed
+  hole_virtual_view_alphas: [0.25, 0.5, 0.75]     # interpolate adjacent poses for extra hole-seeding views
+  hole_virtual_max_cameras: 48                     # cap virtual viewpoints to keep seeding bounded
+  hole_virtual_max_frame_gap: 2                    # only interpolate near-neighbor frames
+  hole_multiview_support_cameras: 12               # initialize seeded Gaussians from nearby real views that see ground pixels
+  hole_multiview_support_frame_gap: 48             # search nearby frames for valid support views
+  hole_seed_min_opacity: 0.08                      # let newly seeded hole Gaussians survive long enough to be optimized
   hole_max_seeds: 60000
   prune_epoch_interval: 30                         # prune every ~30 epochs
   prune_min_opacity: 0.003
