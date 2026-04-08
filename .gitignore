@@ -4,6 +4,9 @@
 *.log
 *.pth
 *.pt
+*.glb
+*.npz
+*.splat
 *.0
 data/
 **/*output*/
@@ -25,3 +28,6 @@ data/
 **/*discard*/
 **/*discard*
 gopro360/colmap/output_v1
+gopromax_neighbour/output/
+gopromax_neighbour/output*/
+huggingface/depth-anything-3/workspace/
