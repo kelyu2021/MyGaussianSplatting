@@ -72,7 +72,7 @@ def _keep_bottom_connected(mask: np.ndarray) -> np.ndarray:
 
 
 def depth_to_roof_mask(depth_map: np.ndarray, depth_scale: float,
-                       erode_px: int = 0) -> np.ndarray:
+                       erode_px: int = 0, dilate_px: int = 0) -> np.ndarray:
     """Threshold inverse-depth to get roof mask (near pixels).
 
     Higher depth values = closer to camera = roof.
@@ -93,6 +93,12 @@ def depth_to_roof_mask(depth_map: np.ndarray, depth_scale: float,
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                            (2 * erode_px + 1, 2 * erode_px + 1))
         roof_mask = cv2.erode(roof_mask.astype(np.uint8), kernel).astype(bool)
+
+    # Dilate to expand masked region
+    if dilate_px > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                           (2 * dilate_px + 1, 2 * dilate_px + 1))
+        roof_mask = cv2.dilate(roof_mask.astype(np.uint8), kernel).astype(bool)
 
     return roof_mask
 
@@ -132,6 +138,9 @@ def main():
                              "front=0.5, back=1.0, left=0.7, right=0.5.")
     parser.add_argument("--erode_px",    type=int, default=0,
                         help="Erosion radius in pixels to shrink mask boundary (default: 0). "
+                             "Set 0 to disable.")
+    parser.add_argument("--dilate_px",   type=int, default=6,
+                        help="Dilation radius in pixels to expand mask boundary (default: 6). "
                              "Set 0 to disable.")
     parser.add_argument("--visualize",   action="store_true")
     args = parser.parse_args()
@@ -184,7 +193,7 @@ def main():
                                        interpolation=cv2.INTER_LINEAR)
             face = face_name_from_path(img_path)
             scale = scale_map.get(face, 1.0)
-            roof_mask = depth_to_roof_mask(depth_map, scale, args.erode_px)
+            roof_mask = depth_to_roof_mask(depth_map, scale, args.erode_px, args.dilate_px)
             roof_pcts.append(100 * roof_mask.sum() / roof_mask.size)
 
             # 0 = masked (roof), 255 = valid

@@ -26,5 +26,7 @@ nohup python densePointCloudWithMask.py --sparse_dir output/colmap_ws --images_d
 nohup python densePointCloudWithMask.py --max_image_size 2048 --sparse_dir output/colmap_ws --images_dir output/images --masks_dir output/masks_depth --output output/dense_mask_2048 --gpu_index  0,1 > densePointCloudWithMask.2048.py.log 2>&1 &
 nohup python densePointCloudWithMask.py --sparse_dir output/colmap_ws --images_dir output/images --masks_dir output/masks_depth --output output/dense_mask_relaxed --fusion_min_num_pixels 3 --fusion_max_reproj_error 4 --pm_filter_min_ncc 0.05 --gpu_index 0,1 > densePointCloudWithMask.relaxed.py.log 2>&1 &
 
-python maskRoofBasedOnDepth.py --help
-python maskRoofBasedOnDepth.py
+python maskRoofBasedOnDepth.py --output_dir output/masks_roof_depth
+python combine_roof_depth_sky_mas13k.py --roof_dir ./output/masks_roof_depth_v2_dilate_6 --output_dir ./output/masks_roof_depth_sky_mass13k_v2
+
+conda run -n da3 python depthAnythingV3.py --model_name da3-giant --device cuda:0 --batch_size 4 --output_dir ./output/depth_anything_v3 2>&1 | head -30

@@ -147,7 +147,7 @@ color_list = np.array(
 colors = color_list.reshape((-1, 3)) * 255
 colors = np.array(colors, dtype=np.uint8).reshape(len(colors), 1, 1, 3)
 
-def visualize_depth_numpy(depth, minmax=None, cmap=cv2.COLORMAP_JET):
+def visualize_depth_numpy(depth, minmax=None, cmap=None):
     x = np.nan_to_num(depth)
     if minmax is None:
         mi = np.min(x[x > 0])
@@ -156,7 +156,10 @@ def visualize_depth_numpy(depth, minmax=None, cmap=cv2.COLORMAP_JET):
         mi, ma = minmax
     x = (x - mi) / (ma - mi + 1e-8)
     x = (255 * x).astype(np.uint8)
-    x_ = cv2.applyColorMap(x, cmap)
+    if cmap is not None:
+        x_ = cv2.applyColorMap(x, cmap)
+    else:
+        x_ = np.stack([x, x, x], axis=-1)
     return x_, [mi, ma]
 
 def normalize_img(img):
