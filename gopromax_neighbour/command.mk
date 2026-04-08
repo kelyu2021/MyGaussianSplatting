@@ -11,6 +11,9 @@ python visualize_metrics.py                                                    #
 python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 # specific run
 python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 --save_dir plots  # save PNGs
 
+
+
+
 # sparse point cloud
 python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 1 --matcher exhaustive
 
@@ -37,3 +40,18 @@ cd /home/lyuk4/GitHub/MyGaussianSplatting/MaSS13K/mmsegmentation && conda run -n
   --out_dir /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/data/mask2former_cityscapes_vehicle \
   --exclude_classes 13 14 15 16 17 18 \
   --save_overlay
+
+cd gopromax_neighbour
+# Edit all masks
+python scripts/edit_masks.py
+# Only back faces
+python scripts/edit_masks.py --filter "*_back.jpg"
+# Only frame 0002
+python scripts/edit_masks.py --filter "0002_*.jpg"
+- Left-click + drag → draw rectangle to set as sky (black)
+- Right-click + drag → draw rectangle to restore as valid (white)
+- u → undo last edit
+- ctrl-s → save and go to next image
+- ctrl-n → skip without saving
+- ctrl-r → reset to original
+- ESC → quit
