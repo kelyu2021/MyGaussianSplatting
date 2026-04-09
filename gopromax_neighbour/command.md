@@ -16,7 +16,7 @@ python render.py --config configs/gopromax_neighbour_1200.yaml --mode trajectory
 cd gopromax_neighbour
 python visualize_metrics.py                                                    # auto-detect latest run
 python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 # specific run
-python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 --save_dir plots  # save PNGs
+python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 --save_dir output/gopromax_neighbour/sky_mask_v1/plots  # save PNGs
 
 
 
@@ -47,6 +47,26 @@ cd /home/lyuk4/GitHub/MyGaussianSplatting/MaSS13K/mmsegmentation && conda run -n
   --out_dir /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/data/mask2former_cityscapes_vehicle \
   --exclude_classes 13 14 15 16 17 18 \
   --save_overlay
+
+# mask out human only using MaSS13K 
+cd /home/lyuk4/GitHub/MyGaussianSplatting/MaSS13K/mmsegmentation && conda run -n massformer --no-banner python /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/mass13k_person.py \
+  --image_dir /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/data/cubemap_faces \
+  --out_dir /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/data/cubemap_faces_mass13k_human \
+  --save_overlay
+
+# mask out human and vehicle only using Mask2Former
+cd /home/lyuk4/GitHub/MyGaussianSplatting/MaSS13K/mmsegmentation && conda run -n mask2former python /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/mask2former_cityscapes.py \
+  --image_dir /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/data/cubemap_faces \
+  --out_dir /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/data/cubemap_faces_mask2former_cityscapes \
+  --save_overlay
+
+# mask out human and vehicle only using SAM2
+conda activate sam2
+cd /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour
+python SAM2.py \
+    --image_dir data/cubemap_faces \
+    --out_dir   data/cubemap_faces_sam \
+    --save_overlay
 
 cd gopromax_neighbour
 # Edit all masks

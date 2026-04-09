@@ -19,8 +19,8 @@ Usage
 -----
     cd gopromax_neighbour
     python scripts/edit_masks.py                                    # all masks
-    python scripts/edit_masks.py --filter "*_back.jpg"              # only back faces
-    python scripts/edit_masks.py --filter "0002_*.jpg"              # only frame 0002
+    python scripts/edit_masks.py --filter "*_back.*"               # only back faces
+    python scripts/edit_masks.py --filter "0002_*"                  # only frame 0002
     python scripts/edit_masks.py --mask_dir data/cubemap_faces_mass13k
 """
 
@@ -32,9 +32,12 @@ import cv2
 import numpy as np
 
 
-def edit_masks(mask_dir: str, pattern: str = "*.jpg"):
+def edit_masks(mask_dir: str, pattern: str = "*"):
     mask_path = Path(mask_dir)
-    files = sorted(mask_path.glob(pattern))
+    files = sorted(
+        f for f in mask_path.glob(pattern)
+        if f.suffix.lower() in (".jpg", ".jpeg", ".png")
+    )
     if not files:
         print(f"No files matching '{pattern}' in {mask_dir}")
         sys.exit(1)
@@ -125,8 +128,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Interactive mask editor")
     parser.add_argument("--mask_dir", default="data/cubemap_faces_mass13k",
                         help="Directory containing mask images")
-    parser.add_argument("--filter", default="*.jpg",
-                        help="Glob pattern to filter files (e.g. '*_back.jpg')")
+    parser.add_argument("--filter", default="*",
+                        help="Glob pattern to filter files (e.g. '*_back.*', '0002_*')")
     args = parser.parse_args()
 
     edit_masks(args.mask_dir, args.filter)
