@@ -70,7 +70,7 @@ python SAM2.py \
 
 cd gopromax_neighbour
 # Edit all masks
-python scripts/edit_masks.py
+python scripts/edit_masks.py --mask_dir data/cubemap_faces_sam_manual --filter "*.png"
 # Only back faces
 python scripts/edit_masks.py --filter "*_back.jpg"
 # Only frame 0002

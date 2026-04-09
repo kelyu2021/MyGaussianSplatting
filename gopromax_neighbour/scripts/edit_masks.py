@@ -12,6 +12,7 @@ Controls
     'u'                 : Undo last edit
     's'                 : Save current image and move to next
     'n'                 : Skip (don't save) and move to next
+    'p'                 : Go back to previous image
     'r'                 : Reset to original (discard all edits)
     ESC / 'q'           : Quit
 
@@ -44,9 +45,11 @@ def edit_masks(mask_dir: str, pattern: str = "*"):
 
     print(f"Found {len(files)} mask files.")
     print("Controls: LMB-drag=sky(black)  RMB-drag=valid(white)  "
-          "u=undo  s=save+next  n=skip  r=reset  ESC=quit\n")
+          "u=undo  s=save+next  n=skip  p=prev  r=reset  ESC=quit\n")
 
-    for idx, fpath in enumerate(files):
+    idx = 0
+    while idx < len(files):
+        fpath = files[idx]
         original = cv2.imread(str(fpath), cv2.IMREAD_GRAYSCALE)
         if original is None:
             print(f"  Cannot read {fpath.name}, skipping")
@@ -99,9 +102,18 @@ def edit_masks(mask_dir: str, pattern: str = "*"):
             if k == ord('s'):
                 cv2.imwrite(str(fpath), img)
                 print(f"  Saved  {fpath.name}")
+                idx += 1
                 break
             elif k == ord('n'):
                 print(f"  Skipped {fpath.name}")
+                idx += 1
+                break
+            elif k == ord('p'):
+                if idx > 0:
+                    print(f"  Back to previous")
+                    idx -= 1
+                else:
+                    print(f"  Already at first image")
                 break
             elif k == ord('u'):
                 if history:
