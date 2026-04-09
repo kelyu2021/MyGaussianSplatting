@@ -26,29 +26,29 @@ data:
 
 model:
   gaussian:
-    sh_degree: 3
+    sh_degree: 4
   nsg:
     include_bkgd: true
     include_sky: false
   use_color_correction: true
 
 train:
-  epochs: 180
-  test_epochs: [30, 60, 90, 120, 150, 180]
-  save_epochs: [180]
-  checkpoint_epochs: [60, 120, 180]
+  epochs: 1200
+  test_epochs: [200, 400, 600, 800, 1000, 1200]
+  save_epochs: [600, 1200]
+  checkpoint_epochs: [600, 1200]
 
 optim:
-  densification_interval: 100
+  densification_interval: 75
   densify_from_epoch: 3
-  densify_until_epoch: 90
-  densify_grad_threshold_bkgd: 0.0002
+  densify_until_epoch: 1000
+  densify_grad_threshold_bkgd: 0.00015
   position_lr_init: 0.00016
   position_lr_final: 1.6e-06
   position_lr_max_epochs: 135
-  opacity_reset_epoch_interval: 18
+  opacity_reset_epoch_interval: 25
   prune_epoch_interval: 30
-  prune_min_opacity: 0.003
+  prune_min_opacity: 0.002
   lambda_l1: 1.0
   lambda_dssim: 0.2
   lambda_color_correction: 0.001

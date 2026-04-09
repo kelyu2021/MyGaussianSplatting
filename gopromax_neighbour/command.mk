@@ -1,10 +1,17 @@
 cd gopromax_neighbour
-nohup python train.py --config configs/gopromax_neighbour.yaml > gopromax_neighbour.yaml.log 2>&1 &
+mkdir output
+nohup python train.py --config configs/gopromax_neighbour_180.yaml > ./output/gopromax_neighbour_180.yaml.log 2>&1 &
+
+mkdir output
+nohup python train.py --config configs/gopromax_neighbour_1200.yaml > ./output/gopromax_neighbour_1200.yaml.log 2>&1 &
+
 
 cd gopromax_neighbour
-python render.py --config configs/gopromax_neighbour.yaml --mode evaluate
-python render.py --config configs/gopromax_neighbour.yaml --mode trajectory --fps 10
-python render.py --config configs/gopromax_neighbour.yaml --mode trajectory --fps 10 --epoch 180
+python render.py --config configs/gopromax_neighbour_180.yaml --mode evaluate
+python render.py --config configs/gopromax_neighbour_180.yaml --mode trajectory --fps 10
+python render.py --config configs/gopromax_neighbour_180.yaml --mode trajectory --fps 10 --epoch 180
+
+python render.py --config configs/gopromax_neighbour_1200.yaml --mode trajectory --fps 10 --epoch 1200
 
 cd gopromax_neighbour
 python visualize_metrics.py                                                    # auto-detect latest run
