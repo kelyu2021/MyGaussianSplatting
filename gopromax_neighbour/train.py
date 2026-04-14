@@ -13,6 +13,7 @@ Data layout (relative to gopromax_neighbour/)::
         fused.ply        <- dense point cloud
     data/cubemap_faces/          <- original cubemap images
     data/cubemap_faces_mass13k/  <- sky masks (0=sky/masked, 255=valid)
+    data/cubemap_faces_sam_moving/ <- moving object masks (255=moving, 0=static)
 
 Usage::
 
@@ -414,7 +415,7 @@ def load_camera(cam_info: CameraInfo, resolution_scale: float = 1.0):
 
     guidance = {}
     for k, v in cam_info.guidance.items():
-        if k in ("mask", "sky_mask", "acc_mask"):
+        if k in ("mask", "sky_mask", "acc_mask", "moving_mask"):
             guidance[k] = _pil_to_torch(v, resolution, Image.NEAREST).bool()
         elif k == "lidar_depth":
             t = torch.from_numpy(v).float()
@@ -1030,6 +1031,7 @@ def read_scene(
     point_cloud_path: str,
     images_dir: str,
     mask_dir: str,
+    moving_mask_dir: str = "",
     split_test: int = 8,
     workspace: str = "",
 ) -> SceneInfo:
@@ -1041,6 +1043,7 @@ def read_scene(
     point_cloud_path : explicit path to fused.ply
     images_dir    : path to cubemap face images
     mask_dir      : path to sky mask images
+    moving_mask_dir : path to moving object mask images (255=moving, 0=static)
     split_test    : every Nth frame → test set
     workspace     : project root for resolving relative paths
     """
@@ -1057,6 +1060,7 @@ def read_scene(
     sparse_dir = _resolve(src / "sparse")
     images_path = _resolve(images_dir)
     mask_path = _resolve(mask_dir) if mask_dir else None
+    moving_mask_path = _resolve(moving_mask_dir) if moving_mask_dir else None
     pcd_path = _resolve(point_cloud_path)
 
     assert (sparse_dir / "cameras.bin").exists(), \
@@ -1140,6 +1144,20 @@ def read_scene(
                 if m_file.exists():
                     guidance["mask"] = Image.open(str(m_file)).convert("L")
 
+            # ── Load moving object mask ───────────────────────────────
+            if moving_mask_path is not None:
+                mm_file = moving_mask_path / colmap_img.name
+                if not mm_file.exists():
+                    stem = Path(colmap_img.name).stem
+                    for ext in (".jpg", ".png", ".jpeg"):
+                        candidate = moving_mask_path / (stem + ext)
+                        if candidate.exists():
+                            mm_file = candidate
+                            break
+                if mm_file.exists():
+                    guidance["moving_mask"] = Image.open(
+                        str(mm_file)).convert("L")
+
             cam_info = CameraInfo(
                 uid=uid, R=R, T=T,
                 FovY=FovY, FovX=FovX, K=K,
@@ -1210,6 +1228,7 @@ DEFAULT_CFG = {
         "split_test": 8,
         "point_cloud_path": "data/colmap_pointcloud_dense/fused.ply",
         "mask_dir": "data/cubemap_faces_mass13k",
+        "moving_mask_dir": "data/cubemap_faces_sam_moving",
         "images": "data/cubemap_faces",
     },
 
@@ -1494,6 +1513,7 @@ def training(cfg: dict):
         point_cloud_path=data_cfg["point_cloud_path"],
         images_dir=data_cfg["images"],
         mask_dir=data_cfg.get("mask_dir", ""),
+        moving_mask_dir=data_cfg.get("moving_mask_dir", ""),
         split_test=data_cfg.get("split_test", 8),
         workspace=workspace,
     )
@@ -1617,11 +1637,25 @@ def training(cfg: dict):
                         if not gt_image.is_cuda else gt_image)
 
             # ── Sky mask ──────────────────────────────────────────────
-            mask = None
+            sky_mask = None
             if "mask" in cam.guidance:
-                mask = cam.guidance["mask"]
-                mask = (mask.cuda(non_blocking=True)
-                        if not mask.is_cuda else mask)
+                sky_mask = cam.guidance["mask"]
+                sky_mask = (sky_mask.cuda(non_blocking=True)
+                            if not sky_mask.is_cuda else sky_mask)
+
+            # ── Moving object mask ────────────────────────────────────
+            moving_mask = None
+            if "moving_mask" in cam.guidance:
+                moving_mask = cam.guidance["moving_mask"]
+                moving_mask = (moving_mask.cuda(non_blocking=True)
+                               if not moving_mask.is_cuda else moving_mask)
+
+            # ── Combined mask (exclude sky + moving objects) ──────────
+            mask = sky_mask
+            if mask is not None and moving_mask is not None:
+                mask = mask & (~moving_mask)
+            elif moving_mask is not None:
+                mask = ~moving_mask
 
             # ── Render ────────────────────────────────────────────────
             render_pkg = render(cam, gaussians, bg_color)
@@ -1654,10 +1688,10 @@ def training(cfg: dict):
                 loss += sh_reg
 
             # ── Sky opacity penalty ───────────────────────────────────
-            #     Push acc → 0 in sky regions (where mask == False)
+            #     Push acc → 0 in sky regions (where sky_mask == False)
             lambda_sky_acc = optim_cfg.get("lambda_sky_acc", 0.01)
-            if lambda_sky_acc > 0 and mask is not None:
-                sky_region = 1.0 - mask.float()     # 1 where sky
+            if lambda_sky_acc > 0 and sky_mask is not None:
+                sky_region = 1.0 - sky_mask.float()     # 1 where sky
                 sky_acc_loss = lambda_sky_acc * (acc * sky_region).mean()
                 scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
                 loss += sky_acc_loss
