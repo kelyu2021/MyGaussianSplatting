@@ -148,8 +148,8 @@ def main() -> None:
 
     for idx, img_path in enumerate(image_paths):
         basename = os.path.basename(img_path)
-        name, _ = os.path.splitext(basename)
-        out_path = os.path.join(args.out_dir, f"{name}.png")
+        name, ext = os.path.splitext(basename)
+        out_path = os.path.join(args.out_dir, f"{name}{ext}")
 
         image = np.array(Image.open(img_path).convert("RGB"))
         h, w = image.shape[:2]

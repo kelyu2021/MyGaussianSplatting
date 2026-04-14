@@ -5,6 +5,7 @@ nohup python train.py --config configs/gopromax_neighbour_180.yaml > ./output/go
 mkdir output
 nohup python train.py --config configs/gopromax_neighbour_1200.yaml > ./output/gopromax_neighbour_1200.yaml.log 2>&1 &
 
+nohup python train.py --config configs/gopromax_neighbour_1800.yaml > ./output/gopromax_neighbour_1800.yaml.log 2>&1 &
 
 cd gopromax_neighbour
 python render.py --config configs/gopromax_neighbour_180.yaml --mode evaluate
@@ -19,6 +20,9 @@ python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 #
 python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 --save_dir output/gopromax_neighbour/sky_mask_v1/plots  # save PNGs
 
 
+cd /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour
+conda activate gopro_360
+CUDA_VISIBLE_DEVICES=1 python render_adversarial.py --config configs/gopromax_neighbour_1200.yaml --model_root output_version_2 --road_width 1 --epoch 1200 2>&1
 
 
 # sparse point cloud
