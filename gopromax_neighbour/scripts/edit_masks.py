@@ -85,6 +85,8 @@ def edit_masks(mask_dir: str, pattern: str = "*", image_dir: str | None = None):
             print(f"  Cannot read {fpath.name}, skipping")
             idx += 1
             continue
+        # Binarize to clean up any JPEG compression artifacts
+        _, original = cv2.threshold(original, 127, 255, cv2.THRESH_BINARY)
 
         # Load original image for overlay
         bg_img = None
@@ -102,6 +104,7 @@ def edit_masks(mask_dir: str, pattern: str = "*", image_dir: str | None = None):
         show_overlay = bg_img is not None  # default to overlay if available
         ix, iy = 0, 0
         fill_val = 0  # 0=sky, 255=valid
+        mx, my = 0, 0  # current mouse position
         preview_mask = img.copy()
 
         win_name = f"[{idx+1}/{len(files)}] {fpath.name}"
@@ -112,7 +115,7 @@ def edit_masks(mask_dir: str, pattern: str = "*", image_dir: str | None = None):
             return cv2.cvtColor(mask_arr, cv2.COLOR_GRAY2BGR)
 
         def mouse_cb(event, x, y, flags, param):
-            nonlocal drawing, ix, iy, fill_val, img, preview_mask, history
+            nonlocal drawing, ix, iy, fill_val, img, preview_mask, history, mx, my
 
             if event == cv2.EVENT_LBUTTONDOWN:
                 drawing = True
@@ -125,6 +128,7 @@ def edit_masks(mask_dir: str, pattern: str = "*", image_dir: str | None = None):
                 fill_val = 255
                 preview_mask = img.copy()
             elif event == cv2.EVENT_MOUSEMOVE and drawing:
+                mx, my = x, y
                 preview_mask = img.copy()
                 # Draw rect preview on mask
                 preview_mask_temp = preview_mask.copy()
@@ -149,14 +153,15 @@ def edit_masks(mask_dir: str, pattern: str = "*", image_dir: str | None = None):
             # Draw rectangle outline during drag
             if drawing:
                 rect_color = (0, 0, 180) if fill_val == 0 else (0, 200, 0)
-                cv2.rectangle(display, (ix, iy),
-                              (preview_mask.shape[1], preview_mask.shape[0]),
-                              rect_color, 2)
+                cv2.rectangle(display, (ix, iy), (mx, my), rect_color, 2)
             cv2.imshow(win_name, display)
             k = cv2.waitKey(30) & 0xFF
 
             if k == ord('s'):
-                cv2.imwrite(str(fpath), img)
+                if fpath.suffix.lower() in ('.jpg', '.jpeg'):
+                    cv2.imwrite(str(fpath), img, [cv2.IMWRITE_JPEG_QUALITY, 100])
+                else:
+                    cv2.imwrite(str(fpath), img)
                 print(f"  Saved  {fpath.name}")
                 idx += 1
                 break
