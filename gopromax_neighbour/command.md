@@ -5,9 +5,7 @@ nohup python train.py --config configs/gopromax_neighbour_180.yaml > ./output/go
 mkdir output
 nohup python train.py --config configs/gopromax_neighbour_1200.yaml > ./output/gopromax_neighbour_1200.yaml.log 2>&1 &
 
-nohup python train.py --config configs/gopromax_neighbour_2400.yaml > ./output/gopromax_neighbour_1800.yaml.log 2>&1 &
-
-nohup python train.py --config configs/gopromax_neighbour_2400.yaml --output-dir output_version_4_2400 > ./output_version_4_2400/gopromax_neighbour_2400.yaml.log 2>&1 &
+nohup python train.py --config configs/gopromax_neighbour_2400.yaml --output-dir output_version_5_2400 > ./output_version_5_2400/gopromax_neighbour_2400.yaml.log 2>&1 &
 
 cd gopromax_neighbour
 python render.py --config configs/gopromax_neighbour_180.yaml --mode evaluate
@@ -54,6 +52,12 @@ cd /home/lyuk4/GitHub/MyGaussianSplatting/MaSS13K/mmsegmentation && conda run -n
   --out_dir /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/data/cubemap_faces_mass13k \
   --exclude_classes 1 5 \
   --save_overlay
+
+cd gopromax_neighbour
+python depth_anything_v2.py \
+    --image_dir  data/cubemap_faces \
+    --mask_dir   data/cubemap_faces_mass13k \
+    --output_dir data/cubemap_faces_da2
 
 # mask out vehicle only
 cd /home/lyuk4/GitHub/MyGaussianSplatting/MaSS13K/mmsegmentation && conda run -n mask2former python /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/mask2former_cityscapes.py \

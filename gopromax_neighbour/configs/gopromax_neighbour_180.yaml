@@ -19,6 +19,7 @@ data:
   type: GOPROMAX_NEIGHBOUR
   white_background: false
   split_test: 8
+  max_frames: 30    # set to 0 to use all frames
   point_cloud_path: data/colmap_pointcloud_dense/fused.ply
   mask_dir: data/cubemap_faces_mass13k_manual
   # Cubemap face images (original, converted from panoramic)

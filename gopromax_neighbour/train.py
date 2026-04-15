@@ -417,7 +417,7 @@ def load_camera(cam_info: CameraInfo, resolution_scale: float = 1.0):
     for k, v in cam_info.guidance.items():
         if k in ("mask", "sky_mask", "acc_mask", "moving_mask"):
             guidance[k] = _pil_to_torch(v, resolution, Image.NEAREST).bool()
-        elif k == "lidar_depth":
+        elif k in ("lidar_depth", "mono_depth"):
             t = torch.from_numpy(v).float()
             if resolution is not None:
                 t = F.interpolate(
@@ -1004,6 +1004,36 @@ def psnr(rendered, gt, mask=None):
     return 10.0 * torch.log10(1.0 / mse.clamp(min=1e-10))
 
 
+def depth_pearson_loss(rendered_depth, mono_depth, mask=None):
+    """Scale-invariant Pearson-correlation depth loss.
+
+    Parameters
+    ----------
+    rendered_depth : (1, H, W)  rendered depth from the rasterizer
+    mono_depth     : (H, W)     monocular depth (sky pixels == 0)
+    mask           : (1, H, W)  optional; True = valid pixel
+
+    Returns 1 − Pearson(r, m) so that 0 = perfect correlation.
+    Only non-sky (mono_depth > 0) pixels participate.
+    """
+    rd = rendered_depth.squeeze(0)           # (H, W)
+    md = mono_depth                          # (H, W)
+
+    valid = md > 0
+    if mask is not None:
+        valid = valid & mask.squeeze(0)
+
+    if valid.sum() < 10:
+        return rendered_depth.new_tensor(0.0)
+
+    r = rd[valid]
+    m = md[valid]
+    r = r - r.mean()
+    m = m - m.mean()
+    corr = (r * m).sum() / (r.norm() * m.norm() + 1e-8)
+    return 1.0 - corr
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  §8  Dataset Reader  (COLMAP + cubemap images + sky masks)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1032,8 +1062,10 @@ def read_scene(
     images_dir: str,
     mask_dir: str,
     moving_mask_dir: str = "",
+    depth_dir: str = "",
     split_test: int = 8,
     workspace: str = "",
+    max_frames: int = 0,
 ) -> SceneInfo:
     """Read COLMAP model, images, masks, and point cloud.
 
@@ -1044,8 +1076,10 @@ def read_scene(
     images_dir    : path to cubemap face images
     mask_dir      : path to sky mask images
     moving_mask_dir : path to moving object mask images (255=moving, 0=static)
+    depth_dir     : path to monocular depth maps (*_depth_raw.npy, sky=0)
     split_test    : every Nth frame → test set
     workspace     : project root for resolving relative paths
+    max_frames    : if >0, only load the first N frames (for quick testing)
     """
     src = Path(source_path)
     ws = Path(workspace) if workspace else Path.cwd()
@@ -1061,6 +1095,7 @@ def read_scene(
     images_path = _resolve(images_dir)
     mask_path = _resolve(mask_dir) if mask_dir else None
     moving_mask_path = _resolve(moving_mask_dir) if moving_mask_dir else None
+    depth_path = _resolve(depth_dir) if depth_dir else None
     pcd_path = _resolve(point_cloud_path)
 
     assert (sparse_dir / "cameras.bin").exists(), \
@@ -1084,6 +1119,9 @@ def read_scene(
             (colmap_img, face_name))
 
     unique_frames = list(frame_groups.keys())
+    if max_frames > 0:
+        unique_frames = unique_frames[:max_frames]
+        print(f"[Scene] Limiting to first {max_frames} frames for quick testing")
     print(f"[Scene] Unique frames: {len(unique_frames)}, "
           f"faces/frame: {[len(v) for v in list(frame_groups.values())[:3]]}...")
 
@@ -1143,6 +1181,13 @@ def read_scene(
                             break
                 if m_file.exists():
                     guidance["mask"] = Image.open(str(m_file)).convert("L")
+
+            # ── Load monocular depth ──────────────────────────────────
+            if depth_path is not None:
+                stem = Path(colmap_img.name).stem
+                npy_file = depth_path / f"{stem}_depth_raw.npy"
+                if npy_file.exists():
+                    guidance["mono_depth"] = np.load(str(npy_file)).astype(np.float32)
 
             # ── Load moving object mask ───────────────────────────────
             if moving_mask_path is not None:
@@ -1267,6 +1312,8 @@ DEFAULT_CFG = {
         "lambda_dssim": 0.2,
         "lambda_sky_acc": 0.01,
         "lambda_sh_reg": 0.001,
+        "lambda_opacity_entropy": 0.0,
+        "lambda_depth": 0.0,
     },
 }
 
@@ -1528,8 +1575,10 @@ def training(cfg: dict):
         images_dir=data_cfg["images"],
         mask_dir=data_cfg.get("mask_dir", ""),
         moving_mask_dir=data_cfg.get("moving_mask_dir", ""),
+        depth_dir=data_cfg.get("depth_dir", ""),
         split_test=data_cfg.get("split_test", 8),
         workspace=workspace,
+        max_frames=data_cfg.get("max_frames", 0),
     )
 
     # Save input PLY
@@ -1741,6 +1790,27 @@ def training(cfg: dict):
                 scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
                 loss += sky_acc_loss
 
+            # ── Opacity entropy regularisation ─────────────────────
+            #     Push opacity toward 0 or 1 to prevent semi-transparent
+            #     layers stacking at incorrect depths.
+            lambda_oe = optim_cfg.get("lambda_opacity_entropy", 0.0)
+            if lambda_oe > 0:
+                o = gaussians.get_opacity.clamp(1e-6, 1.0 - 1e-6)
+                oe_loss = lambda_oe * -(o * o.log() + (1 - o) * (1 - o).log()).mean()
+                scalar_dict["opacity_entropy_loss"] = oe_loss.item()
+                loss += oe_loss
+
+            # ── Monocular depth supervision (Pearson) ──────────────
+            lambda_depth = optim_cfg.get("lambda_depth", 0.0)
+            if lambda_depth > 0 and "mono_depth" in cam.guidance:
+                mono_depth = cam.guidance["mono_depth"]
+                mono_depth = (mono_depth.cuda(non_blocking=True)
+                              if not mono_depth.is_cuda else mono_depth)
+                d_loss = lambda_depth * depth_pearson_loss(
+                    depth, mono_depth, mask)
+                scalar_dict["depth_loss"] = d_loss.item()
+                loss += d_loss
+
             scalar_dict["loss"] = loss.item()
 
             # ── SSIM / PSNR for logging (detached) ────────────────────
@@ -1905,11 +1975,22 @@ def main():
     parser.add_argument(
         "--output-dir", default=None,
         help="Base directory for training outputs. Defaults to the config value or 'output'.")
+    parser.add_argument(
+        "--max_frames", type=int, default=None,
+        help="Only load the first N frames for quick testing. Overrides config value.")
+    parser.add_argument(
+        "--gpu", type=int, default=None,
+        help="GPU device index to use (sets CUDA_VISIBLE_DEVICES).")
     args = parser.parse_args()
+
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
     cfg = load_config(args.config)
     if args.output_dir is not None:
         cfg["output_root"] = args.output_dir
+    if args.max_frames is not None:
+        cfg.setdefault("data", {})["max_frames"] = args.max_frames
 
     print(f"Task: {cfg['task']}  Exp: {cfg['exp_name']}")
 

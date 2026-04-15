@@ -19,14 +19,16 @@ data:
   type: GOPROMAX_NEIGHBOUR
   white_background: false
   split_test: 8
+  max_frames: 30    # set to 0 to use all frames
   point_cloud_path: data/colmap_pointcloud_dense/fused.ply
   mask_dir: data/cubemap_faces_mass13k_manual
+  depth_dir: data/cubemap_faces_da2
   # Cubemap face images (original, converted from panoramic)
   images: data/cubemap_faces
 
 model:
   gaussian:
-    sh_degree: 4
+    sh_degree: 3
   nsg:
     include_bkgd: true
     include_sky: false
@@ -42,7 +44,7 @@ optim:
   densification_interval: 75
   densify_from_epoch: 3
   densify_until_epoch: 900
-  densify_grad_threshold_bkgd: 0.00018
+  densify_grad_threshold_bkgd: 0.003
   position_lr_init: 0.00016
   position_lr_final: 1.6e-06
   position_lr_max_epochs: 135
@@ -51,4 +53,6 @@ optim:
   prune_min_opacity: 0.0025
   lambda_l1: 1.0
   lambda_dssim: 0.2
+  lambda_depth: 0.2
+  lambda_opacity_entropy: 0.02
   lambda_color_correction: 0.001
