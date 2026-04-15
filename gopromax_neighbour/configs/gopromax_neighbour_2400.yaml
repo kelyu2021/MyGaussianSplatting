@@ -10,7 +10,7 @@
 
 task: gopromax_neighbour
 exp_name: sky_mask_v1
-gpus: [0, 1]
+gpus: [1]
 
 # COLMAP model directory (contains sparse/ and fused.ply)
 source_path: data/colmap_pointcloud_dense

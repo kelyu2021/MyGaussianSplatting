@@ -5,7 +5,9 @@ nohup python train.py --config configs/gopromax_neighbour_180.yaml > ./output/go
 mkdir output
 nohup python train.py --config configs/gopromax_neighbour_1200.yaml > ./output/gopromax_neighbour_1200.yaml.log 2>&1 &
 
-nohup python train.py --config configs/gopromax_neighbour_1800.yaml > ./output/gopromax_neighbour_1800.yaml.log 2>&1 &
+nohup python train.py --config configs/gopromax_neighbour_2400.yaml > ./output/gopromax_neighbour_1800.yaml.log 2>&1 &
+
+nohup python train.py --config configs/gopromax_neighbour_2400.yaml --output-dir output_version_4_2400 > ./output_version_4_2400/gopromax_neighbour_2400.yaml.log 2>&1 &
 
 cd gopromax_neighbour
 python render.py --config configs/gopromax_neighbour_180.yaml --mode evaluate
@@ -24,6 +26,14 @@ cd /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour
 conda activate gopro_360
 CUDA_VISIBLE_DEVICES=1 python render_adversarial.py --config configs/gopromax_neighbour_1200.yaml --model_root output_version_2 --road_width 1 --epoch 1200 2>&1
 
+# gan-style
+cd gopromax_neighbour
+nohup python train_gan.py \
+    --config configs/gopromax_neighbour_1200.yaml \
+    --model_root output_version_3 \
+    --road_width 0.5 \
+    --epoch 1200 \
+    --gan_epochs 200 > output/train_gan_gopromax_neighbour_1200.yaml.log 2>&1 &
 
 # sparse point cloud
 python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 1 --matcher exhaustive

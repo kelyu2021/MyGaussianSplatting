@@ -1220,6 +1220,7 @@ def read_scene(
 DEFAULT_CFG = {
     "task": "gopromax_neighbour",
     "exp_name": "default",
+    "output_root": "output",
     "gpus": [0],
     "source_path": "data/colmap_pointcloud_dense",
 
@@ -1296,7 +1297,11 @@ def prepare_output(cfg: dict, workspace: str):
     """Create output directories and return a TensorBoard writer (or None)."""
     task = cfg["task"]
     exp = cfg["exp_name"]
-    model_path = os.path.join(workspace, "output", task, exp)
+    output_root = cfg.get("output_root", "output")
+    if not os.path.isabs(output_root):
+        output_root = os.path.join(workspace, output_root)
+
+    model_path = os.path.join(output_root, task, exp)
     os.makedirs(model_path, exist_ok=True)
     trained_model_dir = os.path.join(model_path, "trained_model")
     os.makedirs(trained_model_dir, exist_ok=True)
@@ -1305,7 +1310,7 @@ def prepare_output(cfg: dict, workspace: str):
     log_images_dir = os.path.join(model_path, "log_images")
     os.makedirs(log_images_dir, exist_ok=True)
 
-    record_dir = os.path.join(workspace, "output", "record", task, exp)
+    record_dir = os.path.join(output_root, "record", task, exp)
     os.makedirs(record_dir, exist_ok=True)
 
     tb_writer = None
@@ -1316,6 +1321,15 @@ def prepare_output(cfg: dict, workspace: str):
     cfg_path = os.path.join(model_path, "config.yaml")
     with open(cfg_path, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False)
+
+    # Save cfg_args (needed by render.py / viewers)
+    with open(os.path.join(model_path, "cfg_args"), "w") as fp:
+        fp.write(str(argparse.Namespace(
+            sh_degree=cfg["model"]["sh_degree"],
+            white_background=cfg["data"].get("white_background", False),
+            source_path=cfg["source_path"],
+            model_path=model_path,
+        )))
 
     # CSV metric files for visualize_metrics.py
     train_csv_path = os.path.join(model_path, "train_metrics.csv")
@@ -1523,6 +1537,37 @@ def training(cfg: dict):
     store_ply(input_ply,
               scene_info.point_cloud.points,
               scene_info.point_cloud.colors)
+
+    # Save cameras.json
+    def _fov2focal(fov, pixels):
+        return pixels / (2.0 * math.tan(fov / 2.0))
+
+    def _camera_info_to_json(cid, cam_info):
+        Rt = np.eye(4)
+        Rt[:3, :3] = cam_info.R.T
+        Rt[:3, 3] = cam_info.T
+        W2C = np.linalg.inv(Rt)
+        pos = W2C[:3, 3]
+        rot = W2C[:3, :3]
+        return {
+            'id': cid,
+            'img_name': cam_info.image_name,
+            'width': cam_info.width,
+            'height': cam_info.height,
+            'position': pos.tolist(),
+            'rotation': [x.tolist() for x in rot],
+            'fy': _fov2focal(cam_info.FovY, cam_info.height),
+            'fx': _fov2focal(cam_info.FovX, cam_info.width),
+        }
+
+    json_cams = []
+    all_cam_infos = list(scene_info.test_cameras) + list(scene_info.train_cameras)
+    for cid, ci in enumerate(all_cam_infos):
+        json_cams.append(_camera_info_to_json(cid, ci))
+    cam_json_path = os.path.join(dirs["model_path"], "cameras.json")
+    with open(cam_json_path, "w") as fp:
+        json.dump(json_cams, fp)
+    print(f"Saved cameras.json ({len(json_cams)} cameras) to {cam_json_path}")
 
     # Build Camera objects
     print("Loading training cameras …")
@@ -1790,7 +1835,7 @@ def training(cfg: dict):
             if epoch in save_epochs_set:
                 ply_path = os.path.join(
                     dirs["point_cloud_dir"],
-                    f"epoch_{epoch}", "point_cloud.ply")
+                    f"iteration_{epoch}", "point_cloud.ply")
                 gaussians.save_ply(ply_path)
 
             # ── Opacity reset ─────────────────────────────────────────
@@ -1857,9 +1902,15 @@ def main():
     parser.add_argument(
         "--config", default="configs/gopromax_neighbour.yaml",
         help="Path to YAML config file.")
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="Base directory for training outputs. Defaults to the config value or 'output'.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.output_dir is not None:
+        cfg["output_root"] = args.output_dir
+
     print(f"Task: {cfg['task']}  Exp: {cfg['exp_name']}")
 
     # Reproducibility
