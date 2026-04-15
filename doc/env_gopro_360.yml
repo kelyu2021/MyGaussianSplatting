@@ -2,6 +2,7 @@ name: gopro_360
 channels:
   - defaults
   - conda-forge
+  - nvidia
 dependencies:
   - _libgcc_mutex=0.1=main
   - _openmp_mutex=5.1=1_gnu
@@ -31,7 +32,7 @@ dependencies:
   - cuda-cuxxfilt=12.6.77=hbd13f7d_1
   - cuda-driver-dev=12.6.77=h5888daf_0
   - cuda-driver-dev_linux-64=12.6.77=h3f2d84a_0
-  - cuda-gdb=12.6.77=h50b4baa_1
+  - cuda-gdb=12.6.77
   - cuda-libraries=12.6.3=ha770c72_0
   - cuda-libraries-dev=12.6.3=ha770c72_0
   - cuda-nsight=12.6.77=h7938cbb_0
@@ -179,6 +180,7 @@ dependencies:
   - xz=5.8.2=h448239c_0
   - zlib=1.3.1=hb25bd0a_0
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu126
       - absl-py==2.4.0
       - annotated-doc==0.0.4
       - anyio==4.12.1
@@ -186,7 +188,6 @@ dependencies:
       - click==8.3.1
       - contourpy==1.3.3
       - cycler==0.12.1
-      - diff-gaussian-rasterization==0.0.0
       - filelock==3.20.0
       - fonttools==4.61.1
       - fsspec==2025.12.0
@@ -237,7 +238,6 @@ dependencies:
       - safetensors==0.7.0
       - scipy==1.17.1
       - shellingham==1.5.4
-      - simple-knn==0.0.0
       - six==1.17.0
       - sympy==1.14.0
       - tensorboard==2.20.0
