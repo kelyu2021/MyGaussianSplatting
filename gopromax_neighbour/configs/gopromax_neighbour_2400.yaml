@@ -44,7 +44,7 @@ optim:
   densification_interval: 75
   densify_from_epoch: 3
   densify_until_epoch: 900
-  densify_grad_threshold_bkgd: 0.003
+  densify_grad_threshold_bkgd: 0.0003
   position_lr_init: 0.00016
   position_lr_final: 1.6e-06
   position_lr_max_epochs: 135
@@ -54,5 +54,5 @@ optim:
   lambda_l1: 1.0
   lambda_dssim: 0.2
   lambda_depth: 0.2
-  lambda_opacity_entropy: 0.02
+  lambda_opacity_entropy: 0.005
   lambda_color_correction: 0.001
