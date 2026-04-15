@@ -5,7 +5,7 @@ nohup python train.py --config configs/gopromax_neighbour_180.yaml > ./output/go
 mkdir output
 nohup python train.py --config configs/gopromax_neighbour_1200.yaml > ./output/gopromax_neighbour_1200.yaml.log 2>&1 &
 
-nohup python train.py --config configs/gopromax_neighbour_2400.yaml --output-dir output_version_5_2400 > ./output_version_5_2400/gopromax_neighbour_2400.yaml.log 2>&1 &
+nohup python train.py --config configs/gopromax_neighbour_2400.yaml --max_frames 30 --gpu 5 --output-dir output_version_6_2400_30 > ./output_version_6_2400_30/gopromax_neighbour_2400.yaml.log 2>&1 &
 
 cd gopromax_neighbour
 python render.py --config configs/gopromax_neighbour_180.yaml --mode evaluate
