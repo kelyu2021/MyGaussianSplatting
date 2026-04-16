@@ -1004,20 +1004,23 @@ def psnr(rendered, gt, mask=None):
     return 10.0 * torch.log10(1.0 / mse.clamp(min=1e-10))
 
 
-def depth_pearson_loss(rendered_depth, mono_depth, mask=None):
-    """Scale-invariant Pearson-correlation depth loss.
+def depth_mono_loss(rendered_depth, mono_depth, acc, mask=None):
+    """Robust scale-shift-invariant depth loss for monocular depth.
+
+    Adapted from gopro360's LiDAR depth loss.  Since monocular depth
+    has unknown absolute scale, we first align it to the rendered depth
+    via least-squares scale+shift, then compute robust L1.
 
     Parameters
     ----------
     rendered_depth : (1, H, W)  rendered depth from the rasterizer
-    mono_depth     : (H, W)     monocular depth (sky pixels == 0)
+    mono_depth     : (H, W)     monocular relative depth (sky == 0)
+    acc            : (1, H, W)  accumulated alpha from rasterizer
     mask           : (1, H, W)  optional; True = valid pixel
-
-    Returns 1 − Pearson(r, m) so that 0 = perfect correlation.
-    Only non-sky (mono_depth > 0) pixels participate.
     """
-    rd = rendered_depth.squeeze(0)           # (H, W)
-    md = mono_depth                          # (H, W)
+    # Expected per-pixel depth (normalised by alpha), same as gopro360
+    rd = (rendered_depth / (acc + 1e-10)).squeeze(0)   # (H, W)
+    md = mono_depth                                     # (H, W)
 
     valid = md > 0
     if mask is not None:
@@ -1028,10 +1031,22 @@ def depth_pearson_loss(rendered_depth, mono_depth, mask=None):
 
     r = rd[valid]
     m = md[valid]
-    r = r - r.mean()
-    m = m - m.mean()
-    corr = (r * m).sum() / (r.norm() * m.norm() + 1e-8)
-    return 1.0 - corr
+
+    # Closed-form least-squares: align mono → rendered  (detached)
+    with torch.no_grad():
+        m_mean = m.mean()
+        r_mean = r.mean()
+        m_c = m - m_mean
+        r_c = r - r_mean
+        scale = (m_c * r_c).sum() / (m_c * m_c).sum().clamp(min=1e-8)
+        shift = r_mean - scale * m_mean
+
+    aligned_m = scale * m + shift          # fully detached target
+
+    d_err = torch.abs(r - aligned_m)
+    # Robust: keep bottom 95 % of errors (discard outliers like gopro360)
+    d_err, _ = torch.topk(d_err, int(0.95 * d_err.numel()), largest=False)
+    return d_err.mean()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1800,14 +1815,14 @@ def training(cfg: dict):
                 scalar_dict["opacity_entropy_loss"] = oe_loss.item()
                 loss += oe_loss
 
-            # ── Monocular depth supervision (Pearson) ──────────────
+            # ── Monocular depth supervision (robust L1) ────────────
             lambda_depth = optim_cfg.get("lambda_depth", 0.0)
             if lambda_depth > 0 and "mono_depth" in cam.guidance:
                 mono_depth = cam.guidance["mono_depth"]
                 mono_depth = (mono_depth.cuda(non_blocking=True)
                               if not mono_depth.is_cuda else mono_depth)
-                d_loss = lambda_depth * depth_pearson_loss(
-                    depth, mono_depth, mask)
+                d_loss = lambda_depth * depth_mono_loss(
+                    depth, mono_depth, acc, mask)
                 scalar_dict["depth_loss"] = d_loss.item()
                 loss += d_loss
 

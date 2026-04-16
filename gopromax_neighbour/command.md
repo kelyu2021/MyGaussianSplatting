@@ -20,18 +20,29 @@ python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 #
 python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 --save_dir output/gopromax_neighbour/sky_mask_v1/plots  # save PNGs
 
 
+# 1. visualize comparison
 cd /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour
 conda activate gopro_360
-CUDA_VISIBLE_DEVICES=1 python render_adversarial.py --config configs/gopromax_neighbour_1200.yaml --model_root output_version_2 --road_width 1 --epoch 1200 2>&1
+## Pre-trained model (before GAN)
+python render_adversarial.py --config configs/gopromax_neighbour_360.yaml --model_root output_version_7_360 --lateral_sign -1 --road_width 0.5 --epoch 360
+## GAN-finetuned model (after GAN)
+python render_adversarial.py --config configs/gopromax_neighbour_360.yaml --model_root output_version_7_360_gan --lateral_sign -1 --road_width 0.5 --epoch 100
+
+# 2. Check training CSV metrics
+cat output/<task>/<exp>_gan/train_metrics.csv
+# 3. Check evaluation CSV
+cat output/<task>/<exp>_gan/eval_metrics.csv
 
 # gan-style
 cd gopromax_neighbour
-nohup python train_gan.py \
-    --config configs/gopromax_neighbour_1200.yaml \
-    --model_root output_version_3 \
-    --road_width 0.5 \
-    --epoch 1200 \
-    --gan_epochs 200 > output/train_gan_gopromax_neighbour_1200.yaml.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup python train_gan.py \
+    --config configs/gopromax_neighbour_360.yaml \
+    --model_root output_version_7_360 \
+    --epoch 360 \
+    --road_width 0.2 \
+    --lateral_sign 1 \
+    --output_dir output_version_7_360_gan \
+    --gan_epochs 100 > output_version_7_360_gan/train_gan_gopromax_neighbour_360.yaml.log 2>&1 &
 
 # sparse point cloud
 python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 1 --matcher exhaustive

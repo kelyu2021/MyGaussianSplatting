@@ -10,7 +10,7 @@
 
 task: gopromax_neighbour
 exp_name: sky_mask_v1
-gpus: [0, 1]
+gpus: [1]
 
 # COLMAP model directory (contains sparse/ and fused.ply)
 source_path: data/colmap_pointcloud_dense
@@ -35,21 +35,21 @@ model:
 
 train:
   epochs: 1200
-  test_epochs: [200, 400, 600, 800, 1000, 1200]
-  save_epochs: [600, 1200]
-  checkpoint_epochs: [600, 1200]
+  test_epochs: [180, 400, 600, 800, 1000, 1200]
+  save_epochs: [180, 600, 1200]
+  checkpoint_epochs: [180, 600, 1200]
 
 optim:
-  densification_interval: 75
+  densification_interval: 100
   densify_from_epoch: 3
-  densify_until_epoch: 900
-  densify_grad_threshold_bkgd: 0.00018
+  densify_until_epoch: 90
+  densify_grad_threshold_bkgd: 0.0002
   position_lr_init: 0.00016
   position_lr_final: 1.6e-06
   position_lr_max_epochs: 135
-  opacity_reset_epoch_interval: 22
+  opacity_reset_epoch_interval: 18
   prune_epoch_interval: 30
-  prune_min_opacity: 0.0025
+  prune_min_opacity: 0.003
   lambda_l1: 1.0
   lambda_dssim: 0.2
   lambda_color_correction: 0.001

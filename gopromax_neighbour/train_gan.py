@@ -38,6 +38,7 @@ import os
 import sys
 import math
 import copy
+import shutil
 import argparse
 import csv
 from pathlib import Path
@@ -297,11 +298,15 @@ def build_jittered_camera(
     cam: Camera,
     up: np.ndarray,
     road_width: float,
+    lateral_sign: float = 1.0,
 ) -> Camera:
     """Build an off-road version of an on-road camera.
 
     Shifts the camera laterally by ``road_width`` metres, perpendicular
     to the camera's own forward (viewing) direction in the ground plane.
+
+    lateral_sign : +1 shift to the left of walking direction,
+                   -1 shift to the right.
     """
     R_c2w = cam.R                # (3,3) numpy
     T_w2c = cam.T                # (3,)  numpy
@@ -312,6 +317,7 @@ def build_jittered_camera(
     # Lateral = perpendicular to camera forward, in the ground plane
     lateral = np.cross(cam_forward, up)
     lateral /= np.linalg.norm(lateral) + 1e-12
+    lateral *= lateral_sign
 
     # Old camera centre in world coords
     C_old = -R_c2w @ T_w2c
@@ -370,6 +376,7 @@ def _load_checkpoint(ckpt_dir: str, epoch: int | None, sh_degree: int):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def training_gan(cfg: dict, model_root: str, road_width: float,
+                 lateral_sign: float,
                  pretrained_epoch: int | None, gan_epochs: int,
                  critic_iters: int, lambda_gp: float,
                  lambda_recon: float, lambda_dssim: float,
@@ -456,7 +463,8 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
     print(f"Trajectory directions:")
     print(f"  forward : {forward_dir}")
     print(f"  up      : {up_dir}")
-    print(f"  lateral : {lateral_dir}  (road_width = {road_width:.2f} m)")
+    print(f"  lateral : {lateral_dir}  (road_width = {road_width:.2f} m, "
+          f"lateral_sign = {lateral_sign})")
 
     # ── Load pre-trained Gaussians ────────────────────────────────────
     model_path = os.path.join(
@@ -470,6 +478,15 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
 
     print(f"Loaded pre-trained model from epoch {loaded_epoch}")
 
+    # ── Copy input.ply from pre-trained model to GAN output ───────────
+    src_input_ply = os.path.join(model_path, "input.ply")
+    dst_input_ply = os.path.join(dirs["model_path"], "input.ply")
+    if os.path.isfile(src_input_ply):
+        shutil.copy2(src_input_ply, dst_input_ply)
+        print(f"Copied input.ply -> {dst_input_ply}")
+    else:
+        print(f"Warning: {src_input_ply} not found, skipping input.ply copy")
+
     # ── Setup Gaussian optimizer for fine-tuning ──────────────────────
     # Use lower learning rates for fine-tuning
     ft_optim_cfg = copy.deepcopy(optim_cfg)
@@ -479,9 +496,9 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
     ft_optim_cfg["position_lr_max_steps"] = (
         gan_epochs * len(train_cameras))
     ft_optim_cfg["feature_lr"] = lr_generator * 5.0
-    ft_optim_cfg["opacity_lr"] = lr_generator * 100.0
-    ft_optim_cfg["scaling_lr"] = lr_generator * 10.0
-    ft_optim_cfg["rotation_lr"] = lr_generator * 2.0
+    ft_optim_cfg["opacity_lr"] = lr_generator * 5.0
+    ft_optim_cfg["scaling_lr"] = lr_generator * 2.0
+    ft_optim_cfg["rotation_lr"] = lr_generator * 1.0
 
     gaussians.training_setup(ft_optim_cfg)
     # Restore active SH degree to max (already trained)
@@ -502,6 +519,35 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                 "wasserstein_dist", "psnr_onroad", "psnr_offroad",
                 "n_points",
             ])
+
+    # ── Critic warm-up ──────────────────────────────────────────────
+    # Train the critic alone for a few epochs so it provides a
+    # meaningful gradient signal before the generator starts updating.
+    warmup_epochs = 10
+    print(f"\nCritic warm-up: {warmup_epochs} epochs "
+          f"(generator frozen) ...")
+    for wu_ep in range(1, warmup_epochs + 1):
+        wu_stack = list(train_cameras)
+        shuffle(wu_stack)
+        wu_loss = 0.0
+        for cam in wu_stack:
+            jit_cam = build_jittered_camera(cam, up_dir, road_width,
+                                             lateral_sign)
+            with torch.no_grad():
+                real_img = render(cam, gaussians, bg_color)["rgb"].detach()
+                fake_img = render(jit_cam, gaussians, bg_color)["rgb"].detach()
+            real_score = critic(real_img.unsqueeze(0))
+            fake_score = critic(fake_img.unsqueeze(0))
+            loss_c = fake_score.mean() - real_score.mean()
+            gp = gradient_penalty(critic, real_img.unsqueeze(0),
+                                  fake_img.unsqueeze(0), real_img.device)
+            loss_c = loss_c + lambda_gp * gp
+            critic_optimizer.zero_grad()
+            loss_c.backward()
+            critic_optimizer.step()
+            wu_loss += loss_c.item()
+        print(f"  warm-up epoch {wu_ep}/{warmup_epochs}  "
+              f"critic_loss = {wu_loss / len(wu_stack):.4f}")
 
     # ── Training ──────────────────────────────────────────────────────
     print(f"\nGAN fine-tuning: {gan_epochs} epochs × "
@@ -538,7 +584,8 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
             step += 1
 
             # ── Build jittered camera ─────────────────────────────
-            jit_cam = build_jittered_camera(cam, up_dir, road_width)
+            jit_cam = build_jittered_camera(cam, up_dir, road_width,
+                                             lateral_sign)
 
             # ── Load masks ────────────────────────────────────────
             sky_mask = None
@@ -621,6 +668,8 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                 # --- Adversarial loss: fool the critic ---
                 fake_score = critic(fake_img.unsqueeze(0))
                 loss_adv = -fake_score.mean()
+                # Clamp to prevent large adversarial gradients
+                loss_adv = loss_adv.clamp(-50.0, 50.0)
 
                 # --- Reconstruction loss on on-road view ---
                 Ll1 = l1_loss(real_img, gt_image, mask)
@@ -651,11 +700,11 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
 
                 loss_g.backward()
 
-                # Density control stats
-                with torch.no_grad():
-                    gaussians.set_max_radii2D(radii, visibility)
-                    gaussians.add_densification_stats(
-                        viewspace_pts, visibility)
+                # Clip Gaussian gradients to prevent destructive updates
+                all_params = []
+                for pg in gaussians.optimizer.param_groups:
+                    all_params.extend(pg["params"])
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
 
                 gaussians.update_optimizer()
 
@@ -795,6 +844,9 @@ def main():
         "--road_width", type=float, default=0.5,
         help="Lateral shift in metres for jittered cameras (default: 0.5).")
     parser.add_argument(
+        "--lateral_sign", type=float, default=1.0,
+        help="+1 shift left of walking direction, -1 shift right (default: 1.0).")
+    parser.add_argument(
         "--epoch", type=int, default=None,
         help="Pre-trained checkpoint epoch to load (default: latest).")
     parser.add_argument(
@@ -818,6 +870,9 @@ def main():
     parser.add_argument(
         "--lr_generator", type=float, default=1e-5,
         help="Generator (Gaussian params) learning rate (default: 1e-5).")
+    parser.add_argument(
+        "--output_dir", type=str, default="output",
+        help="Root output directory (default: output).")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -831,10 +886,13 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.autograd.set_detect_anomaly(False)
 
+    cfg["output_root"] = args.output_dir
+
     training_gan(
         cfg,
         model_root=args.model_root,
         road_width=args.road_width,
+        lateral_sign=args.lateral_sign,
         pretrained_epoch=args.epoch,
         gan_epochs=args.gan_epochs,
         critic_iters=args.critic_iters,
