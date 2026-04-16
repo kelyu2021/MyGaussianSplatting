@@ -398,6 +398,11 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
     if gpus and gpus[0] >= 0:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(gpus[0]))
 
+    # Explicitly initialise the CUDA context before any .backward() call
+    # to avoid "no current CUDA context" cuBLAS warnings.
+    torch.cuda.set_device(0)
+    torch.cuda.init()
+
     white_bg = data_cfg.get("white_background", False)
     bg_color = torch.tensor(
         [1, 1, 1] if white_bg else [0, 0, 0],
@@ -530,7 +535,8 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
         wu_stack = list(train_cameras)
         shuffle(wu_stack)
         wu_loss = 0.0
-        for cam in wu_stack:
+        wu_w_dist = 0.0
+        for wi, cam in enumerate(wu_stack):
             jit_cam = build_jittered_camera(cam, up_dir, road_width,
                                              lateral_sign)
             with torch.no_grad():
@@ -546,8 +552,18 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
             loss_c.backward()
             critic_optimizer.step()
             wu_loss += loss_c.item()
+            wu_w_dist += (real_score.mean() - fake_score.mean()).item()
+            if wi % max(1, len(wu_stack) // 4) == 0:
+                print(f"    warm-up {wu_ep}/{warmup_epochs} "
+                      f"[{wi+1}/{len(wu_stack)}] "
+                      f"loss={loss_c.item():.4f}  "
+                      f"real={real_score.mean().item():.4f}  "
+                      f"fake={fake_score.mean().item():.4f}  "
+                      f"GP={gp.item():.4f}")
+        n_wu = len(wu_stack)
         print(f"  warm-up epoch {wu_ep}/{warmup_epochs}  "
-              f"critic_loss = {wu_loss / len(wu_stack):.4f}")
+              f"critic_loss={wu_loss / n_wu:.4f}  "
+              f"W_dist={wu_w_dist / n_wu:.4f}")
 
     # ── Training ──────────────────────────────────────────────────────
     print(f"\nGAN fine-tuning: {gan_epochs} epochs × "
@@ -559,12 +575,15 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
     print(f"  lr_critic    = {lr_critic}")
     print(f"  lr_generator = {lr_generator}")
 
+    log_every_n_steps = max(1, len(train_cameras) // 6)  # ~6 logs per epoch
+
     step = 0
     progress = tqdm(range(gan_epochs), desc="GAN Epochs", unit="ep")
 
     for epoch in range(1, gan_epochs + 1):
         viewpoint_stack = list(train_cameras)
         shuffle(viewpoint_stack)
+        n_cameras = len(viewpoint_stack)
 
         # Per-epoch accumulators
         ep_critic_loss = 0.0
@@ -648,6 +667,15 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                 ep_critic_loss += loss_c.item()
                 ep_w_dist += w_dist.item()
 
+                if cam_idx % log_every_n_steps == 0:
+                    tqdm.write(
+                        f"  [E{epoch} C {cam_idx+1}/{n_cameras}] "
+                        f"critic_loss={loss_c.item():.4f}  "
+                        f"W_dist={w_dist.item():.4f}  "
+                        f"real_score={real_score.mean().item():.4f}  "
+                        f"fake_score={fake_score.mean().item():.4f}  "
+                        f"GP={gp.item():.4f}")
+
             # ==================================================
             #  GENERATOR STEP  (train Gaussians, freeze critic)
             # ==================================================
@@ -713,8 +741,22 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
 
                 # Logging metrics (detached)
                 with torch.no_grad():
-                    ep_psnr_on += psnr(real_img, gt_image, mask).item()
-                    ep_psnr_off += psnr(fake_img, gt_image, mask).item()
+                    cur_psnr_on = psnr(real_img, gt_image, mask).item()
+                    cur_psnr_off = psnr(fake_img, gt_image, mask).item()
+                    ep_psnr_on += cur_psnr_on
+                    ep_psnr_off += cur_psnr_off
+
+                if cam_idx % log_every_n_steps == 0:
+                    tqdm.write(
+                        f"  [E{epoch} G {cam_idx+1}/{n_cameras}] "
+                        f"loss_g={loss_g.item():.4f}  "
+                        f"adv={loss_adv.item():.4f}  "
+                        f"recon={loss_recon.item():.4f} "
+                        f"(L1={Ll1.item():.4f})  "
+                        f"sh_reg={sh_reg.item():.6f}  "
+                        f"sky={sky_loss.item():.6f}  "
+                        f"PSNR_on={cur_psnr_on:.2f}  "
+                        f"PSNR_off={cur_psnr_off:.2f}")
 
                 # Stash for end-of-epoch log images
                 log_gt_on = gt_image.detach()
@@ -751,6 +793,27 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
             "PSNR_on": f"{avg_psnr_on:.2f}",
             "#G": f"{gaussians.num_points:,}",
         })
+
+        # ── Detailed epoch summary ────────────────────────────────
+        with torch.no_grad():
+            xyz = gaussians.get_xyz
+            opac = gaussians.get_opacity
+            scale = gaussians.get_scaling
+            tqdm.write(
+                f"\n{'─'*72}\n"
+                f"  EPOCH {epoch}/{gan_epochs} SUMMARY\n"
+                f"  critic_steps={n_crit_steps}  gen_steps={n_gen_steps}\n"
+                f"  Loss  │ critic={avg_c:.4f}  gen={avg_g:.4f}  "
+                f"recon={avg_r:.4f}  W_dist={avg_w:.4f}\n"
+                f"  PSNR  │ on-road={avg_psnr_on:.2f}  "
+                f"off-road={avg_psnr_off:.2f}\n"
+                f"  Gauss │ N={gaussians.num_points:,}  "
+                f"xyz=[{xyz.min().item():.2f}, {xyz.max().item():.2f}]  "
+                f"opacity=[{opac.min().item():.3f}, {opac.max().item():.3f}] "
+                f"mean={opac.mean().item():.3f}  "
+                f"scale=[{scale.min().item():.4f}, {scale.max().item():.4f}] "
+                f"mean={scale.mean().item():.4f}\n"
+                f"{'─'*72}")
 
         # ── CSV logging ───────────────────────────────────────────
         with open(train_csv_path, "a", newline="") as f:
