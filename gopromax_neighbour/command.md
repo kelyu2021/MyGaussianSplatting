@@ -35,14 +35,14 @@ cat output/<task>/<exp>_gan/eval_metrics.csv
 
 # gan-style
 cd gopromax_neighbour
-CUDA_VISIBLE_DEVICES=1 nohup python train_gan.py \
+CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
     --config configs/gopromax_neighbour_360.yaml \
     --model_root output_version_7_360 \
     --epoch 360 \
     --road_width 0.2 \
     --lateral_sign 1 \
     --output_dir output_version_7_360_gan \
-    --gan_epochs 100 > output_version_7_360_gan/train_gan_gopromax_neighbour_360.yaml.log 2>&1 &
+    --gan_epochs 100 > output_version_7_360_gan/train.log 2>&1 &
 
 # sparse point cloud
 python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 1 --matcher exhaustive

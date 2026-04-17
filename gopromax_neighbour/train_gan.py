@@ -156,6 +156,117 @@ def save_log_images_gan(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  §0b  GAN-aware Evaluation (8-panel composite per test camera)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def evaluate_gan(
+    test_cameras, gaussians, bg_color, epoch,
+    up_dir: np.ndarray, road_width: float, lateral_sign: float,
+    tb_writer=None,
+    eval_csv_path: str | None = None, split: str = "test",
+    n_points: int | None = None,
+    save_dir: str | None = None,
+):
+    """Evaluate on test cameras with 8-panel composite images.
+
+    For each test camera, also renders from a laterally-jittered camera
+    and saves an 8-panel grid (2 rows × 4 cols):
+      Top row:    GT | On-road RGB | On-road Depth | On-road Acc
+      Bottom row: Mask | Off-road RGB | Off-road Depth | Off-road Acc
+    """
+    if not test_cameras:
+        return {}
+
+    import cv2
+    import torchvision
+
+    l1_list, psnr_list, ssim_list = [], [], []
+
+    img_dir = None
+    if save_dir is not None:
+        img_dir = os.path.join(save_dir, split, f"epoch_{epoch}")
+        os.makedirs(img_dir, exist_ok=True)
+
+    for cam in test_cameras:
+        gt = cam.original_image.cuda(non_blocking=True)
+        sky_mask = cam.guidance.get("mask")
+        if sky_mask is not None:
+            sky_mask = sky_mask.cuda(non_blocking=True)
+        moving_mask = cam.guidance.get("moving_mask")
+        if moving_mask is not None:
+            moving_mask = moving_mask.cuda(non_blocking=True)
+
+        mask = sky_mask
+        if mask is not None and moving_mask is not None:
+            mask = mask & (~moving_mask)
+        elif moving_mask is not None:
+            mask = ~moving_mask
+
+        # Render on-road
+        pkg_on = render(cam, gaussians, bg_color)
+        image_on = pkg_on["rgb"]
+
+        # Render off-road (jittered)
+        jit_cam = build_jittered_camera(cam, up_dir, road_width,
+                                         lateral_sign)
+        pkg_off = render(jit_cam, gaussians, bg_color)
+        image_off = pkg_off["rgb"]
+
+        # Metrics (on-road)
+        l1_list.append(l1_loss(image_on, gt, mask).item())
+        psnr_list.append(psnr(image_on, gt, mask).item())
+        ssim_list.append(ssim(image_on, gt, mask=mask).item())
+
+        # Save 8-panel composite
+        if img_dir is not None:
+            name = cam.image_name
+            save_log_images_gan(
+                img_dir, 0,  # epoch unused in filename below
+                gt, image_on, pkg_on["depth"], pkg_on["acc"],
+                image_off, pkg_off["depth"], pkg_off["acc"],
+                sky_mask=sky_mask,
+                moving_mask=moving_mask,
+            )
+            # Rename the generic file to camera-specific name
+            generic = os.path.join(img_dir, "epoch_0000.png")
+            target = os.path.join(img_dir, f"{name}_composite.png")
+            if os.path.isfile(generic):
+                os.rename(generic, target)
+
+    metrics = {
+        "l1_loss": np.mean(l1_list),
+        "psnr": np.mean(psnr_list),
+        "ssim": np.mean(ssim_list),
+    }
+    if n_points is not None:
+        metrics["n_points"] = n_points
+
+    print(f"  [EVAL {split} epoch {epoch}] "
+          f"L1={metrics['l1_loss']:.4f}  "
+          f"PSNR={metrics['psnr']:.2f}  "
+          f"SSIM={metrics['ssim']:.4f}")
+
+    if tb_writer is not None:
+        for k, v in metrics.items():
+            tb_writer.add_scalar(f"eval_{split}/{k}", v, epoch)
+
+    if eval_csv_path is not None:
+        file_exists = os.path.isfile(eval_csv_path)
+        row = {"split": split, "epoch": epoch}
+        row.update(metrics)
+        fieldnames = ["split", "epoch", "l1_loss", "psnr", "ssim", "n_points"]
+        with open(eval_csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=fieldnames, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    return metrics
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  §1  Critic Network (PatchGAN / WGAN-GP)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -417,6 +528,7 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
         moving_mask_dir=data_cfg.get("moving_mask_dir", ""),
         split_test=data_cfg.get("split_test", 8),
         workspace=workspace,
+        max_frames=data_cfg.get("max_frames", 0),
     )
 
     # Save cameras.json
@@ -845,11 +957,15 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
             except Exception:
                 pass
 
-        # ── Evaluation every 50 epochs ────────────────────────────
-        if epoch % 50 == 0 or epoch == gan_epochs:
+        # ── Evaluation every 10 epochs ────────────────────────────
+        if epoch % 10 == 0 or epoch == gan_epochs:
             with torch.no_grad():
-                evaluate(test_cameras, gaussians, bg_color,
-                         epoch, tb_writer,
+                evaluate_gan(test_cameras, gaussians, bg_color,
+                         epoch,
+                         up_dir=up_dir,
+                         road_width=road_width,
+                         lateral_sign=lateral_sign,
+                         tb_writer=tb_writer,
                          eval_csv_path=dirs["eval_csv_path"],
                          split="test",
                          n_points=gaussians.num_points,
