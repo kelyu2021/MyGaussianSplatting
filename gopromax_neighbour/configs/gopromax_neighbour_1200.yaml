@@ -19,7 +19,7 @@ data:
   type: GOPROMAX_NEIGHBOUR
   white_background: false
   split_test: 8
-  max_frames: 30    # set to 0 to use all frames
+  max_frames: 0    # set to 0 to use all frames
   point_cloud_path: data/colmap_pointcloud_dense/fused.ply
   mask_dir: data/cubemap_faces_mass13k_manual
   # Cubemap face images (original, converted from panoramic)
@@ -27,7 +27,7 @@ data:
 
 model:
   gaussian:
-    sh_degree: 4
+    sh_degree: 3
   nsg:
     include_bkgd: true
     include_sky: false
@@ -35,9 +35,9 @@ model:
 
 train:
   epochs: 1200
-  test_epochs: [180, 400, 600, 800, 1000, 1200]
-  save_epochs: [180, 600, 1200]
-  checkpoint_epochs: [180, 600, 1200]
+  test_epochs: [400, 600, 800, 1000, 1200]
+  save_epochs: [400, 600, 800, 1000, 1200]
+  checkpoint_epochs: [400, 600, 800, 1000, 1200]
 
 optim:
   densification_interval: 100

@@ -35,7 +35,7 @@ cat output/<task>/<exp>_gan/eval_metrics.csv
 
 # gan-style
 cd gopromax_neighbour
-CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
+CUDA_VISIBLE_DEVICES=1 nohup python -u train_gan.py \
     --config configs/gopromax_neighbour_360.yaml \
     --model_root output_version_7_360 \
     --epoch 360 \

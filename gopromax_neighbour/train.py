@@ -1710,6 +1710,9 @@ def training(cfg: dict):
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
 
+    import time as _time
+    epoch_wall_start = _time.time()
+
     progress = tqdm(
         range(start_epoch, num_epochs),
         initial=start_epoch, total=num_epochs,
@@ -1719,6 +1722,7 @@ def training(cfg: dict):
     #  EPOCH LOOP
     # ══════════════════════════════════════════════════════════════════
     for epoch in range(start_epoch + 1, num_epochs + 1):
+        epoch_wall_start = _time.time()
 
         viewpoint_stack = list(train_cameras)
         shuffle(viewpoint_stack)
@@ -1874,6 +1878,10 @@ def training(cfg: dict):
                         )
                         if n_before != n_after:
                             scalar_dict["n_gaussians"] = n_after
+                            tqdm.write(
+                                f"  [E{epoch} step {cam_idx}] "
+                                f"densify: {n_before:,} → {n_after:,} "
+                                f"(Δ {n_after - n_before:+,})")
 
                 # ── Optimiser step ────────────────────────────────────
                 gaussians.update_optimizer()
@@ -1890,6 +1898,42 @@ def training(cfg: dict):
         # ══════════════════════════════════════════════════════════════
         with torch.no_grad():
             progress.update(1)
+
+            # ── Epoch summary log ─────────────────────────────────────
+            if epoch_count > 0:
+                epoch_wall_elapsed = _time.time() - epoch_wall_start
+                avg_loss = epoch_loss_sum / epoch_count
+                avg_l1 = epoch_l1_sum / epoch_count
+                avg_psnr = epoch_psnr_sum / epoch_count
+                avg_ssim = epoch_ssim_sum / epoch_count
+                cur_lr = gaussians.optimizer.param_groups[0]["lr"]
+                gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
+                xyz = gaussians.get_xyz
+                opac = gaussians.get_opacity
+                scale = gaussians.get_scaling
+                tqdm.write(
+                    f"\n{'─'*72}\n"
+                    f"  EPOCH {epoch}/{num_epochs}  "
+                    f"({epoch_wall_elapsed:.1f}s, "
+                    f"{epoch_count} cams)\n"
+                    f"  Loss  │ total={avg_loss:.6f}  "
+                    f"L1={avg_l1:.6f}  "
+                    f"PSNR={avg_psnr:.2f}  "
+                    f"SSIM={avg_ssim:.4f}\n"
+                    f"  EMA   │ loss={ema_loss:.6f}  "
+                    f"PSNR={ema_psnr:.2f}  "
+                    f"SSIM={ema_ssim:.4f}\n"
+                    f"  Gauss │ N={gaussians.num_points:,}  "
+                    f"xyz=[{xyz.min().item():.2f}, "
+                    f"{xyz.max().item():.2f}]  "
+                    f"opacity=[{opac.min().item():.3f}, "
+                    f"{opac.max().item():.3f}] "
+                    f"mean={opac.mean().item():.3f}  "
+                    f"scale_mean={scale.mean().item():.4f}\n"
+                    f"  LR={cur_lr:.2e}  "
+                    f"GPU={gpu_mem:.2f} GB  "
+                    f"SH={gaussians.active_sh_degree}\n"
+                    f"{'─'*72}")
 
             # ── Write train CSV row ───────────────────────────────────
             if epoch_count > 0:
@@ -1913,8 +1957,8 @@ def training(cfg: dict):
                     save_log_images(
                         dirs["log_images_dir"], epoch,
                         gt_image, image, depth, acc)
-                except Exception:
-                    pass
+                except Exception as e:
+                    tqdm.write(f"  [E{epoch}] log image save failed: {e}")
 
             # ── Save PLY ──────────────────────────────────────────────
             if epoch in save_epochs_set:

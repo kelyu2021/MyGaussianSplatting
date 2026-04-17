@@ -123,6 +123,7 @@ def build_adversarial_cameras(
     FovY: float,
     road_width: float = 6.0,
     lateral_sign: float = 1.0,
+    max_frames: int = 0,
 ) -> list[Camera]:
     """Read COLMAP poses, shift laterally, reverse order, rotate 180° yaw.
 
@@ -135,6 +136,7 @@ def build_adversarial_cameras(
     road_width   : lateral shift in metres  (positive = other side of road)
     lateral_sign : +1 shift to the left of walking direction,
                    -1 shift to the right
+    max_frames   : if >0, only use the first N frames
     """
     sparse = Path(sparse_dir)
     cameras_bin = read_cameras_binary(str(sparse / "cameras.bin"))
@@ -152,6 +154,9 @@ def build_adversarial_cameras(
             (face_name, R_c2w, T_w2c, img))
 
     frames = list(frame_groups.items())
+    if max_frames > 0:
+        frames = frames[:max_frames]
+        print(f"[Adversarial] Limiting to first {max_frames} frames")
     n_frames = len(frames)
     print(f"[Adversarial] {n_frames} frames, "
           f"faces/frame: {len(frames[0][1])}")
@@ -315,6 +320,7 @@ def render_adversarial(cfg, model_root, road_width, lateral_sign,
         trained_model_dir, epoch, sh_degree)
 
     # ── Build adversarial cameras ─────────────────────────────────────
+    max_frames = data_cfg.get("max_frames", 0)
     adv_cameras = build_adversarial_cameras(
         sparse_dir=sparse_dir,
         cam_width=W_scaled,
@@ -324,6 +330,7 @@ def render_adversarial(cfg, model_root, road_width, lateral_sign,
         FovY=FovY,
         road_width=road_width,
         lateral_sign=lateral_sign,
+        max_frames=max_frames,
     )
 
     # ── Output directory ──────────────────────────────────────────────
