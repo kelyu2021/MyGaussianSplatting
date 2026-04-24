@@ -1,0 +1,44 @@
+# Street View Round-Trip Camera Configuration
+# Generates city/street views with 4 camera viewpoints (front, left, back, right)
+# For verifying Gaussian Splatting reconstruction across multiple directions
+
+# ==============================================================================
+# Scene Configuration
+# ==============================================================================
+
+# Disable unnecessary elements for street view
+compose_street_view.render_frames = True
+
+# Camera setup
+ROUND_TRIP_PARAMS = {
+    'frames_per_viewpoint': 20,  # 10 seconds at 2 fps
+    'fps': 2,
+    'viewpoints': ['front', 'left', 'back', 'right'],
+    'distance_from_center': 8.0,  # 8 meters from center
+    'center_point': [0, 0, 0],
+    'camera_height': 1.7,  # Human eye level
+    'fov_degrees': 50,
+}
+
+# GPS Reference Point (New York City - adjust as needed)
+GPS_REFERENCE = {
+    'latitude': 40.7128,
+    'longitude': -74.0060,
+    'altitude': 10.0,  # meters above sea level
+}
+
+# ==============================================================================
+# Terrain Configuration
+# ==============================================================================
+
+# Simple flat terrain for street
+create_simple_urban_scene.height_variation = 0.5
+
+# ==============================================================================
+# Output Configuration
+# ==============================================================================
+
+# Output files will include:
+# - camera_metadata.txt: Detailed camera positions and rotations
+# - camera_gps.txt: GPS coordinates for each viewpoint
+# - camera_extrinsics.npz: Camera extrinsic matrices for each frame
