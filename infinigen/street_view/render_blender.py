@@ -220,15 +220,116 @@ def _add_noise_displace(obj, strength=0.35, scale=1.2):
     mod.texture_coords = 'LOCAL'
 
 
+_FACADE_STYLES = (
+    "grid",         # default rectangular grid
+    "tall_narrow", # tall, narrow vertical windows
+    "ribbon",       # continuous horizontal ribbon glazing
+    "small_grid",  # many small panes
+    "paned_v",      # tall windows split by a vertical mullion
+    "paned_4",      # windows split into 4 panes by a cross mullion
+    "wide_square", # fewer, larger square punched openings
+    "georgian",    # 6-over-6 multi-pane sash windows
+)
+
+
+def _facade_param_set(style):
+    """Return parameters that control window aspect / density / mullions
+    for a given facade style.
+    """
+    if style == "grid":
+        return dict(cols_mul=1.2, col_thr=0.45, floors_mul=1.5, floor_thr=0.55,
+                    mullion="none", trim=0.0)
+    if style == "tall_narrow":
+        return dict(cols_mul=1.7, col_thr=0.62, floors_mul=1.3, floor_thr=0.30,
+                    mullion="none", trim=0.04)
+    if style == "ribbon":
+        return dict(cols_mul=1.0, col_thr=-1.0, floors_mul=1.4, floor_thr=0.55,
+                    mullion="ribbon_mull", trim=0.05)
+    if style == "small_grid":
+        return dict(cols_mul=2.2, col_thr=0.40, floors_mul=2.4, floor_thr=0.40,
+                    mullion="none", trim=0.0)
+    if style == "paned_v":
+        return dict(cols_mul=1.1, col_thr=0.40, floors_mul=1.4, floor_thr=0.40,
+                    mullion="v", trim=0.05)
+    if style == "paned_4":
+        return dict(cols_mul=1.0, col_thr=0.35, floors_mul=1.2, floor_thr=0.40,
+                    mullion="cross", trim=0.05)
+    if style == "wide_square":
+        return dict(cols_mul=0.8, col_thr=0.40, floors_mul=1.0, floor_thr=0.45,
+                    mullion="none", trim=0.06)
+    if style == "georgian":
+        return dict(cols_mul=1.3, col_thr=0.50, floors_mul=1.3, floor_thr=0.45,
+                    mullion="georgian", trim=0.06)
+    return _facade_param_set("grid")
+
+
+def _make_axis_steps(nt, axis_socket, frequency, low, high):
+    """Build a band-pass on a single axis: returns a 0/1 socket that is 1
+    inside [low, high] of each repeating cell of `frequency` units.
+    """
+    mul = nt.nodes.new("ShaderNodeMath")
+    mul.operation = "MULTIPLY"
+    mul.inputs[1].default_value = float(frequency)
+    nt.links.new(axis_socket, mul.inputs[0])
+    frac = nt.nodes.new("ShaderNodeMath")
+    frac.operation = "FRACT"
+    nt.links.new(mul.outputs[0], frac.inputs[0])
+    if low <= -0.5:
+        # Always 1 (used to disable column splitting in ribbon style)
+        const = nt.nodes.new("ShaderNodeMath")
+        const.operation = "GREATER_THAN"
+        const.inputs[0].default_value = 1.0
+        const.inputs[1].default_value = 0.0
+        return const.outputs[0], frac.outputs[0]
+    gt = nt.nodes.new("ShaderNodeMath")
+    gt.operation = "GREATER_THAN"
+    gt.inputs[1].default_value = float(low)
+    nt.links.new(frac.outputs[0], gt.inputs[0])
+    if high >= 1.0:
+        return gt.outputs[0], frac.outputs[0]
+    lt = nt.nodes.new("ShaderNodeMath")
+    lt.operation = "LESS_THAN"
+    lt.inputs[1].default_value = float(high)
+    nt.links.new(frac.outputs[0], lt.inputs[0])
+    band = nt.nodes.new("ShaderNodeMath")
+    band.operation = "MULTIPLY"
+    nt.links.new(gt.outputs[0], band.inputs[0])
+    nt.links.new(lt.outputs[0], band.inputs[1])
+    return band.outputs[0], frac.outputs[0]
+
+
+def _thin_line_mask(nt, frac_socket, center, half_width):
+    """Returns a 0/1 socket that is 1 in the strip [center-half, center+half]
+    of `frac_socket` (a value in [0,1]).
+    """
+    gt = nt.nodes.new("ShaderNodeMath")
+    gt.operation = "GREATER_THAN"
+    gt.inputs[1].default_value = float(center - half_width)
+    nt.links.new(frac_socket, gt.inputs[0])
+    lt = nt.nodes.new("ShaderNodeMath")
+    lt.operation = "LESS_THAN"
+    lt.inputs[1].default_value = float(center + half_width)
+    nt.links.new(frac_socket, lt.inputs[0])
+    band = nt.nodes.new("ShaderNodeMath")
+    band.operation = "MULTIPLY"
+    nt.links.new(gt.outputs[0], band.inputs[0])
+    nt.links.new(lt.outputs[0], band.inputs[1])
+    return band.outputs[0]
+
+
 def building_facade_material(name, base_color, n_floors, n_windows,
                               window_color=(0.05, 0.07, 0.12),
-                              roughness=0.7, height=10.0, width=10.0):
-    """Procedural facade with horizontal window stripes (one stripe per floor)
-    multiplied by vertical column stripes -> a window grid pattern.
-
-    The pattern is in object/UV-ish space; we drive it from generated coords
-    so it works on any cube without unwrapping.
+                              roughness=0.7, height=10.0, width=10.0,
+                              style=None, rng=None):
+    """Procedural facade. Picks one of several window styles so the dataset
+    has architectural variety instead of a uniform grid on every building.
     """
+    if rng is None:
+        rng = random
+    if style is None:
+        style = rng.choice(_FACADE_STYLES)
+    p = _facade_param_set(style)
+
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nt = mat.node_tree
@@ -239,71 +340,90 @@ def building_facade_material(name, base_color, n_floors, n_windows,
     sep = nt.nodes.new("ShaderNodeSeparateXYZ")
     nt.links.new(coord.outputs["Generated"], sep.inputs["Vector"])
 
-    # Horizontal floor stripes from Z (0..1 generated coord)
-    floor_math = nt.nodes.new("ShaderNodeMath")
-    floor_math.operation = "MULTIPLY"
-    floor_math.inputs[1].default_value = float(n_floors) * 1.5
-    nt.links.new(sep.outputs["Z"], floor_math.inputs[0])
-    floor_frac = nt.nodes.new("ShaderNodeMath")
-    floor_frac.operation = "FRACT"
-    nt.links.new(floor_math.outputs[0], floor_frac.inputs[0])
-    floor_step = nt.nodes.new("ShaderNodeMath")
-    floor_step.operation = "GREATER_THAN"
-    floor_step.inputs[1].default_value = 0.55     # window band height
-    nt.links.new(floor_frac.outputs[0], floor_step.inputs[0])
+    floor_freq = float(n_floors) * p["floors_mul"]
+    col_freq = float(n_windows) * p["cols_mul"]
 
-    # Vertical column stripes from X (visible on Y-facing walls)
-    col_x = nt.nodes.new("ShaderNodeMath")
-    col_x.operation = "MULTIPLY"
-    col_x.inputs[1].default_value = float(n_windows) * 1.2
-    nt.links.new(sep.outputs["X"], col_x.inputs[0])
-    col_x_frac = nt.nodes.new("ShaderNodeMath")
-    col_x_frac.operation = "FRACT"
-    nt.links.new(col_x.outputs[0], col_x_frac.inputs[0])
-    col_x_step = nt.nodes.new("ShaderNodeMath")
-    col_x_step.operation = "GREATER_THAN"
-    col_x_step.inputs[1].default_value = 0.45
-    nt.links.new(col_x_frac.outputs[0], col_x_step.inputs[0])
+    floor_step, floor_frac = _make_axis_steps(
+        nt, sep.outputs["Z"], floor_freq, p["floor_thr"], 1.0)
+    col_x_step, col_x_frac = _make_axis_steps(
+        nt, sep.outputs["X"], col_freq, p["col_thr"], 1.0)
+    col_y_step, col_y_frac = _make_axis_steps(
+        nt, sep.outputs["Y"], col_freq, p["col_thr"], 1.0)
 
-    # Vertical column stripes from Y (visible on X-facing walls)
-    col_y = nt.nodes.new("ShaderNodeMath")
-    col_y.operation = "MULTIPLY"
-    col_y.inputs[1].default_value = float(n_windows) * 1.2
-    nt.links.new(sep.outputs["Y"], col_y.inputs[0])
-    col_y_frac = nt.nodes.new("ShaderNodeMath")
-    col_y_frac.operation = "FRACT"
-    nt.links.new(col_y.outputs[0], col_y_frac.inputs[0])
-    col_y_step = nt.nodes.new("ShaderNodeMath")
-    col_y_step.operation = "GREATER_THAN"
-    col_y_step.inputs[1].default_value = 0.45
-    nt.links.new(col_y_frac.outputs[0], col_y_step.inputs[0])
-
-    # Combined column step = MAX(x, y) so windows appear on every wall
     col_step = nt.nodes.new("ShaderNodeMath")
     col_step.operation = "MAXIMUM"
-    nt.links.new(col_x_step.outputs[0], col_step.inputs[0])
-    nt.links.new(col_y_step.outputs[0], col_step.inputs[1])
+    nt.links.new(col_x_step, col_step.inputs[0])
+    nt.links.new(col_y_step, col_step.inputs[1])
 
-    # Window mask = floor_step * col_step
     mask = nt.nodes.new("ShaderNodeMath")
     mask.operation = "MULTIPLY"
-    nt.links.new(floor_step.outputs[0], mask.inputs[0])
+    nt.links.new(floor_step, mask.inputs[0])
     nt.links.new(col_step.outputs[0], mask.inputs[1])
+    window_mask_socket = mask.outputs[0]
+
+    # ---- mullions (subtract thin lines from the window mask) ------------
+    mullion = p["mullion"]
+    if mullion in ("v", "cross", "georgian", "ribbon_mull"):
+        mull_lines = []
+        if mullion in ("v", "cross", "georgian"):
+            # Vertical mullion at x=0.5 of each window cell
+            mull_lines.append(_thin_line_mask(nt, col_x_frac, 0.5, 0.025))
+            mull_lines.append(_thin_line_mask(nt, col_y_frac, 0.5, 0.025))
+        if mullion in ("cross", "georgian", "ribbon_mull"):
+            # Horizontal mullion at floor_frac=0.78 (mid of window band)
+            mull_lines.append(_thin_line_mask(nt, floor_frac, 0.78, 0.022))
+        if mullion == "georgian":
+            # 6-over-6: two extra vertical mullions and one extra horizontal
+            for cx in (0.30, 0.70):
+                mull_lines.append(_thin_line_mask(nt, col_x_frac, cx, 0.018))
+                mull_lines.append(_thin_line_mask(nt, col_y_frac, cx, 0.018))
+            for fz in (0.66, 0.90):
+                mull_lines.append(_thin_line_mask(nt, floor_frac, fz, 0.015))
+        if mullion == "ribbon_mull":
+            # vertical mullions tied to columns to break the ribbon glazing
+            for cx in (0.25, 0.5, 0.75):
+                mull_lines.append(_thin_line_mask(nt, col_x_frac, cx, 0.012))
+                mull_lines.append(_thin_line_mask(nt, col_y_frac, cx, 0.012))
+
+        mull_union = mull_lines[0]
+        for line in mull_lines[1:]:
+            mx = nt.nodes.new("ShaderNodeMath")
+            mx.operation = "MAXIMUM"
+            nt.links.new(mull_union, mx.inputs[0])
+            nt.links.new(line, mx.inputs[1])
+            mull_union = mx.outputs[0]
+
+        # invert and multiply: mask *= (1 - mullion)
+        inv = nt.nodes.new("ShaderNodeMath")
+        inv.operation = "SUBTRACT"
+        inv.inputs[0].default_value = 1.0
+        nt.links.new(mull_union, inv.inputs[1])
+        clamp = nt.nodes.new("ShaderNodeMath")
+        clamp.operation = "MAXIMUM"
+        clamp.inputs[1].default_value = 0.0
+        nt.links.new(inv.outputs[0], clamp.inputs[0])
+
+        carve = nt.nodes.new("ShaderNodeMath")
+        carve.operation = "MULTIPLY"
+        nt.links.new(window_mask_socket, carve.inputs[0])
+        nt.links.new(clamp.outputs[0], carve.inputs[1])
+        window_mask_socket = carve.outputs[0]
 
     # Mix wall color and window color
     mix = nt.nodes.new("ShaderNodeMixRGB")
     mix.inputs["Color1"].default_value = (*base_color, 1.0)        # wall
     mix.inputs["Color2"].default_value = (*window_color, 1.0)      # window
-    nt.links.new(mask.outputs[0], mix.inputs["Fac"])
+    nt.links.new(window_mask_socket, mix.inputs["Fac"])
     nt.links.new(mix.outputs["Color"], bsdf.inputs["Base Color"])
 
-    # Make windows slightly emissive and very smooth so they pop
+    # Make windows smoother than the wall so they read as glass
     rough_mix = nt.nodes.new("ShaderNodeMixRGB")
     rough_mix.inputs["Color1"].default_value = (roughness, roughness, roughness, 1.0)
     rough_mix.inputs["Color2"].default_value = (0.1, 0.1, 0.1, 1.0)
-    nt.links.new(mask.outputs[0], rough_mix.inputs["Fac"])
+    nt.links.new(window_mask_socket, rough_mix.inputs["Fac"])
     nt.links.new(rough_mix.outputs["Color"], bsdf.inputs["Roughness"])
 
+    mat["facade_style"] = style
     return mat
 
 
@@ -1059,7 +1179,7 @@ def add_pitched_roof(rng, x_center, y_center, width, depth, roof_z, roof_mat):
 
 
 def add_facade_articulation(rng, x_center, y_center, width, depth, height, idx, side):
-    facade_x, facing_sign = _street_facing_x(x_center, width * 1.01)
+    facade_x, facing_sign = _street_facing_x(x_center, width * 0.5 + 0.05)
     trim_mat = _principled(
         f"trim_{side}_{idx}",
         (rng.uniform(0.22, 0.34), rng.uniform(0.22, 0.34), rng.uniform(0.24, 0.36)),
@@ -1199,7 +1319,7 @@ def add_storefront_details(rng, x_center, y_center, width, depth, idx, side, fac
         contrast=0.08,
     )
 
-    facade_x, facing_sign = _street_facing_x(x_center, width * 0.98)
+    facade_x, facing_sign = _street_facing_x(x_center, width * 0.5 + 0.05)
     storefront_count = rng.randint(2, max(3, int(depth // 2)))
     bay_width = (depth * 1.7) / storefront_count
     for bay in range(storefront_count):
@@ -1263,6 +1383,7 @@ def build_one_building(rng, x_center, y_center, max_depth=12.0,
                       rng.uniform(0.15, 0.35)),
         roughness=rng.uniform(0.55, 0.85),
         height=height, width=width,
+        rng=rng,
     )
     roof_mat = _principled(f"roof_{side}_{idx}",
                            (rng.uniform(0.10, 0.25),) * 3,
@@ -1322,6 +1443,7 @@ def build_one_building(rng, x_center, y_center, max_depth=12.0,
             window_color=(0.10, 0.12, 0.18),
             roughness=rng.uniform(0.55, 0.85),
             height=h2, width=w2,
+            rng=rng,
         )
         x_shift = rng.choice([-1, 1]) * (width / 2 + w2 / 2 - 0.5)
         b2 = _create_cube(
@@ -1366,6 +1488,7 @@ def build_one_building(rng, x_center, y_center, max_depth=12.0,
             roughness=rng.uniform(0.45, 0.72),
             height=tower_h,
             width=tower_w,
+            rng=rng,
         )
         tower = _create_cube(
             location=(x_center + tower_shift_x, y_center + tower_shift_y, podium_h + tower_h / 2),
@@ -1460,6 +1583,7 @@ def build_one_building(rng, x_center, y_center, max_depth=12.0,
                     max(2, int(seg_h / 3.0)), max(2, int(cur_w / 2.0)),
                     roughness=rng.uniform(0.55, 0.85),
                     height=seg_h, width=cur_w,
+                    rng=rng,
                 )
             _set_material(seg, mat)
             cur_z += seg_h
