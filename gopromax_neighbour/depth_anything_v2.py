@@ -127,11 +127,9 @@ def main():
         # Sky stays black
         depth_norm[depth == 0] = 0.0
         depth_u8 = (depth_norm * 255).astype(np.uint8)
-        depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
-        depth_color[depth == 0] = 0  # black for sky
 
         vis_path = os.path.join(args.output_dir, f"{stem}_depth_vis.png")
-        cv2.imwrite(vis_path, depth_color)
+        cv2.imwrite(vis_path, depth_u8)
 
         print(f"  [{i+1}/{len(paths)}] {stem}  "
               f"depth range [{depth[depth > 0].min():.2f}, "

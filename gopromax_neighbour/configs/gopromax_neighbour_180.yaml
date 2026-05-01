@@ -22,6 +22,7 @@ data:
   max_frames: 30    # set to 0 to use all frames
   point_cloud_path: data/colmap_pointcloud_dense/fused.ply
   mask_dir: data/cubemap_faces_mass13k_manual
+  depth_dir: data/cubemap_faces_da2
   # Cubemap face images (original, converted from panoramic)
   images: data/cubemap_faces
 
@@ -53,3 +54,4 @@ optim:
   lambda_l1: 1.0
   lambda_dssim: 0.2
   lambda_color_correction: 0.001
+  lambda_depth: 0.05    # monocular depth supervision (data/cubemap_faces_da2)

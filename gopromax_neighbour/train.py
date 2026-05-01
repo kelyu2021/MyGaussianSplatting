@@ -1417,6 +1417,7 @@ def save_log_images(log_dir: str, epoch: int, gt, rendered, depth, acc):
 
     if depth is not None:
         d = depth.detach().cpu().float()
+        d = torch.log1p(d)
         d = (d - d.min()) / (d.max() - d.min() + 1e-6)
         d = d.expand(3, -1, -1)
     else:

@@ -42,7 +42,7 @@ import shutil
 import argparse
 import csv
 from pathlib import Path
-from random import shuffle, seed as set_seed
+from random import shuffle, seed as set_seed, choice as random_choice
 from collections import OrderedDict
 
 import yaml
@@ -74,6 +74,7 @@ from train import (  # noqa: E402
     l1_loss,
     ssim,
     psnr,
+    depth_mono_loss,
     save_log_images,
     FACE_TO_CAM_ID,
     TENSORBOARD_FOUND,
@@ -118,6 +119,7 @@ def save_log_images_gan(
 
     def _norm_depth(dep):
         d = dep.detach().cpu().float()
+        d = torch.log1p(d)
         d = (d - d.min()) / (d.max() - d.min() + 1e-6)
         return d.expand(3, -1, -1) if d.shape[0] == 1 else d
 
@@ -409,15 +411,15 @@ def build_jittered_camera(
     cam: Camera,
     up: np.ndarray,
     road_width: float,
-    lateral_sign: float = 1.0,
+    lateral_sign: float | str | None = None,
 ) -> Camera:
     """Build an off-road version of an on-road camera.
 
-    Shifts the camera laterally by ``road_width`` metres, perpendicular
-    to the camera's own forward (viewing) direction in the ground plane.
+    Shifts the camera by ``road_width`` metres in a chosen direction.
 
-    lateral_sign : +1 shift to the left of walking direction,
-                   -1 shift to the right.
+    lateral_sign : one of "left", "right", "up", "front", "back" (string),
+                   +1.0 (left) / -1.0 (right) (float),
+                   or None = randomly picks a direction.
     """
     R_c2w = cam.R                # (3,3) numpy
     T_w2c = cam.T                # (3,)  numpy
@@ -428,13 +430,31 @@ def build_jittered_camera(
     # Lateral = perpendicular to camera forward, in the ground plane
     lateral = np.cross(cam_forward, up)
     lateral /= np.linalg.norm(lateral) + 1e-12
-    lateral *= lateral_sign
+
+    # Resolve the actual direction string
+    if isinstance(lateral_sign, str):
+        direction = lateral_sign
+    elif lateral_sign is None:
+        direction = random_choice(["left", "right", "up", "front", "back"])
+    else:
+        direction = "left" if lateral_sign >= 0 else "right"
+
+    if direction == "left":
+        shift_vec = lateral
+    elif direction == "right":
+        shift_vec = -lateral
+    elif direction == "up":
+        shift_vec = up / (np.linalg.norm(up) + 1e-12)
+    elif direction == "front":
+        shift_vec = cam_forward / (np.linalg.norm(cam_forward) + 1e-12)
+    else:  # back
+        shift_vec = -cam_forward / (np.linalg.norm(cam_forward) + 1e-12)
 
     # Old camera centre in world coords
     C_old = -R_c2w @ T_w2c
 
-    # Shift laterally
-    C_new = C_old + road_width * lateral
+    # Shift
+    C_new = C_old + road_width * shift_vec
 
     # Orientation unchanged
     R_c2w_new = R_c2w
@@ -449,7 +469,7 @@ def build_jittered_camera(
         FoVy=cam.FoVy,
         K=cam.K.cpu().numpy(),
         image=cam.original_image.clone(),
-        image_name=f"jitter_{cam.image_name}",
+        image_name=f"jitter_{direction}_{cam.image_name}",
         metadata=cam.meta.copy() if hasattr(cam, "meta") else {},
         guidance={},
     )
@@ -648,23 +668,30 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
         shuffle(wu_stack)
         wu_loss = 0.0
         wu_w_dist = 0.0
+        _wu_directions = (
+            ["left", "right", "up", "front", "back"]
+            if lateral_sign is None
+            else [lateral_sign if isinstance(lateral_sign, str)
+                  else ("left" if lateral_sign >= 0 else "right")]
+        )
         for wi, cam in enumerate(wu_stack):
-            jit_cam = build_jittered_camera(cam, up_dir, road_width,
-                                             lateral_sign)
-            with torch.no_grad():
-                real_img = render(cam, gaussians, bg_color)["rgb"].detach()
-                fake_img = render(jit_cam, gaussians, bg_color)["rgb"].detach()
-            real_score = critic(real_img.unsqueeze(0))
-            fake_score = critic(fake_img.unsqueeze(0))
-            loss_c = fake_score.mean() - real_score.mean()
-            gp = gradient_penalty(critic, real_img.unsqueeze(0),
-                                  fake_img.unsqueeze(0), real_img.device)
-            loss_c = loss_c + lambda_gp * gp
-            critic_optimizer.zero_grad()
-            loss_c.backward()
-            critic_optimizer.step()
-            wu_loss += loss_c.item()
-            wu_w_dist += (real_score.mean() - fake_score.mean()).item()
+            for direction in _wu_directions:
+                jit_cam = build_jittered_camera(cam, up_dir, road_width,
+                                                 lateral_sign=direction)
+                with torch.no_grad():
+                    real_img = render(cam, gaussians, bg_color)["rgb"].detach()
+                    fake_img = render(jit_cam, gaussians, bg_color)["rgb"].detach()
+                real_score = critic(real_img.unsqueeze(0))
+                fake_score = critic(fake_img.unsqueeze(0))
+                loss_c = fake_score.mean() - real_score.mean()
+                gp = gradient_penalty(critic, real_img.unsqueeze(0),
+                                      fake_img.unsqueeze(0), real_img.device)
+                loss_c = loss_c + lambda_gp * gp
+                critic_optimizer.zero_grad()
+                loss_c.backward()
+                critic_optimizer.step()
+                wu_loss += loss_c.item()
+                wu_w_dist += (real_score.mean() - fake_score.mean()).item()
             if wi % max(1, len(wu_stack) // 4) == 0:
                 print(f"    warm-up {wu_ep}/{warmup_epochs} "
                       f"[{wi+1}/{len(wu_stack)}] "
@@ -672,7 +699,7 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                       f"real={real_score.mean().item():.4f}  "
                       f"fake={fake_score.mean().item():.4f}  "
                       f"GP={gp.item():.4f}")
-        n_wu = len(wu_stack)
+        n_wu = len(wu_stack) * len(_wu_directions)
         print(f"  warm-up epoch {wu_ep}/{warmup_epochs}  "
               f"critic_loss={wu_loss / n_wu:.4f}  "
               f"W_dist={wu_w_dist / n_wu:.4f}")
@@ -711,14 +738,16 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
         log_render_off = log_depth_off = log_acc_off = None
         log_sky_mask = log_moving_mask = None
 
+        _jitter_directions = (
+            ["left", "right", "up", "front", "back"]
+            if lateral_sign is None
+            else [lateral_sign if isinstance(lateral_sign, str)
+                  else ("left" if lateral_sign >= 0 else "right")]
+        )
+
         for cam_idx, cam in enumerate(viewpoint_stack):
-            step += 1
 
-            # ── Build jittered camera ─────────────────────────────
-            jit_cam = build_jittered_camera(cam, up_dir, road_width,
-                                             lateral_sign)
-
-            # ── Load masks ────────────────────────────────────────
+            # ── Load masks (once per camera) ──────────────────────
             sky_mask = None
             if "mask" in cam.guidance:
                 sky_mask = cam.guidance["mask"]
@@ -741,147 +770,173 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
             gt_image = (gt_image.cuda(non_blocking=True)
                         if not gt_image.is_cuda else gt_image)
 
-            # ==================================================
-            #  CRITIC STEP  (train critic, freeze Gaussians)
-            # ==================================================
-            if cam_idx % (critic_iters + 1) < critic_iters:
-                critic.train()
+            for dir_idx, direction in enumerate(_jitter_directions):
+                step += 1
 
-                # Render on-road (real) — detach from Gaussian graph
-                with torch.no_grad():
+                # ── Build jittered camera for this direction ───────
+                jit_cam = build_jittered_camera(
+                    cam, up_dir, road_width,
+                    lateral_sign=direction,
+                )
+
+                # global step index across all cameras × directions
+                global_step_idx = cam_idx * len(_jitter_directions) + dir_idx
+
+                # ==================================================
+                #  CRITIC STEP  (train critic, freeze Gaussians)
+                # ==================================================
+                if global_step_idx % (critic_iters + 1) < critic_iters:
+                    critic.train()
+
+                    # Render on-road (real) — detach from Gaussian graph
+                    with torch.no_grad():
+                        real_pkg = render(cam, gaussians, bg_color)
+                        real_img = real_pkg["rgb"].detach()  # (3, H, W)
+
+                    # Render off-road (fake) — detach from Gaussian graph
+                    with torch.no_grad():
+                        fake_pkg = render(jit_cam, gaussians, bg_color)
+                        fake_img = fake_pkg["rgb"].detach()  # (3, H, W)
+
+                    # Critic scores
+                    real_score = critic(real_img.unsqueeze(0))  # (1, 1)
+                    fake_score = critic(fake_img.unsqueeze(0))  # (1, 1)
+
+                    # WGAN loss: maximise E[C(real)] - E[C(fake)]
+                    # => minimise E[C(fake)] - E[C(real)]
+                    w_dist = real_score.mean() - fake_score.mean()
+                    loss_c = -w_dist
+
+                    # Gradient penalty
+                    gp = gradient_penalty(
+                        critic, real_img.unsqueeze(0),
+                        fake_img.unsqueeze(0), real_img.device)
+                    loss_c = loss_c + lambda_gp * gp
+
+                    critic_optimizer.zero_grad()
+                    loss_c.backward()
+                    critic_optimizer.step()
+
+                    ep_critic_loss += loss_c.item()
+                    ep_w_dist += w_dist.item()
+
+                    if cam_idx % log_every_n_steps == 0 and dir_idx == 0:
+                        tqdm.write(
+                            f"  [E{epoch} C {cam_idx+1}/{n_cameras} {direction}] "
+                            f"critic_loss={loss_c.item():.4f}  "
+                            f"W_dist={w_dist.item():.4f}  "
+                            f"real_score={real_score.mean().item():.4f}  "
+                            f"fake_score={fake_score.mean().item():.4f}  "
+                            f"GP={gp.item():.4f}")
+
+                # ==================================================
+                #  GENERATOR STEP  (train Gaussians, freeze critic)
+                # ==================================================
+                else:
+                    critic.eval()
+
+                    # Render on-road (for reconstruction loss)
                     real_pkg = render(cam, gaussians, bg_color)
-                    real_img = real_pkg["rgb"].detach()  # (3, H, W)
+                    real_img = real_pkg["rgb"]
+                    viewspace_pts = real_pkg["viewspace_points"]
+                    visibility = real_pkg["visibility_filter"]
+                    radii = real_pkg["radii"]
 
-                # Render off-road (fake) — detach from Gaussian graph
-                with torch.no_grad():
+                    # Render off-road (for adversarial loss)
                     fake_pkg = render(jit_cam, gaussians, bg_color)
-                    fake_img = fake_pkg["rgb"].detach()  # (3, H, W)
+                    fake_img = fake_pkg["rgb"]
 
-                # Critic scores
-                real_score = critic(real_img.unsqueeze(0))  # (1, 1)
-                fake_score = critic(fake_img.unsqueeze(0))  # (1, 1)
+                    # --- Adversarial loss: fool the critic ---
+                    fake_score = critic(fake_img.unsqueeze(0))
+                    loss_adv = -fake_score.mean()
+                    # Clamp to prevent large adversarial gradients
+                    loss_adv = loss_adv.clamp(-50.0, 50.0)
 
-                # WGAN loss: maximise E[C(real)] - E[C(fake)]
-                # => minimise E[C(fake)] - E[C(real)]
-                w_dist = real_score.mean() - fake_score.mean()
-                loss_c = -w_dist
+                    # --- Reconstruction loss on on-road view ---
+                    Ll1 = l1_loss(real_img, gt_image, mask)
+                    loss_recon = (
+                        (1.0 - lambda_dssim) * Ll1 +
+                        lambda_dssim * (1.0 - ssim(real_img, gt_image, mask=mask)))
 
-                # Gradient penalty
-                gp = gradient_penalty(
-                    critic, real_img.unsqueeze(0),
-                    fake_img.unsqueeze(0), real_img.device)
-                loss_c = loss_c + lambda_gp * gp
+                    # --- SH regularisation ---
+                    lambda_sh = optim_cfg.get("lambda_sh_reg", 1e-3)
+                    sh_reg = torch.tensor(0.0, device="cuda")
+                    if lambda_sh > 0:
+                        sh_rest = gaussians._features_rest
+                        sh_reg = lambda_sh * (sh_rest ** 2).mean()
 
-                critic_optimizer.zero_grad()
-                loss_c.backward()
-                critic_optimizer.step()
+                    # --- Sky opacity penalty ---
+                    lambda_sky_acc = optim_cfg.get("lambda_sky_acc", 0.01)
+                    sky_loss = torch.tensor(0.0, device="cuda")
+                    if lambda_sky_acc > 0 and sky_mask is not None:
+                        acc = real_pkg["acc"]
+                        sky_region = 1.0 - sky_mask.float()
+                        sky_loss = lambda_sky_acc * (acc * sky_region).mean()
 
-                ep_critic_loss += loss_c.item()
-                ep_w_dist += w_dist.item()
+                    # --- Monocular depth supervision (on-road view) ---
+                    lambda_depth = optim_cfg.get("lambda_depth", 0.0)
+                    depth_loss = torch.tensor(0.0, device="cuda")
+                    if lambda_depth > 0 and "mono_depth" in cam.guidance:
+                        mono_depth = cam.guidance["mono_depth"]
+                        mono_depth = (mono_depth.cuda(non_blocking=True)
+                                      if not mono_depth.is_cuda else mono_depth)
+                        depth_loss = lambda_depth * depth_mono_loss(
+                            real_pkg["depth"], mono_depth,
+                            real_pkg["acc"], mask)
 
-                if cam_idx % log_every_n_steps == 0:
-                    tqdm.write(
-                        f"  [E{epoch} C {cam_idx+1}/{n_cameras}] "
-                        f"critic_loss={loss_c.item():.4f}  "
-                        f"W_dist={w_dist.item():.4f}  "
-                        f"real_score={real_score.mean().item():.4f}  "
-                        f"fake_score={fake_score.mean().item():.4f}  "
-                        f"GP={gp.item():.4f}")
+                    # --- Total generator loss ---
+                    loss_g = (loss_adv +
+                              lambda_recon * loss_recon +
+                              sh_reg +
+                              sky_loss +
+                              depth_loss)
 
-            # ==================================================
-            #  GENERATOR STEP  (train Gaussians, freeze critic)
-            # ==================================================
-            else:
-                critic.eval()
+                    loss_g.backward()
 
-                # Render on-road (for reconstruction loss)
-                real_pkg = render(cam, gaussians, bg_color)
-                real_img = real_pkg["rgb"]
-                viewspace_pts = real_pkg["viewspace_points"]
-                visibility = real_pkg["visibility_filter"]
-                radii = real_pkg["radii"]
+                    # Clip Gaussian gradients to prevent destructive updates
+                    all_params = []
+                    for pg in gaussians.optimizer.param_groups:
+                        all_params.extend(pg["params"])
+                    torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
 
-                # Render off-road (for adversarial loss)
-                fake_pkg = render(jit_cam, gaussians, bg_color)
-                fake_img = fake_pkg["rgb"]
+                    gaussians.update_optimizer()
 
-                # --- Adversarial loss: fool the critic ---
-                fake_score = critic(fake_img.unsqueeze(0))
-                loss_adv = -fake_score.mean()
-                # Clamp to prevent large adversarial gradients
-                loss_adv = loss_adv.clamp(-50.0, 50.0)
+                    ep_gen_loss += loss_g.item()
+                    ep_recon_loss += loss_recon.item()
 
-                # --- Reconstruction loss on on-road view ---
-                Ll1 = l1_loss(real_img, gt_image, mask)
-                loss_recon = (
-                    (1.0 - lambda_dssim) * Ll1 +
-                    lambda_dssim * (1.0 - ssim(real_img, gt_image, mask=mask)))
+                    # Logging metrics (detached)
+                    with torch.no_grad():
+                        cur_psnr_on = psnr(real_img, gt_image, mask).item()
+                        cur_psnr_off = psnr(fake_img, gt_image, mask).item()
+                        ep_psnr_on += cur_psnr_on
+                        ep_psnr_off += cur_psnr_off
 
-                # --- SH regularisation ---
-                lambda_sh = optim_cfg.get("lambda_sh_reg", 1e-3)
-                sh_reg = torch.tensor(0.0, device="cuda")
-                if lambda_sh > 0:
-                    sh_rest = gaussians._features_rest
-                    sh_reg = lambda_sh * (sh_rest ** 2).mean()
+                    if cam_idx % log_every_n_steps == 0 and dir_idx == 0:
+                        tqdm.write(
+                            f"  [E{epoch} G {cam_idx+1}/{n_cameras} {direction}] "
+                            f"loss_g={loss_g.item():.4f}  "
+                            f"adv={loss_adv.item():.4f}  "
+                            f"recon={loss_recon.item():.4f} "
+                            f"(L1={Ll1.item():.4f})  "
+                            f"sh_reg={sh_reg.item():.6f}  "
+                            f"sky={sky_loss.item():.6f}  "
+                            f"depth={depth_loss.item():.6f}  "
+                            f"PSNR_on={cur_psnr_on:.2f}  "
+                            f"PSNR_off={cur_psnr_off:.2f}")
 
-                # --- Sky opacity penalty ---
-                lambda_sky_acc = optim_cfg.get("lambda_sky_acc", 0.01)
-                sky_loss = torch.tensor(0.0, device="cuda")
-                if lambda_sky_acc > 0 and sky_mask is not None:
-                    acc = real_pkg["acc"]
-                    sky_region = 1.0 - sky_mask.float()
-                    sky_loss = lambda_sky_acc * (acc * sky_region).mean()
+                    # Stash for end-of-epoch log images (last direction)
+                    if dir_idx == len(_jitter_directions) - 1:
+                        log_gt_on = gt_image.detach()
+                        log_render_on = real_img.detach()
+                        log_depth_on = real_pkg["depth"].detach()
+                        log_acc_on = real_pkg["acc"].detach()
+                        log_render_off = fake_img.detach()
+                        log_depth_off = fake_pkg["depth"].detach()
+                        log_acc_off = fake_pkg["acc"].detach()
+                        log_sky_mask = sky_mask
+                        log_moving_mask = moving_mask
 
-                # --- Total generator loss ---
-                loss_g = (loss_adv +
-                          lambda_recon * loss_recon +
-                          sh_reg +
-                          sky_loss)
-
-                loss_g.backward()
-
-                # Clip Gaussian gradients to prevent destructive updates
-                all_params = []
-                for pg in gaussians.optimizer.param_groups:
-                    all_params.extend(pg["params"])
-                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-
-                gaussians.update_optimizer()
-
-                ep_gen_loss += loss_g.item()
-                ep_recon_loss += loss_recon.item()
-
-                # Logging metrics (detached)
-                with torch.no_grad():
-                    cur_psnr_on = psnr(real_img, gt_image, mask).item()
-                    cur_psnr_off = psnr(fake_img, gt_image, mask).item()
-                    ep_psnr_on += cur_psnr_on
-                    ep_psnr_off += cur_psnr_off
-
-                if cam_idx % log_every_n_steps == 0:
-                    tqdm.write(
-                        f"  [E{epoch} G {cam_idx+1}/{n_cameras}] "
-                        f"loss_g={loss_g.item():.4f}  "
-                        f"adv={loss_adv.item():.4f}  "
-                        f"recon={loss_recon.item():.4f} "
-                        f"(L1={Ll1.item():.4f})  "
-                        f"sh_reg={sh_reg.item():.6f}  "
-                        f"sky={sky_loss.item():.6f}  "
-                        f"PSNR_on={cur_psnr_on:.2f}  "
-                        f"PSNR_off={cur_psnr_off:.2f}")
-
-                # Stash for end-of-epoch log images
-                log_gt_on = gt_image.detach()
-                log_render_on = real_img.detach()
-                log_depth_on = real_pkg["depth"].detach()
-                log_acc_on = real_pkg["acc"].detach()
-                log_render_off = fake_img.detach()
-                log_depth_off = fake_pkg["depth"].detach()
-                log_acc_off = fake_pkg["acc"].detach()
-                log_sky_mask = sky_mask
-                log_moving_mask = moving_mask
-
-            ep_count += 1
+                ep_count += 1
 
         # ══════════════════════════════════════════════════════════
         #  END OF EPOCH
@@ -1023,8 +1078,8 @@ def main():
         "--road_width", type=float, default=0.5,
         help="Lateral shift in metres for jittered cameras (default: 0.5).")
     parser.add_argument(
-        "--lateral_sign", type=float, default=1.0,
-        help="+1 shift left of walking direction, -1 shift right (default: 1.0).")
+        "--lateral_sign", type=float, default=None,
+        help="+1 shift left, -1 shift right, omit to randomly choose left/right/up per camera.")
     parser.add_argument(
         "--epoch", type=int, default=None,
         help="Pre-trained checkpoint epoch to load (default: latest).")

@@ -79,8 +79,9 @@ def _depth_colorize(depth_hw1: np.ndarray) -> np.ndarray:
         d_norm = ((d - d_min) / (d_max - d_min) * 255).astype(np.uint8)
     else:
         d_norm = np.zeros_like(d, dtype=np.uint8)
-    colored = cv2.applyColorMap(d_norm, cv2.COLORMAP_JET)
-    return colored[..., [2, 1, 0]]  # BGR → RGB
+    # Stack to 3 channels for grayscale RGB
+    gray = np.stack([d_norm]*3, axis=-1)
+    return gray
 
 
 def _diff_colorize(diff_hw1: np.ndarray) -> np.ndarray:

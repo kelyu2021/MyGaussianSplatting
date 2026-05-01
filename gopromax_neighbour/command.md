@@ -1,10 +1,9 @@
 cd gopromax_neighbour
 mkdir output
-nohup python train.py --config configs/gopromax_neighbour_180.yaml > ./output/gopromax_neighbour_180.yaml.log 2>&1 &
+nohup python train.py --config configs/gopromax_neighbour_180.yaml --output-dir ./output_version_9_180 > ./output_version_9_180/gopromax_neighbour_180.yaml.log 2>&1 &
 
 mkdir output
-nohup python train.py --config configs/gopromax_neighbour_1200.yaml --output-dir output_version_8_1200 > ./output_version_8_1200/train.log 2>&1 &
-
+CUDA_VISIBLE_DEVICES=1 nohup python train.py --config configs/gopromax_neighbour_1200.yaml --output-dir ./output_version_10_1200 > ./output_version_10_1200/gopromax_neighbour_1200.yaml.log 2>&1 &
 nohup python train.py --config configs/gopromax_neighbour_2400.yaml --max_frames 30 --gpu 5 --output-dir output_version_6_2400_30 > ./output_version_6_2400_30/gopromax_neighbour_2400.yaml.log 2>&1 &
 
 cd gopromax_neighbour
@@ -18,6 +17,14 @@ cd gopromax_neighbour
 python visualize_metrics.py                                                    # auto-detect latest run
 python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 # specific run
 python visualize_metrics.py --model_path output/gopromax_neighbour/sky_mask_v1 --save_dir output/gopromax_neighbour/sky_mask_v1/plots  # save PNGs
+
+# SIBR
+cd C:\Users\lyuk4\Documents\MiamiUniversity\GaussianSplatting\viewers\bin
+.\SIBR_gaussianViewer_app.exe -m C:\Users\lyuk4\Downloads\output_version_6_cityview\gopro360_exp_mask\gopro360_10s_mask
+.\SIBR_gaussianViewer_app.exe -m C:\Users\lyuk4\Downloads\output_version_3\gopromax_neighbour\sky_mask_v1
+.\SIBR_gaussianViewer_app.exe -m C:\Users\lyuk4\Downloads\output_version_7_360\gopromax_neighbour\sky_mask_v1
+.\SIBR_gaussianViewer_app.exe -m C:\Users\lyuk4\Downloads\output_version_7_360_gan\gopromax_neighbour\sky_mask_v1_gan
+.\SIBR_gaussianViewer_app.exe -m C:\Users\lyuk4\Downloads\output_train_gan_version_1\gopromax_neighbour\sky_mask_v1_gan
 
 
 # 1. visualize comparison
@@ -35,14 +42,13 @@ cat output/<task>/<exp>_gan/eval_metrics.csv
 
 # gan-style
 cd gopromax_neighbour
-CUDA_VISIBLE_DEVICES=1 nohup python -u train_gan.py \
-    --config configs/gopromax_neighbour_360.yaml \
-    --model_root output_version_7_360 \
-    --epoch 360 \
-    --road_width 0.2 \
-    --lateral_sign 1 \
-    --output_dir output_version_7_360_gan \
-    --gan_epochs 100 > output_version_7_360_gan/train.log 2>&1 &
+CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
+    --config configs/gopromax_neighbour_180.yaml \
+    --model_root output_version_9_180 \
+    --epoch 180 \
+    --road_width 0.5 \
+    --output_dir output_version_9_180_gan_0.5_1_200 \
+    --gan_epochs 200 > output_version_9_180_gan_0.5_1_200/train_gan.log 2>&1 &
 
 # sparse point cloud
 python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 1 --matcher exhaustive
@@ -64,6 +70,7 @@ cd /home/lyuk4/GitHub/MyGaussianSplatting/MaSS13K/mmsegmentation && conda run -n
   --exclude_classes 1 5 \
   --save_overlay
 
+# depth anything v2
 cd gopromax_neighbour
 python depth_anything_v2.py \
     --image_dir  data/cubemap_faces \
