@@ -1494,17 +1494,21 @@ def evaluate(
             torchvision.utils.save_image(
                 gt[:3], os.path.join(img_dir, f"{name}_gt.png"))
 
-            # Depth (colorized)
-            depth = pkg["depth"].detach().permute(1, 2, 0).cpu().numpy()
-            d = depth.squeeze()
-            d_min, d_max = d.min(), d.max()
-            if d_max - d_min > 1e-6:
-                d_norm = ((d - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-            else:
-                d_norm = np.zeros_like(d, dtype=np.uint8)
-            depth_color = cv2.applyColorMap(d_norm, cv2.COLORMAP_JET)
-            depth_color = depth_color[..., [2, 1, 0]]  # BGR → RGB
-            Image.fromarray(depth_color).save(
+            # Depth (greyscale: dark = near, light = far; sky/empty = white)
+            depth = pkg["depth"].detach().permute(1, 2, 0).cpu().numpy().squeeze()
+            acc_np = pkg["acc"].detach().permute(1, 2, 0).cpu().numpy().squeeze()
+            valid = acc_np > 1e-3
+            d_norm = np.full_like(depth, 255, dtype=np.uint8)
+            if valid.any():
+                d_valid = depth[valid]
+                d_min, d_max = d_valid.min(), d_valid.max()
+                if d_max - d_min > 1e-6:
+                    scaled = ((depth - d_min) / (d_max - d_min) * 255)
+                else:
+                    scaled = np.zeros_like(depth)
+                scaled = np.clip(scaled, 0, 255).astype(np.uint8)
+                d_norm[valid] = scaled[valid]
+            Image.fromarray(d_norm).save(
                 os.path.join(img_dir, f"{name}_depth.png"))
 
             # Diff (squared error, colorized)
@@ -1516,9 +1520,7 @@ def evaluate(
                 d_norm = ((diff - d_min) / (d_max - d_min) * 255).astype(np.uint8)
             else:
                 d_norm = np.zeros_like(diff, dtype=np.uint8)
-            diff_color = cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)
-            diff_color = diff_color[..., [2, 1, 0]]  # BGR → RGB
-            Image.fromarray(diff_color).save(
+            Image.fromarray(d_norm).save(
                 os.path.join(img_dir, f"{name}_diff.png"))
 
     metrics = {
