@@ -37,6 +37,7 @@ from collections import namedtuple, OrderedDict
 
 import yaml
 import numpy as np
+from scipy.spatial import cKDTree
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1329,6 +1330,12 @@ DEFAULT_CFG = {
         "lambda_sh_reg": 0.001,
         "lambda_opacity_entropy": 0.0,
         "lambda_depth": 0.0,
+        # COLMAP anchor (constrain splats to dense point cloud)
+        "lambda_xyz_anchor": 0.005,
+        "anchor_radius_scale": 0.05,        # × scene_radius
+        "floater_radius_scale": 0.10,       # × scene_radius
+        "floater_prune_epoch_interval": 10,
+        "anchor_nn_refresh_interval": 50,   # iters between KDTree queries
     },
 }
 
@@ -1786,6 +1793,27 @@ def training(cfg: dict):
     prune_interval = optim_cfg["prune_epoch_interval"]
     scene_extent = scene_info.scene_radius
 
+    # ── COLMAP anchor (constrain splats to dense point cloud) ──────────
+    lambda_xyz_anchor = optim_cfg.get("lambda_xyz_anchor", 0.005)
+    anchor_radius = (
+        optim_cfg.get("anchor_radius_scale", 0.05) * scene_extent)
+    floater_radius = (
+        optim_cfg.get("floater_radius_scale", 0.10) * scene_extent)
+    floater_prune_interval = optim_cfg.get(
+        "floater_prune_epoch_interval", 10)
+    nn_refresh_interval = optim_cfg.get("anchor_nn_refresh_interval", 50)
+
+    colmap_pts_np = np.ascontiguousarray(
+        scene_info.point_cloud.points.astype(np.float32))
+    colmap_kdtree = cKDTree(colmap_pts_np)
+    colmap_pts_t = torch.as_tensor(colmap_pts_np, device="cuda")
+    cached_nn_idx: "torch.Tensor | None" = None
+    cached_nn_step = -10**9
+
+    print(f"  anchor:      λ={lambda_xyz_anchor}  r={anchor_radius:.3f}  "
+          f"floater_r={floater_radius:.3f}  "
+          f"prune every {floater_prune_interval} ep")
+
     print(f"Training: {num_epochs} epochs × {cams_per_epoch} cameras/epoch")
     print(f"  densify:     epoch {densify_from_epoch}–{densify_until_epoch}")
     print(f"  opacity reset every {opacity_reset_interval} epochs")
@@ -1948,6 +1976,27 @@ def training(cfg: dict):
                     depth, mono_depth, acc, mask)
                 scalar_dict["depth_loss"] = d_loss.item()
                 loss += d_loss
+
+            # ── COLMAP position anchor (soft) ────────────────────────────
+            if lambda_xyz_anchor > 0:
+                xyz = gaussians.get_xyz
+                need_refresh = (
+                    cached_nn_idx is None
+                    or cached_nn_idx.shape[0] != xyz.shape[0]
+                    or (step - cached_nn_step) >= nn_refresh_interval)
+                if need_refresh:
+                    xyz_np = xyz.detach().cpu().numpy()
+                    _, nn_idx = colmap_kdtree.query(xyz_np, k=1)
+                    cached_nn_idx = torch.as_tensor(
+                        nn_idx, device="cuda", dtype=torch.long)
+                    cached_nn_step = step
+                nn_pts = colmap_pts_t[cached_nn_idx]
+                d2 = ((xyz - nn_pts) ** 2).sum(-1)
+                inside = d2 < (anchor_radius ** 2)
+                if inside.any():
+                    anchor_loss = lambda_xyz_anchor * d2[inside].mean()
+                    scalar_dict["xyz_anchor_loss"] = anchor_loss.item()
+                    loss = loss + anchor_loss
 
             scalar_dict["loss"] = loss.item()
 
@@ -2115,6 +2164,31 @@ def training(cfg: dict):
                     print(f"\n[EPOCH {epoch}] Pruned "
                           f"{n_before - gaussians.num_points:,} "
                           f"low-opacity → {gaussians.num_points:,}")
+
+            # ── Floater pruning (splats far from any COLMAP point) ──────
+            if (epoch > densify_until_epoch and
+                    floater_prune_interval > 0 and
+                    epoch % floater_prune_interval == 0 and
+                    floater_radius > 0):
+                xyz_np = gaussians.get_xyz.detach().cpu().numpy()
+                d_nn, _ = colmap_kdtree.query(xyz_np, k=1)
+                floater_mask = torch.from_numpy(
+                    d_nn > floater_radius).cuda()
+                if floater_mask.any():
+                    n_before = gaussians.num_points
+                    gaussians._prune_points(floater_mask)
+                    gaussians.xyz_gradient_accum = torch.zeros(
+                        (gaussians.num_points, 1), device="cuda")
+                    gaussians.denom = torch.zeros(
+                        (gaussians.num_points, 1), device="cuda")
+                    gaussians.max_radii2D = torch.zeros(
+                        gaussians.num_points, device="cuda")
+                    torch.cuda.empty_cache()
+                    cached_nn_idx = None
+                    print(f"\n[EPOCH {epoch}] Pruned "
+                          f"{n_before - gaussians.num_points:,} floaters "
+                          f"(>{floater_radius:.2f}) → "
+                          f"{gaussians.num_points:,}")
 
             # ── Evaluation ────────────────────────────────────────────
             if epoch in test_epochs_set:

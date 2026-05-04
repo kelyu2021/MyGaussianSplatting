@@ -90,71 +90,102 @@ os.environ.setdefault(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  §0  Two-Row Log Image Helper
+#  §0  3×3 Log Image Helper
 # ═══════════════════════════════════════════════════════════════════════════
 
 def save_log_images_gan(
     log_dir: str, epoch: int,
     gt_on, rendered_on, depth_on, acc_on,
     rendered_off, depth_off, acc_off,
-    sky_mask=None, moving_mask=None,
+    sky_mask=None, moving_mask=None, mono_depth=None,
 ):
-    """Save an 8-panel visualisation grid (2 rows × 4 cols).
+    """Save a 3×3 grid to {log_dir}/epoch_{epoch:04d}.png.
 
-    Top row:    GT | Rendered | Depth | Acc                (original camera)
-    Bottom row: Rendered | Depth | Acc | Sky+Moving mask   (perturbed camera)
+    Row 1: GT RGB          | GT mask (sky=red, moving=green) | GT depth (mono)
+    Row 2: Pred RGB        | Pred alpha (acc)                | Pred depth
+    Row 3: Jittered RGB    | Jittered alpha (acc)            | Jittered depth
 
-    Mask panel colour coding:
-      Red   = sky,  Green = moving objects,  Yellow = overlap,  Black = valid
+    All depth panels: greyscale, light = near, dark = far, empty/sky = black.
     """
-    import torchvision
+    import numpy as np
+    from PIL import Image as _Image
 
-    def _to3(t):
-        c = t.detach().cpu().float()
-        if c.dim() == 2:
-            c = c.unsqueeze(0)
-        if c.shape[0] == 1:
-            c = c.expand(3, -1, -1)
-        return c
+    def _to_rgb_uint8(t):
+        arr = t.detach().cpu().float().numpy()
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        else:
+            arr = np.transpose(arr, (1, 2, 0))
+            if arr.shape[-1] == 1:
+                arr = np.repeat(arr, 3, axis=-1)
+            elif arr.shape[-1] > 3:
+                arr = arr[..., :3]
+        return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
 
-    def _norm_depth(dep):
-        d = dep.detach().cpu().float()
-        d = torch.log1p(d)
-        d = (d - d.min()) / (d.max() - d.min() + 1e-6)
-        return d.expand(3, -1, -1) if d.shape[0] == 1 else d
+    def _acc_to_grey(acc_t):
+        a = acc_t.detach().cpu().numpy().squeeze()
+        grey = (np.clip(a, 0, 1) * 255).astype(np.uint8)
+        return np.stack([grey] * 3, axis=-1)
 
-    gt_c = _to3(gt_on)
-    rn_on_c = _to3(rendered_on)
-    dep_on_c = _norm_depth(depth_on)
-    acc_on_c = _to3(acc_on)
+    def _depth_to_grey(depth_t_or_np, valid_mask=None):
+        if torch.is_tensor(depth_t_or_np):
+            d = depth_t_or_np.detach().cpu().numpy().squeeze()
+        else:
+            d = np.asarray(depth_t_or_np).squeeze().astype(np.float32)
+        out = np.zeros(d.shape, dtype=np.uint8)
+        if valid_mask is None:
+            valid_mask = np.isfinite(d) & (d > 0)
+        if valid_mask.any():
+            d_min = float(d[valid_mask].min())
+            d_max = float(d[valid_mask].max())
+            if d_max - d_min > 1e-6:
+                scaled = (1.0 - (d - d_min) / (d_max - d_min)) * 255.0
+            else:
+                scaled = np.full_like(d, 255.0)
+            out[valid_mask] = np.clip(scaled, 0, 255).astype(np.uint8)[valid_mask]
+        return np.stack([out] * 3, axis=-1)
 
-    rn_off_c = _to3(rendered_off)
-    dep_off_c = _norm_depth(depth_off)
-    acc_off_c = _to3(acc_off)
+    H = int(gt_on.shape[-2])
+    W = int(gt_on.shape[-1])
 
-    # Combined mask panel: R=sky, G=moving, B=0
-    H, W = gt_c.shape[1], gt_c.shape[2]
-    mask_vis = torch.zeros(3, H, W)
+    # ── Row 1: Ground truth ───────────────────────────────────────────
+    gt_rgb = _to_rgb_uint8(gt_on[:3])
+
+    # Mask: R=sky, G=moving, B=0
+    mask_img = np.zeros((H, W, 3), dtype=np.uint8)
     if sky_mask is not None:
-        # sky_mask: 1=valid, 0=sky  ->  sky region = (1 - sky_mask)
-        s = sky_mask.detach().cpu().float()
-        if s.dim() == 3:
-            s = s.squeeze(0)
-        mask_vis[0] = 1.0 - s          # Red channel = sky
+        s = sky_mask.detach().cpu().float().numpy().squeeze()
+        mask_img[..., 0] = ((1.0 - np.clip(s, 0, 1)) * 255).astype(np.uint8)
     if moving_mask is not None:
-        # moving_mask: 1=moving, 0=static
-        m = moving_mask.detach().cpu().float()
-        if m.dim() == 3:
-            m = m.squeeze(0)
-        mask_vis[1] = m                 # Green channel = moving
+        m = moving_mask.detach().cpu().float().numpy().squeeze()
+        mask_img[..., 1] = (np.clip(m, 0, 1) * 255).astype(np.uint8)
 
-    top = [gt_c, rn_on_c, dep_on_c, acc_on_c]
-    bot = [mask_vis,rn_off_c, dep_off_c, acc_off_c]
+    if mono_depth is not None:
+        gt_depth_img = _depth_to_grey(mono_depth)
+    else:
+        gt_depth_img = np.zeros((H, W, 3), dtype=np.uint8)
 
-    grid = torchvision.utils.make_grid(
-        top + bot, nrow=4, padding=2, normalize=False)
-    path = os.path.join(log_dir, f"epoch_{epoch:04d}.png")
-    torchvision.utils.save_image(grid, path)
+    # ── Row 2: On-road prediction ─────────────────────────────────────
+    pred_rgb = _to_rgb_uint8(rendered_on)
+    acc_on_np = acc_on.detach().cpu().numpy().squeeze()
+    pred_alpha_img = _acc_to_grey(acc_on)
+    pred_depth_img = _depth_to_grey(depth_on, valid_mask=acc_on_np > 1e-3)
+
+    # ── Row 3: Jittered prediction ────────────────────────────────────
+    jit_rgb = _to_rgb_uint8(rendered_off)
+    acc_off_np = acc_off.detach().cpu().numpy().squeeze()
+    jit_alpha_img = _acc_to_grey(acc_off)
+    jit_depth_img = _depth_to_grey(depth_off, valid_mask=acc_off_np > 1e-3)
+
+    # ── Compose grid ──────────────────────────────────────────────────
+    row1 = np.concatenate([gt_rgb,   mask_img,       gt_depth_img],   axis=1)
+    row2 = np.concatenate([pred_rgb, pred_alpha_img, pred_depth_img], axis=1)
+    row3 = np.concatenate([jit_rgb,  jit_alpha_img,  jit_depth_img],  axis=1)
+    grid = np.concatenate([row1, row2, row3], axis=0)
+
+    os.makedirs(log_dir, exist_ok=True)
+    _Image.fromarray(grid).save(
+        os.path.join(log_dir, f"epoch_{epoch:04d}.png"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -179,9 +210,6 @@ def evaluate_gan(
     """
     if not test_cameras:
         return {}
-
-    import cv2
-    import torchvision
 
     l1_list, psnr_list, ssim_list = [], [], []
 
@@ -220,19 +248,21 @@ def evaluate_gan(
         psnr_list.append(psnr(image_on, gt, mask).item())
         ssim_list.append(ssim(image_on, gt, mask=mask).item())
 
-        # Save 8-panel composite
+        # Save 3×3 composite
         if img_dir is not None:
             name = cam.image_name
+            mono_depth = cam.guidance.get("mono_depth")
             save_log_images_gan(
-                img_dir, 0,  # epoch unused in filename below
+                img_dir, 0,
                 gt, image_on, pkg_on["depth"], pkg_on["acc"],
                 image_off, pkg_off["depth"], pkg_off["acc"],
                 sky_mask=sky_mask,
                 moving_mask=moving_mask,
+                mono_depth=mono_depth,
             )
-            # Rename the generic file to camera-specific name
+            # Rename generic epoch_0000.png to camera-specific name
             generic = os.path.join(img_dir, "epoch_0000.png")
-            target = os.path.join(img_dir, f"{name}_composite.png")
+            target = os.path.join(img_dir, f"{name}.png")
             if os.path.isfile(generic):
                 os.rename(generic, target)
 

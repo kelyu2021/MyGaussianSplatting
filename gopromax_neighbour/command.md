@@ -4,7 +4,10 @@ nohup python train.py --config configs/gopromax_neighbour_180.yaml --output-dir 
 
 mkdir output
 CUDA_VISIBLE_DEVICES=1 nohup python train.py --config configs/gopromax_neighbour_1200.yaml --output-dir ./output_version_10_1200 > ./output_version_10_1200/gopromax_neighbour_1200.yaml.log 2>&1 &
+
 nohup python train.py --config configs/gopromax_neighbour_2400.yaml --max_frames 30 --gpu 5 --output-dir output_version_6_2400_30 > ./output_version_6_2400_30/gopromax_neighbour_2400.yaml.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=1 nohup python train.py --config configs/gopromax_neighbour_360.yaml --output-dir ./output_version_11_360 > ./output_version_11_360/train.log 2>&1 &
 
 cd gopromax_neighbour
 python render.py --config configs/gopromax_neighbour_180.yaml --mode evaluate
@@ -69,6 +72,14 @@ cd /home/lyuk4/GitHub/MyGaussianSplatting/MaSS13K/mmsegmentation && conda run -n
   --out_dir /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/data/cubemap_faces_mass13k \
   --exclude_classes 1 5 \
   --save_overlay
+
+## refine the sky boundary
+cd gopromax_neighbour
+python refine_sky_mask.py \
+  --in_dir  data/cubemap_faces_mass13k_manual \
+  --out_dir data/cubemap_faces_mass13k_manual_refined \
+  --erode_px 6 \
+  --image_dir data/cubemap_faces --save_overlay
 
 # depth anything v2
 cd gopromax_neighbour
