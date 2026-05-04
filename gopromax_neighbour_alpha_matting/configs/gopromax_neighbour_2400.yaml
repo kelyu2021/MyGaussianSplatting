@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────────────
+#  GoPro Max Neighbour – Gaussian Splatting with Sky Mask
+# ─────────────────────────────────────────────────────────────────────
+#
+#  Usage:
+#      cd MyGaussianSplatting/gopromax_neighbour
+#      python train.py --cfg_file configs/gopromax_neighbour.yaml
+#
+#  All relative paths are resolved from the workspace (cwd).
+
+task: gopromax_neighbour
+exp_name: sky_mask_v1
+gpus: [1]
+
+# COLMAP model directory (contains sparse/ and fused.ply)
+source_path: data/colmap_pointcloud_dense
+
+data:
+  type: GOPROMAX_NEIGHBOUR
+  white_background: false
+  split_test: 8
+  max_frames: 30    # set to 0 to use all frames
+  point_cloud_path: data/colmap_pointcloud_dense/fused.ply
+  mask_dir: data/cubemap_faces_mass13k_manual
+  depth_dir: data/cubemap_faces_da2
+  # Cubemap face images (original, converted from panoramic)
+  images: data/cubemap_faces
+
+model:
+  gaussian:
+    sh_degree: 3
+  nsg:
+    include_bkgd: true
+    include_sky: false
+  use_color_correction: true
+  # ── Learned per-scene sky dome (MLP over view direction) ──────────
+  use_sky_mlp: true
+  sky_n_freq: 6
+  sky_hidden: 64
+
+train:
+  epochs: 2400
+  test_epochs: [180, 400, 600, 800, 1000, 1200, 1600, 2000, 2400]
+  save_epochs: [180, 600, 1200, 1800, 2400]
+  checkpoint_epochs: [180, 600, 1200, 1800, 2400]
+
+optim:
+  densification_interval: 100
+  densify_from_epoch: 3
+  densify_until_epoch: 90
+  densify_grad_threshold_bkgd: 0.0002
+  position_lr_init: 0.00016
+  position_lr_final: 1.6e-06
+  position_lr_max_epochs: 135
+  opacity_reset_epoch_interval: 18
+  prune_epoch_interval: 30
+  prune_min_opacity: 0.003
+  lambda_l1: 1.0
+  lambda_dssim: 0.2
+  lambda_color_correction: 0.001
+  lambda_depth: 0.05    # monocular depth supervision (data/cubemap_faces_da2)
+  # ── Sky-dome MLP ──────────────────────────────────────────────────
+  sky_lr: 1.0e-3
+  lambda_sky_rgb: 0.1   # direct sky-region L1 supervision
+  lambda_sky_acc: 0.01  # push Gaussian opacity → 0 in sky pixels

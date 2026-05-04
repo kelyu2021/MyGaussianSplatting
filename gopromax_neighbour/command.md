@@ -66,6 +66,10 @@ cd /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour && conda run -n gop
   --output_dir data/colmap_pointcloud_dense \
   --use_gpu 1
 
+# alpha matting
+cd /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour
+python alpha_matting.py --save_rgba --save_trimap --overwrite
+
 # mask out sky
 cd /home/lyuk4/GitHub/MyGaussianSplatting/MaSS13K/mmsegmentation && conda run -n massformer python /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/mass13k.py \
   --image_dir /home/lyuk4/GitHub/MyGaussianSplatting/gopromax_neighbour/data/cubemap_faces \
