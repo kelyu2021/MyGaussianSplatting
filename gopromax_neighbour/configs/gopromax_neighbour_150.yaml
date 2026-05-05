@@ -21,13 +21,10 @@ data:
   split_test: 8
   max_frames: 30    # set to 0 to use all frames
   point_cloud_path: data/colmap_pointcloud_dense/fused.ply
-  mask_dir: ../gopromax_neighbour/data/cubemap_faces_mass13k_manual
-  depth_dir: ../gopromax_neighbour/data/cubemap_faces_da2
-  # Cubemap face images used by COLMAP (sky baked out, .png).
-  # COLMAP's images.bin references these filenames, so this must point
-  # to the baked-RGB set, not the raw .jpg cubemap faces.
-  images: data/cubemap_faces_nosky_rgb
-  alpha_matting_images: data/cubemap_faces_alpha_matting
+  mask_dir: data/cubemap_faces_mass13k_manual
+  depth_dir: data/cubemap_faces_da2
+  # Cubemap face images (original, converted from panoramic)
+  images: data/cubemap_faces
 
 model:
   gaussian:
@@ -42,10 +39,10 @@ model:
   sky_hidden: 64
 
 train:
-  epochs: 180
-  test_epochs: [30, 60, 90, 120, 150, 180]
-  save_epochs: [180]
-  checkpoint_epochs: [60, 120, 180]
+  epochs: 150
+  test_epochs: [5, 10, 15, 20, 25, 50, 75, 100, 125, 150]
+  save_epochs: [50, 100, 150]
+  checkpoint_epochs: [50, 100, 150]
 
 optim:
   densification_interval: 100
@@ -61,5 +58,6 @@ optim:
   lambda_l1: 1.0
   lambda_dssim: 0.2
   lambda_color_correction: 0.001
-  lambda_depth: 0.19    # monocular depth supervision (data/cubemap_faces_da2)
+  lambda_depth: 0.5    # monocular depth supervision (data/cubemap_faces_da2)
+  lambda_opacity_entropy: 0    # encourage sharper opacity (non-empty) distributions
 

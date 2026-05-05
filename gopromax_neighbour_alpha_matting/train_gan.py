@@ -127,14 +127,7 @@ def save_log_images_gan(
         grey = (np.clip(a, 0, 1) * 255).astype(np.uint8)
         return np.stack([grey] * 3, axis=-1)
 
-    def _depth_to_grey(depth_t_or_np, valid_mask=None, is_disparity=False):
-        """Greyscale depth panel: near = light, far = dark.
-
-        If ``is_disparity`` is True, the input is treated as inverse depth
-        (larger value = closer), so the brightness mapping is *not* inverted.
-        Otherwise the input is metric depth (larger value = farther) and the
-        mapping is inverted so that close points still appear bright.
-        """
+    def _depth_to_grey(depth_t_or_np, valid_mask=None):
         if torch.is_tensor(depth_t_or_np):
             d = depth_t_or_np.detach().cpu().numpy().squeeze()
         else:
@@ -146,11 +139,7 @@ def save_log_images_gan(
             d_min = float(d[valid_mask].min())
             d_max = float(d[valid_mask].max())
             if d_max - d_min > 1e-6:
-                norm = (d - d_min) / (d_max - d_min)
-                if is_disparity:
-                    scaled = norm * 255.0           # near (large) -> light
-                else:
-                    scaled = (1.0 - norm) * 255.0   # near (small) -> light
+                scaled = (1.0 - (d - d_min) / (d_max - d_min)) * 255.0
             else:
                 scaled = np.full_like(d, 255.0)
             out[valid_mask] = np.clip(scaled, 0, 255).astype(np.uint8)[valid_mask]
@@ -172,10 +161,7 @@ def save_log_images_gan(
         mask_img[..., 1] = (np.clip(m, 0, 1) * 255).astype(np.uint8)
 
     if mono_depth is not None:
-        # DA-v2 outputs are disparity (larger = closer); flip the brightness
-        # mapping so this panel matches the rendered-depth panels below
-        # (near = light, far = dark).
-        gt_depth_img = _depth_to_grey(mono_depth, is_disparity=True)
+        gt_depth_img = _depth_to_grey(mono_depth)
     else:
         gt_depth_img = np.zeros((H, W, 3), dtype=np.uint8)
 

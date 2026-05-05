@@ -74,11 +74,14 @@ from train import (  # noqa: E402
     l1_loss,
     ssim,
     psnr,
-    depth_mono_loss,
     save_log_images,
     FACE_TO_CAM_ID,
     TENSORBOARD_FOUND,
 )
+# Use the Depth Anything V2 (MiDaS-style) scale-and-shift-invariant loss
+# defined in train_da2loss.py so the depth supervision here matches the
+# original DA-v2 paper formulation.
+from train_da2loss import depth_mono_loss  # noqa: E402
 
 try:
     from torch.utils.tensorboard import SummaryWriter

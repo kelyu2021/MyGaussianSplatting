@@ -1,6 +1,6 @@
 cd gopromax_neighbour
 mkdir output
-nohup python train.py --config configs/gopromax_neighbour_180.yaml --output-dir ./output_version_9_180 > ./output_version_9_180/gopromax_neighbour_180.yaml.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup python train.py --config configs/gopromax_neighbour_180.yaml --output-dir ./output_version_16_180_da2loss > ./output_version_16_180_da2loss/train.log 2>&1 &
 
 mkdir output
 CUDA_VISIBLE_DEVICES=1 nohup python train.py --config configs/gopromax_neighbour_1200.yaml --output-dir ./output_version_10_1200 > ./output_version_10_1200/gopromax_neighbour_1200.yaml.log 2>&1 &
@@ -8,6 +8,11 @@ CUDA_VISIBLE_DEVICES=1 nohup python train.py --config configs/gopromax_neighbour
 nohup python train.py --config configs/gopromax_neighbour_2400.yaml --max_frames 30 --gpu 5 --output-dir output_version_6_2400_30 > ./output_version_6_2400_30/gopromax_neighbour_2400.yaml.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=1 nohup python train.py --config configs/gopromax_neighbour_360.yaml --output-dir ./output_version_11_360 > ./output_version_11_360/train.log 2>&1 &
+
+# train_da2loss
+CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config configs/gopromax_neighbour_100.yaml --output-dir ./output_version_17_100_da2loss > ./output_version_17_100_da2loss/train.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config configs/gopromax_neighbour_150.yaml --output-dir ./output_version_18_150_da2loss > ./output_version_18_150_da2loss/train.log 2>&1 &
 
 cd gopromax_neighbour
 python render.py --config configs/gopromax_neighbour_180.yaml --mode evaluate
@@ -44,14 +49,18 @@ cat output/<task>/<exp>_gan/train_metrics.csv
 cat output/<task>/<exp>_gan/eval_metrics.csv
 
 # gan-style
-cd gopromax_neighbour
 CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
     --config configs/gopromax_neighbour_180.yaml \
-    --model_root output_version_9_180 \
+    --model_root output_version_15_180 \
     --epoch 180 \
-    --road_width 0.5 \
-    --output_dir output_version_9_180_gan_0.5_1_200 \
-    --gan_epochs 200 > output_version_9_180_gan_0.5_1_200/train_gan.log 2>&1 &
+    --road_width 0.3 \
+    --road_width_init_frac 0.1 \
+    --road_width_warmup_epochs 20 \
+    --gan_epochs 100 \
+    --jitter_faces front back \
+    --jitter_directions left right \
+    --output_dir output_version_15_180_gan_0.4_100_curriculum \
+    > output_version_15_180_gan_0.4_100_curriculum/train_gan.log 2>&1 &
 
 # sparse point cloud
 python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 1 --matcher exhaustive
