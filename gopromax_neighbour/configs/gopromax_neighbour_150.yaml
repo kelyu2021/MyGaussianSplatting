@@ -58,6 +58,6 @@ optim:
   lambda_l1: 1.0
   lambda_dssim: 0.2
   lambda_color_correction: 0.001
-  lambda_depth: 0.5    # monocular depth supervision (data/cubemap_faces_da2)
+  lambda_depth: 0.8    # monocular depth supervision (data/cubemap_faces_da2)
   lambda_opacity_entropy: 0    # encourage sharper opacity (non-empty) distributions
 
