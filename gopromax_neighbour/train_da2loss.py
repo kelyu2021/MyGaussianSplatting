@@ -1696,7 +1696,9 @@ def evaluate(
                                valid: np.ndarray | None = None,
                                d_min: float | None = None,
                                d_max: float | None = None,
-                               invert: bool = True) -> np.ndarray:
+                               invert: bool = True,
+                               pct_lo: float = 0.0,
+                               pct_hi: float = 1.0) -> np.ndarray:
                 """Normalize depth to greyscale RGB. Convention: light = near,
                 dark = far, invalid pixels black.
 
@@ -1707,7 +1709,11 @@ def evaluate(
                                     *_depth_raw.npy), so we map directly.
 
                 If ``d_min``/``d_max`` are provided, they are used instead of
-                per-image min/max so multiple depth maps share a scale."""
+                per-image min/max so multiple depth maps share a scale.
+                Otherwise, ``pct_lo`` / ``pct_hi`` (in [0, 1]) select
+                percentile bounds over the valid pixels, suppressing the
+                influence of a few outliers (e.g. stray near-Gaussian leaks
+                into sky tiles)."""
                 d = depth_np.astype(np.float32)
                 out = np.zeros(d.shape, dtype=np.uint8)
                 if valid is None:
@@ -1715,10 +1721,15 @@ def evaluate(
                 if valid.any():
                     if d_min is None or d_max is None:
                         d_valid = d[valid]
-                        d_min = float(d_valid.min())
-                        d_max = float(d_valid.max())
+                        if pct_lo > 0.0 or pct_hi < 1.0:
+                            d_min = float(np.quantile(d_valid, pct_lo))
+                            d_max = float(np.quantile(d_valid, pct_hi))
+                        else:
+                            d_min = float(d_valid.min())
+                            d_max = float(d_valid.max())
                     if d_max - d_min > 1e-6:
                         n = (d - d_min) / (d_max - d_min)
+                        n = np.clip(n, 0.0, 1.0)
                         scaled = ((1.0 - n) if invert else n) * 255.0
                     else:
                         scaled = np.full_like(d, 255.0)
@@ -1755,7 +1766,27 @@ def evaluate(
             # what ``depth_mono_loss`` optimises.
             depth_premul_np = pkg["depth_premul"].detach().permute(
                 1, 2, 0).cpu().numpy().squeeze()
-            pred_valid = acc_np > 1e-3
+            # Stricter acc cutoff: stray near-Gaussians in sky tiles often
+            # leak with acc < 0.05 and cause bright outliers after disparity
+            # inversion.
+            pred_valid = acc_np > 5e-2
+            # If a GT non-sky mask is available, erode it by a few pixels
+            # so 1-px boundary leakage is excluded too.
+            if gt_mask is not None:
+                gm = gt_mask.detach().float().cpu().numpy().squeeze()
+                if gm.shape == pred_valid.shape:
+                    non_sky = (gm > 0.5).astype(np.float32)
+                    # Min-pool erosion via OpenCV-free trick: sliding min.
+                    k = 5
+                    pad = k // 2
+                    padded = np.pad(non_sky, pad, mode="edge")
+                    eroded = np.ones_like(non_sky)
+                    for di in range(k):
+                        for dj in range(k):
+                            eroded = np.minimum(
+                                eroded, padded[di:di + non_sky.shape[0],
+                                               dj:dj + non_sky.shape[1]])
+                    pred_valid = pred_valid & (eroded > 0.5)
             depth_np = np.zeros_like(depth_premul_np, dtype=np.float32)
             depth_np[pred_valid] = (
                 depth_premul_np[pred_valid]
@@ -1770,14 +1801,16 @@ def evaluate(
             if md is not None:
                 md_valid = np.isfinite(md) & (md > 0)
                 gt_depth_img = _depth_to_grey(
-                    md, valid=md_valid, invert=False)
+                    md, valid=md_valid, invert=False,
+                    pct_lo=0.02, pct_hi=0.98)
             else:
                 gt_depth_img = np.full((H, W, 3), 255, dtype=np.uint8)
 
             pred_disp = np.zeros_like(depth_np, dtype=np.float32)
             pred_disp[pred_valid] = 1.0 / np.maximum(depth_np[pred_valid], 1e-6)
             pred_depth_img = _depth_to_grey(
-                pred_disp, valid=pred_valid, invert=False)
+                pred_disp, valid=pred_valid, invert=False,
+                pct_lo=0.02, pct_hi=0.98)
 
             # ── Compose 2×3 grid ────────────────────────────────────
             row1 = np.concatenate([gt_rgb_img,   gt_mask_img,   gt_depth_img], axis=1)

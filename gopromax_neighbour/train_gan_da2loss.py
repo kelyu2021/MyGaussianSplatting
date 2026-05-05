@@ -45,6 +45,7 @@ from pathlib import Path
 from random import shuffle, seed as set_seed, choice as random_choice
 from collections import OrderedDict
 
+import imageio.v2 as imageio
 import yaml
 import numpy as np
 import torch
@@ -130,13 +131,18 @@ def save_log_images_gan(
         grey = (np.clip(a, 0, 1) * 255).astype(np.uint8)
         return np.stack([grey] * 3, axis=-1)
 
-    def _depth_to_grey(depth_t_or_np, valid_mask=None, is_disparity=False):
+    def _depth_to_grey(depth_t_or_np, valid_mask=None, is_disparity=False,
+                       pct_lo: float = 0.0, pct_hi: float = 1.0):
         """Greyscale depth panel: near = light, far = dark.
 
         If ``is_disparity`` is True, the input is treated as inverse depth
         (larger value = closer), so the brightness mapping is *not* inverted.
         Otherwise the input is metric depth (larger value = farther) and the
         mapping is inverted so that close points still appear bright.
+
+        ``pct_lo``/``pct_hi`` (in [0, 1]) select percentile bounds over the
+        valid pixels, suppressing the influence of a few outliers (e.g.
+        stray near-Gaussian leaks into sky tiles).
         """
         if torch.is_tensor(depth_t_or_np):
             d = depth_t_or_np.detach().cpu().numpy().squeeze()
@@ -146,10 +152,15 @@ def save_log_images_gan(
         if valid_mask is None:
             valid_mask = np.isfinite(d) & (d > 0)
         if valid_mask.any():
-            d_min = float(d[valid_mask].min())
-            d_max = float(d[valid_mask].max())
+            v = d[valid_mask]
+            if pct_lo > 0.0 or pct_hi < 1.0:
+                d_min = float(np.quantile(v, pct_lo))
+                d_max = float(np.quantile(v, pct_hi))
+            else:
+                d_min = float(v.min())
+                d_max = float(v.max())
             if d_max - d_min > 1e-6:
-                norm = (d - d_min) / (d_max - d_min)
+                norm = np.clip((d - d_min) / (d_max - d_min), 0.0, 1.0)
                 if is_disparity:
                     scaled = norm * 255.0           # near (large) -> light
                 else:
@@ -158,6 +169,57 @@ def save_log_images_gan(
                 scaled = np.full_like(d, 255.0)
             out[valid_mask] = np.clip(scaled, 0, 255).astype(np.uint8)[valid_mask]
         return np.stack([out] * 3, axis=-1)
+
+    def _erode_non_sky(sky_mask_arg, shape_hw):
+        """Return a (H, W) bool mask of non-sky pixels eroded by 5px.
+
+        ``sky_mask_arg`` follows the dataset convention: 1 = non-sky/valid,
+        0 = sky. Returns ``None`` if no mask is available.
+        """
+        if sky_mask_arg is None:
+            return None
+        if torch.is_tensor(sky_mask_arg):
+            gm = sky_mask_arg.detach().float().cpu().numpy().squeeze()
+        else:
+            gm = np.asarray(sky_mask_arg).astype(np.float32).squeeze()
+        if gm.shape != shape_hw:
+            return None
+        non_sky = (gm > 0.5).astype(np.float32)
+        k = 5
+        pad = k // 2
+        padded = np.pad(non_sky, pad, mode="edge")
+        eroded = np.ones_like(non_sky)
+        for di in range(k):
+            for dj in range(k):
+                eroded = np.minimum(
+                    eroded,
+                    padded[di:di + non_sky.shape[0],
+                           dj:dj + non_sky.shape[1]])
+        return eroded > 0.5
+
+    def _pred_depth_panel(depth_premul_t, acc_t, sky_mask_arg=None,
+                          use_sky_mask: bool = True,
+                          acc_cutoff: float = 5e-2):
+        """Convert premul depth + acc to a disparity greyscale panel.
+
+        Mirrors the convention in train_da2loss.py to suppress sky-area
+        white patches caused by stray near-Gaussian leaks.
+        """
+        dp = depth_premul_t.detach().cpu().numpy().squeeze().astype(np.float32)
+        a = acc_t.detach().cpu().numpy().squeeze().astype(np.float32)
+        valid = (a > acc_cutoff) & np.isfinite(dp)
+        if use_sky_mask:
+            eroded = _erode_non_sky(sky_mask_arg, valid.shape)
+            if eroded is not None:
+                valid = valid & eroded
+        # Expected depth = premul / acc on valid pixels.
+        depth = np.zeros_like(dp)
+        depth[valid] = dp[valid] / np.maximum(a[valid], 1e-10)
+        # Disparity (1/d) so brightness = near.
+        disp = np.zeros_like(depth)
+        disp[valid] = 1.0 / np.maximum(depth[valid], 1e-6)
+        return _depth_to_grey(disp, valid_mask=valid, is_disparity=True,
+                              pct_lo=0.02, pct_hi=0.98)
 
     H = int(gt_on.shape[-2])
     W = int(gt_on.shape[-1])
@@ -177,22 +239,34 @@ def save_log_images_gan(
     if mono_depth is not None:
         # DA-v2 outputs are disparity (larger = closer); flip the brightness
         # mapping so this panel matches the rendered-depth panels below
-        # (near = light, far = dark).
-        gt_depth_img = _depth_to_grey(mono_depth, is_disparity=True)
+        # (near = light, far = dark). Use percentile bounds to suppress
+        # outliers — same as the predicted depth panels.
+        gt_depth_img = _depth_to_grey(mono_depth, is_disparity=True,
+                                       pct_lo=0.02, pct_hi=0.98)
     else:
         gt_depth_img = np.zeros((H, W, 3), dtype=np.uint8)
 
     # ── Row 2: On-road prediction ─────────────────────────────────────
+    # Use the GT sky mask to suppress white patches from stray near-Gaussians
+    # leaking into sky tiles (consistent with train_da2loss.py).
     pred_rgb = _to_rgb_uint8(rendered_on)
-    acc_on_np = acc_on.detach().cpu().numpy().squeeze()
     pred_alpha_img = _acc_to_grey(acc_on)
-    pred_depth_img = _depth_to_grey(depth_on, valid_mask=acc_on_np > 1e-3)
+    pred_depth_img = _pred_depth_panel(depth_on, acc_on,
+                                        sky_mask_arg=sky_mask,
+                                        use_sky_mask=True)
 
     # ── Row 3: Jittered prediction ────────────────────────────────────
+    # Off-road view doesn't have a pixel-aligned GT sky mask, but for the
+    # small lateral shifts used here the GT sky mask is still a good
+    # approximation of where the sky is. Re-using it (same as row 2)
+    # together with a stricter acc cutoff suppresses the white patches
+    # caused by stray near-Gaussians leaking into sky tiles.
     jit_rgb = _to_rgb_uint8(rendered_off)
-    acc_off_np = acc_off.detach().cpu().numpy().squeeze()
     jit_alpha_img = _acc_to_grey(acc_off)
-    jit_depth_img = _depth_to_grey(depth_off, valid_mask=acc_off_np > 1e-3)
+    jit_depth_img = _pred_depth_panel(depth_off, acc_off,
+                                       sky_mask_arg=sky_mask,
+                                       use_sky_mask=True,
+                                       acc_cutoff=1e-1)
 
     # ── Compose grid ──────────────────────────────────────────────────
     row1 = np.concatenate([gt_rgb,   mask_img,       gt_depth_img],   axis=1)
@@ -203,6 +277,71 @@ def save_log_images_gan(
     os.makedirs(log_dir, exist_ok=True)
     _Image.fromarray(grid).save(
         os.path.join(log_dir, f"epoch_{epoch:04d}.png"))
+
+
+def _tensor_to_video_uint8(t: torch.Tensor) -> np.ndarray:
+    """Convert a rendered RGB tensor [C,H,W] in [0,1] to a video frame."""
+    arr = t.detach().cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
+    return (arr * 255).astype(np.uint8)
+
+
+@torch.no_grad()
+def _save_eval_jitter_videos(
+    cam: Camera,
+    gaussians: GaussianModel,
+    bg_color: torch.Tensor,
+    image_on: torch.Tensor,
+    up_dir: np.ndarray,
+    road_width: float,
+    directions: list[str],
+    forward_dir: np.ndarray | None,
+    lateral_dir: np.ndarray | None,
+    save_root: str,
+    steps: int = 10,
+    fps: int = 10,
+) -> dict[str, dict]:
+    """Save outward/return jitter videos for one eval camera.
+
+    The return leg reuses the outward rendered viewpoints in reverse order.
+    The final endpoint package for each direction is returned so the existing
+    composite eval image can reuse it instead of rendering that endpoint again.
+    """
+    if steps <= 0 or road_width <= 0:
+        return {}
+
+    cam_dir = os.path.join(save_root, cam.image_name)
+    os.makedirs(cam_dir, exist_ok=True)
+
+    base_frame = _tensor_to_video_uint8(image_on)
+    distances = [road_width * (i + 1) / steps for i in range(steps)]
+    endpoint_pkgs: dict[str, dict] = {}
+
+    for direction in directions:
+        frames = []
+        for step_idx, dist in enumerate(distances, start=1):
+            jit_cam = build_jittered_camera(
+                cam, up_dir, dist,
+                lateral_sign=direction,
+                forward=forward_dir,
+                lateral=lateral_dir,
+            )
+            pkg = render(jit_cam, gaussians, bg_color)
+            frames.append(_tensor_to_video_uint8(pkg["rgb"]))
+            if step_idx == steps:
+                endpoint_pkgs[direction] = pkg
+
+        imageio.mimwrite(
+            os.path.join(cam_dir, f"on_path_to_{direction}.mp4"),
+            [base_frame] + frames,
+            fps=fps,
+        )
+        imageio.mimwrite(
+            os.path.join(cam_dir, f"{direction}_to_on_path.mp4"),
+            list(reversed(frames)) + [base_frame],
+            fps=fps,
+        )
+
+    return endpoint_pkgs
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -255,6 +394,10 @@ def evaluate_gan(
     if save_dir is not None:
         img_dir = os.path.join(save_dir, split, f"epoch_{epoch}")
         os.makedirs(img_dir, exist_ok=True)
+    video_dir = None
+    if img_dir is not None:
+        video_dir = os.path.join(img_dir, "jitter_videos")
+        os.makedirs(video_dir, exist_ok=True)
 
     for cam in eval_cameras:
         gt = cam.original_image.cuda(non_blocking=True)
@@ -280,15 +423,31 @@ def evaluate_gan(
         psnr_list.append(psnr(image_on, gt, mask).item())
         ssim_list.append(ssim(image_on, gt, mask=mask).item())
 
+        endpoint_pkgs = {}
+        if video_dir is not None:
+            endpoint_pkgs = _save_eval_jitter_videos(
+                cam, gaussians, bg_color, image_on,
+                up_dir=up_dir,
+                road_width=road_width,
+                directions=directions,
+                forward_dir=forward_dir,
+                lateral_dir=lateral_dir,
+                save_root=video_dir,
+                steps=10,
+                fps=10,
+            )
+
         # Render off-road for each requested direction and save composite
         for direction in directions:
-            jit_cam = build_jittered_camera(
-                cam, up_dir, road_width,
-                lateral_sign=direction,
-                forward=forward_dir,
-                lateral=lateral_dir,
-            )
-            pkg_off = render(jit_cam, gaussians, bg_color)
+            pkg_off = endpoint_pkgs.get(direction)
+            if pkg_off is None:
+                jit_cam = build_jittered_camera(
+                    cam, up_dir, road_width,
+                    lateral_sign=direction,
+                    forward=forward_dir,
+                    lateral=lateral_dir,
+                )
+                pkg_off = render(jit_cam, gaussians, bg_color)
             image_off = pkg_off["rgb"]
 
             if img_dir is not None:
