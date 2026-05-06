@@ -315,6 +315,7 @@ def _save_eval_jitter_videos(
     base_frame = _tensor_to_video_uint8(image_on)
     distances = [road_width * (i + 1) / steps for i in range(steps)]
     endpoint_pkgs: dict[str, dict] = {}
+    outward_frames: dict[str, list[np.ndarray]] = {}
 
     for direction in directions:
         frames = []
@@ -330,6 +331,8 @@ def _save_eval_jitter_videos(
             if step_idx == steps:
                 endpoint_pkgs[direction] = pkg
 
+        outward_frames[direction] = frames
+
         imageio.mimwrite(
             os.path.join(cam_dir, f"on_path_to_{direction}.mp4"),
             [base_frame] + frames,
@@ -338,6 +341,35 @@ def _save_eval_jitter_videos(
         imageio.mimwrite(
             os.path.join(cam_dir, f"{direction}_to_on_path.mp4"),
             list(reversed(frames)) + [base_frame],
+            fps=fps,
+        )
+
+    # Combined loop for easy review on repeat:
+    # on_path_to_right + right_to_on_path + on_path_to_left + left_to_on_path
+    # (Skip duplicate boundary frames so playback is smooth.)
+    if ("right" in outward_frames) and ("left" in outward_frames):
+        right_out = outward_frames["right"]
+        left_out = outward_frames["left"]
+
+        def _return_leg(out_frames: list[np.ndarray]) -> list[np.ndarray]:
+            # If out_frames = [f1, ..., fN], outward segment ends at fN.
+            # Return segment should be [f(N-1), ..., f1, base] to avoid
+            # duplicating fN at the join.
+            if len(out_frames) <= 1:
+                return [base_frame]
+            return list(reversed(out_frames[:-1])) + [base_frame]
+
+        combined_frames = (
+            [base_frame] +
+            right_out +
+            _return_leg(right_out) +
+            left_out +
+            _return_leg(left_out)
+        )
+
+        imageio.mimwrite(
+            os.path.join(cam_dir, f"{cam.image_name}_wobble.mp4"),
+            combined_frames,
             fps=fps,
         )
 

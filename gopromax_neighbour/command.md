@@ -14,6 +14,9 @@ CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config configs/gopromax_n
 
 CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config configs/gopromax_neighbour_150.yaml --output-dir ./output_version_18_150_da2loss > ./output_version_18_150_da2loss/train.log 2>&1 &
 
+# train_gan_da2loss
+CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan_da2loss.py     --config configs/gopromax_neighbour_150.yaml     --model_root output_version_18_150_da2loss_0.5     --epoch 150     --road_width 0.3     --road_width_init_frac 0.05     --road_width_warmup_epochs 20     --gan_epochs 100     --jitter_faces front back     --jitter_directions left right     --output_dir output_version_18_150_da2loss_0.5_gan_0.3_100     > output_version_18_150_da2loss_0.5_gan_0.3_100/train_gan_da2loss.log 2>&1 &
+
 cd gopromax_neighbour
 python render.py --config configs/gopromax_neighbour_180.yaml --mode evaluate
 python render.py --config configs/gopromax_neighbour_180.yaml --mode trajectory --fps 10
@@ -74,6 +77,22 @@ CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
     --jitter_directions left right \
     --output_dir output_version_18_150_da2loss_0.5_v2_gan_0.3_100 \
     > output_version_18_150_da2loss_0.5_v2_gan_0.3_100/train_gan.log 2>&1 &
+
+
+# render wobble
+python gopromax_neighbour/render_wobble.py \
+  --img_name 0001_front \
+  --road_width 0.3 \
+  --model_path gopromax_neighbour/output_version_18_150_da2loss_0.8/gopromax_neighbour/sky_mask_v1/trained_model/epoch_150.pth \
+  --cameras_json gopromax_neighbour/output_version_18_150_da2loss_0.8/gopromax_neighbour/sky_mask_v1/cameras.json \
+  --fps 10 \
+  --steps 10 \
+  --output_dir gopromax_neighbour/output_version_18_150_da2loss_0.8/gopromax_neighbour/sky_mask_v1/wobble_videos
+
+python gopromax_neighbour/render_wobble.py   --img_name 0001_front   --road_width 0.2 --fps 10   --steps 10 \
+  --model_path gopromax_neighbour/output_version_18_150_da2loss_0.8/gopromax_neighbour/sky_mask_v1/trained_model/epoch_150.pth \
+  --cameras_json gopromax_neighbour/output_version_18_150_da2loss_0.8/gopromax_neighbour/sky_mask_v1/cameras.json \
+  --output_dir gopromax_neighbour/output_version_18_150_da2loss_0.8/gopromax_neighbour/sky_mask_v1/wobble_videos
 
 # sparse point cloud
 python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 1 --matcher exhaustive

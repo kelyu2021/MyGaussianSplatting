@@ -393,8 +393,25 @@ class Camera(nn.Module):
 
 def _pil_to_torch(pil_img, resolution=None, mode=Image.BILINEAR):
     """PIL Image → (C, H, W) torch float in [0, 1]."""
+    # Convert to PIL Image if needed
+    if isinstance(pil_img, torch.Tensor):
+        arr = pil_img.detach().cpu()
+        if arr.ndim == 3 and arr.shape[0] in [1, 3]:
+            # (C, H, W) -> (H, W, C)
+            arr = arr.permute(1, 2, 0)
+        arr = arr.numpy()
+        if arr.dtype in [np.float32, np.float64]:
+            arr = (arr * 255).clip(0, 255).astype(np.uint8)
+        pil_img = Image.fromarray(arr)
+    elif isinstance(pil_img, np.ndarray):
+        if pil_img.dtype in [np.float32, np.float64]:
+            arr = (pil_img * 255).clip(0, 255).astype(np.uint8)
+        else:
+            arr = pil_img
+        pil_img = Image.fromarray(arr)
+    # Now pil_img is a PIL Image
     if resolution is not None:
-        pil_img = pil_img.resize(resolution, mode)
+        pil_img = pil_img.resize(resolution[::-1], mode)
     arr = torch.from_numpy(np.array(pil_img)).float() / 255.0
     if arr.ndim == 3:
         return arr.permute(2, 0, 1)

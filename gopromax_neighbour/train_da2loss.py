@@ -2351,7 +2351,31 @@ def main():
     if args.max_frames is not None:
         cfg.setdefault("data", {})["max_frames"] = args.max_frames
 
+    # ── Config logging (written into train.log when stdout is redirected) ──
+    config_path = os.path.abspath(args.config)
+    print(f"[Config] --config = {args.config}")
+    print(f"[Config] resolved path = {config_path}")
+    if os.path.exists(config_path):
+        try:
+            mtime = os.path.getmtime(config_path)
+            print(f"[Config] file mtime (epoch seconds) = {mtime:.0f}")
+        except Exception as e:
+            print(f"[Config] WARNING: could not read mtime: {e}")
+    else:
+        print("[Config] WARNING: config path does not exist on disk")
+
     print(f"Task: {cfg['task']}  Exp: {cfg['exp_name']}")
+    train_cfg = cfg.get("train", {})
+    optim_cfg = cfg.get("optim", {})
+    print(f"[Config] output_root = {cfg.get('output_root')}")
+    print(f"[Config] epochs = {train_cfg.get('epochs')}")
+    print(f"[Config] test_epochs = {train_cfg.get('test_epochs')}")
+    print(f"[Config] checkpoint_epochs = {train_cfg.get('checkpoint_epochs')}")
+    print(f"[Config] save_epochs = {train_cfg.get('save_epochs')}")
+    print(f"[Config] optim.lambda_depth = {optim_cfg.get('lambda_depth')}")
+    print(f"[Config] optim.lambda_sky_acc = {optim_cfg.get('lambda_sky_acc')}")
+    print(f"[Config] optim.lambda_l1 = {optim_cfg.get('lambda_l1')}")
+    print(f"[Config] optim.lambda_dssim = {optim_cfg.get('lambda_dssim')}")
 
     # Reproducibility
     set_seed(0)
