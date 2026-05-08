@@ -82,7 +82,8 @@ from train import (  # noqa: E402
 # Use the Depth Anything V2 (MiDaS-style) scale-and-shift-invariant loss
 # defined in train_da2loss.py so the depth supervision here matches the
 # original DA-v2 paper formulation.
-from train_da2loss import depth_mono_loss  # noqa: E402
+from train_da2loss import (depth_mono_loss,  # noqa: E402
+                           SphericalHarmonicSky, _compute_sky_bg)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -299,6 +300,7 @@ def _save_eval_jitter_videos(
     save_root: str,
     steps: int = 10,
     fps: int = 10,
+    sky_model=None,
 ) -> dict[str, dict]:
     """Save outward/return jitter videos for one eval camera.
 
@@ -312,6 +314,8 @@ def _save_eval_jitter_videos(
     cam_dir = os.path.join(save_root, cam.image_name)
     os.makedirs(cam_dir, exist_ok=True)
 
+    # image_on is already sky-composited when sky_model is provided
+    # (caller passes image_on_display in that case)
     base_frame = _tensor_to_video_uint8(image_on)
     distances = [road_width * (i + 1) / steps for i in range(steps)]
     endpoint_pkgs: dict[str, dict] = {}
@@ -327,7 +331,12 @@ def _save_eval_jitter_videos(
                 lateral=lateral_dir,
             )
             pkg = render(jit_cam, gaussians, bg_color)
-            frames.append(_tensor_to_video_uint8(pkg["rgb"]))
+            if sky_model is not None:
+                _sky_jit = _compute_sky_bg(jit_cam, sky_model)
+                _rgb_composited = (pkg["rgb"] + (1.0 - pkg["acc"]) * _sky_jit).clamp(0.0, 1.0)
+                frames.append(_tensor_to_video_uint8(_rgb_composited))
+            else:
+                frames.append(_tensor_to_video_uint8(pkg["rgb"]))
             if step_idx == steps:
                 endpoint_pkgs[direction] = pkg
 
@@ -392,6 +401,7 @@ def evaluate_gan(
     save_dir: str | None = None,
     jitter_faces: tuple[str, ...] | None = None,
     jitter_directions: tuple[str, ...] | None = None,
+    sky_model=None,
 ):
     """Evaluate on test cameras with 3x3 composite images.
 
@@ -449,6 +459,12 @@ def evaluate_gan(
         # Render on-road (once per camera; metrics computed once)
         pkg_on = render(cam, gaussians, bg_color)
         image_on = pkg_on["rgb"]
+        # SH sky composited image for display (row 2 col 1)
+        if sky_model is not None:
+            _sky_bg_on = _compute_sky_bg(cam, sky_model)
+            image_on_display = (image_on + (1.0 - pkg_on["acc"]) * _sky_bg_on).clamp(0.0, 1.0)
+        else:
+            image_on_display = image_on
 
         # Metrics (on-road)
         l1_list.append(l1_loss(image_on, gt, mask).item())
@@ -458,7 +474,7 @@ def evaluate_gan(
         endpoint_pkgs = {}
         if video_dir is not None:
             endpoint_pkgs = _save_eval_jitter_videos(
-                cam, gaussians, bg_color, image_on,
+                cam, gaussians, bg_color, image_on_display,
                 up_dir=up_dir,
                 road_width=road_width,
                 directions=directions,
@@ -467,28 +483,35 @@ def evaluate_gan(
                 save_root=video_dir,
                 steps=10,
                 fps=10,
+                sky_model=sky_model,
             )
 
         # Render off-road for each requested direction and save composite
         for direction in directions:
+            jit_cam = build_jittered_camera(
+                cam, up_dir, road_width,
+                lateral_sign=direction,
+                forward=forward_dir,
+                lateral=lateral_dir,
+            )
             pkg_off = endpoint_pkgs.get(direction)
             if pkg_off is None:
-                jit_cam = build_jittered_camera(
-                    cam, up_dir, road_width,
-                    lateral_sign=direction,
-                    forward=forward_dir,
-                    lateral=lateral_dir,
-                )
                 pkg_off = render(jit_cam, gaussians, bg_color)
             image_off = pkg_off["rgb"]
+            # SH sky composited image for display (row 3 col 1)
+            if sky_model is not None:
+                _sky_bg_off = _compute_sky_bg(jit_cam, sky_model)
+                image_off_display = (image_off + (1.0 - pkg_off["acc"]) * _sky_bg_off).clamp(0.0, 1.0)
+            else:
+                image_off_display = image_off
 
             if img_dir is not None:
                 name = cam.image_name
                 mono_depth = cam.guidance.get("mono_depth")
                 save_log_images_gan(
                     img_dir, 0,
-                    gt, image_on, pkg_on["depth"], pkg_on["acc"],
-                    image_off, pkg_off["depth"], pkg_off["acc"],
+                    gt, image_on_display, pkg_on["depth"], pkg_on["acc"],
+                    image_off_display, pkg_off["depth"], pkg_off["acc"],
                     sky_mask=sky_mask,
                     moving_mask=moving_mask,
                     mono_depth=mono_depth,
@@ -779,7 +802,20 @@ def _load_checkpoint(ckpt_dir: str, epoch: int | None, sh_degree: int):
     gaussians.active_sh_degree = gaussians.max_sh_degree
     print(f"  {gaussians.num_points:,} Gaussians, "
           f"SH degree {gaussians.active_sh_degree}")
-    return gaussians, loaded_epoch, state
+
+    sky_model = None
+    if "sky_model_state" in state:
+        saved_coeffs = state["sky_model_state"]["sh_coeffs"]
+        sky_sh_degree = int(math.sqrt(saved_coeffs.shape[1]) + 0.5) - 1
+        sky_model = SphericalHarmonicSky(sh_degree=sky_sh_degree).cuda()
+        sky_model.load_state_dict(state["sky_model_state"])
+        sky_model.eval()
+        for p in sky_model.parameters():
+            p.requires_grad_(False)
+        print(f"  SH sky model loaded (degree {sky_sh_degree})")
+    else:
+        print("  No sky_model_state in checkpoint; sky backdrop disabled.")
+    return gaussians, loaded_epoch, state, sky_model
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -912,7 +948,7 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
 
     sh_degree = cfg.get("model", {}).get("sh_degree",
                 cfg.get("model", {}).get("gaussian", {}).get("sh_degree", 3))
-    gaussians, loaded_epoch, ckpt_state = _load_checkpoint(
+    gaussians, loaded_epoch, ckpt_state, sky_model = _load_checkpoint(
         trained_model_dir, pretrained_epoch, sh_degree)
 
     print(f"Loaded pre-trained model from epoch {loaded_epoch}")
@@ -1253,15 +1289,25 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                     # Stash for end-of-epoch log images (last direction)
                     if dir_idx == len(_jitter_directions) - 1:
                         log_gt_on = gt_image.detach()
-                        log_render_on = real_img.detach()
+                        _raw_on = real_img.detach()
                         log_depth_on = real_pkg["depth"].detach()
                         log_acc_on = real_pkg["acc"].detach()
-                        log_render_off = fake_img.detach()
+                        _raw_off = fake_img.detach()
                         log_depth_off = fake_pkg["depth"].detach()
                         log_acc_off = fake_pkg["acc"].detach()
                         log_sky_mask = sky_mask
                         log_moving_mask = moving_mask
                         log_mono_depth = cam.guidance.get("mono_depth")
+                        # Apply SH sky compositing for display panels
+                        if sky_model is not None:
+                            with torch.no_grad():
+                                _sky_on = _compute_sky_bg(cam, sky_model)
+                                log_render_on = (_raw_on + (1.0 - log_acc_on) * _sky_on).clamp(0.0, 1.0)
+                                _sky_off = _compute_sky_bg(jit_cam, sky_model)
+                                log_render_off = (_raw_off + (1.0 - log_acc_off) * _sky_off).clamp(0.0, 1.0)
+                        else:
+                            log_render_on = _raw_on
+                            log_render_off = _raw_off
 
                 ep_count += 1
 
@@ -1357,7 +1403,8 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                          save_dir=dirs["model_path"],
                          jitter_faces=tuple(jitter_faces_set),
                          jitter_directions=tuple(
-                             jitter_directions_default))
+                             jitter_directions_default),
+                         sky_model=sky_model)
 
         # ── Save checkpoint every 50 epochs + final ───────────────
         if epoch % 50 == 0 or epoch == gan_epochs:

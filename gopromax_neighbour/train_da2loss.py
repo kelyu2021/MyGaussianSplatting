@@ -1421,14 +1421,30 @@ def read_scene(
             colors=pcd.colors[keep],
             normals=pcd.normals[keep])
 
-    print(f"[Scene] Scene radius: {radius_pct:.2f}")
+    # Use camera positions to compute scene_extent instead of the point-cloud
+    # 99th-percentile radius, which is dominated by far-away background points.
+    # All densification/pruning thresholds (percent_dense * scene_extent,
+    # percent_big_ws * scene_extent) and position_lr (spatial_lr_scale) are
+    # scaled by scene_radius, so using a far-scene value makes them too loose
+    # for close-range Gaussians.  Camera positions represent the capture volume
+    # where detail actually matters.
+    cam_positions = np.array([
+        (-qvec2rotmat(img.qvec).T @ img.tvec)
+        for img in images_bin.values()
+    ])
+    cam_centre = cam_positions.mean(axis=0)
+    cam_dists = np.linalg.norm(cam_positions - cam_centre, axis=1)
+    camera_extent = float(np.percentile(cam_dists, 90)) if len(cam_dists) > 1 else radius_pct
+    scene_radius = max(camera_extent * 2.0, 1.0)
+    print(f"[Scene] Point-cloud radius (p99): {radius_pct:.2f}  |  "
+          f"Camera-based scene_radius: {scene_radius:.2f}")
 
     return SceneInfo(
         point_cloud=pcd,
         train_cameras=train_cams,
         test_cameras=test_cams,
         scene_center=centre,
-        scene_radius=radius_pct,
+        scene_radius=scene_radius,
         ply_path=str(pcd_path))
 
 
