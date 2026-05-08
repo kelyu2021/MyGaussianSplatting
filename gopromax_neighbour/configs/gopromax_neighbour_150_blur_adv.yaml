@@ -35,10 +35,10 @@ model:
   use_color_correction: true
 
 train:
-  epochs: 300
-  test_epochs: [10, 20, 30, 50, 75, 100, 150, 175, 200, 225, 250, 275, 300]
-  save_epochs: [150, 300]
-  checkpoint_epochs: [150, 300]
+  epochs: 150
+  test_epochs: [5, 10, 15, 20, 25, 50, 75, 100, 125, 150]
+  save_epochs: [50, 100, 150]
+  checkpoint_epochs: [50, 100, 150]
 
 optim:
   densification_interval: 100
@@ -53,7 +53,19 @@ optim:
   prune_min_opacity: 0.003
   lambda_l1: 1.0
   lambda_dssim: 0.2
+  lambda_sky: 1    # supervise sky region with a constant blue color (data/cubemap_faces_mass13k_manual)
+  lambda_sky_acc: 0.01    # accumulate sky supervision gradients over multiple epochs (for stability)
   lambda_color_correction: 0.001
   lambda_depth: 0.5    # monocular depth supervision (data/cubemap_faces_da2)
-  lambda_sky: 1.0    # supervise sky region with a constant blue color (data/cubemap_faces_mass13k_manual)
-  lambda_sky_acc: 0.01    # accumulate sky supervision gradients over multiple epochs (for stability)
+  lambda_opacity_entropy: 0    # encourage sharper opacity (non-empty) distributions
+  lambda_sky_acc: 0.5    # accumulate sky supervision gradients over multiple epochs (for stability) 
+
+  # solve the blur of close scene
+  densify_grad_threshold: 0.0001  # was 0.0002 — triggers more splits near camera
+  max_screen_size: 40             # was 20 — don't prune large nearby Gaussians
+  percent_big_ws: 0.0             # was 0.1 — disable world-space size pruning
+  densify_until_epoch: 135        # was 90 — allow more epochs of aggressive densification to capture close details
+  force_split_screen_size: 15
+  depth_loss_trim: 0.05
+  opacity_reset_until_epoch: 60
+  densification_interval: 50
