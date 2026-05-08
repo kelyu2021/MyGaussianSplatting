@@ -54,7 +54,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent))
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-from train import (                                                      # noqa: E402
+from train_da2loss import (                                              # noqa: E402
     GaussianModel,
     Camera,
     load_camera,
@@ -206,34 +206,14 @@ def _compute_sky_bg(camera, sky_model: "SphericalHarmonicSky") -> torch.Tensor:
 
 
 def _composite_sky(rgb: torch.Tensor, acc: torch.Tensor,
-                   sky_bg: torch.Tensor,
-                   sky_mask: torch.Tensor | None = None,
-                   dilate_px: int = 0) -> torch.Tensor:
+                   sky_bg: torch.Tensor) -> torch.Tensor:
     """Alpha-composite the sky behind the rendered Gaussians.
 
-    rgb       : (3, H, W) Gaussian render against a black background
-    acc       : (1, H, W) accumulated Gaussian opacity
-    sky_bg    : (3, H, W) per-pixel sky color
-    sky_mask  : (1, H, W) bool – True where foreground, False where sky.
-                When provided with dilate_px > 0, the sky region is dilated
-                inward so boundary floaters are replaced by the sky model.
-    dilate_px : Number of pixels to dilate the sky region into foreground.
+    rgb    : (3, H, W) Gaussian render against a black background
+    acc    : (1, H, W) accumulated Gaussian opacity
+    sky_bg : (3, H, W) per-pixel sky color
     """
     a = acc[:1] if acc.dim() == 3 else acc.unsqueeze(0)  # (1, H, W)
-
-    if sky_mask is not None and dilate_px > 0:
-        import torch.nn.functional as F
-        # sky_region: 1.0 where sky, 0.0 where foreground
-        sky_region = (~sky_mask[:1].bool()).float()           # (1, H, W)
-        kernel = 2 * dilate_px + 1
-        # Dilate the sky region by dilate_px pixels into the foreground.
-        sky_dilated = F.max_pool2d(
-            sky_region.unsqueeze(0),                          # (1,1,H,W)
-            kernel_size=kernel, stride=1, padding=dilate_px,
-        ).squeeze(0)                                          # (1, H, W)
-        # Zero out alpha in the dilated sky zone → those pixels show pure sky.
-        a = a * (1.0 - sky_dilated)
-
     return rgb + (1.0 - a) * sky_bg
 
 
@@ -380,10 +360,10 @@ def _save_video(frames: list, path: str, fps: int,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _load_checkpoint(trained_model_dir: str, epoch: int | None,
-                     sh_degree: int) -> tuple[GaussianModel, int]:
+                     sh_degree: int) -> tuple[GaussianModel, int, dict | None]:
     """Load a GaussianModel from a checkpoint.
 
-    Returns (gaussians, loaded_epoch).
+    Returns (gaussians, loaded_epoch, sky_model_state_or_None).
     """
     ckpt_dir = Path(trained_model_dir)
     if epoch is not None:
@@ -405,10 +385,15 @@ def _load_checkpoint(trained_model_dir: str, epoch: int | None,
     gaussians = GaussianModel(sh_degree=sh_degree)
     gaussians.load_state_dict(state)
     gaussians.active_sh_degree = gaussians.max_sh_degree
+    sky_state = state.get("sky_model_state", None)
+    if sky_state is not None:
+        print("  Co-trained sky model found in checkpoint.")
+    else:
+        print("  No sky model in checkpoint – will fit from GT sky pixels.")
     print(f"  Loaded epoch {loaded_epoch}, "
           f"{gaussians.num_points:,} Gaussians, "
           f"SH degree {gaussians.active_sh_degree}")
-    return gaussians, loaded_epoch
+    return gaussians, loaded_epoch, sky_state
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -421,8 +406,7 @@ def render_sets(cfg: dict, config_path: str, epoch: int | None = None,
                 output_dir: str | None = None,
                 fit_sky: bool = True,
                 fit_iters: int = 300,
-                fit_lr: float = 1e-2,
-                sky_mask_dilate: int = 0):
+                fit_lr: float = 1e-2):
     """Render and save per-image outputs for train and test camera sets."""
     workspace = os.getcwd()
     data_cfg = cfg["data"]
@@ -462,7 +446,7 @@ def render_sets(cfg: dict, config_path: str, epoch: int | None = None,
     # Load trained model
     sh_degree = cfg.get("model", {}).get("sh_degree",
                 cfg.get("model", {}).get("gaussian", {}).get("sh_degree", 3))
-    gaussians, loaded_epoch = _load_checkpoint(
+    gaussians, loaded_epoch, sky_ckpt_state = _load_checkpoint(
         trained_model_dir, epoch, sh_degree)
 
     # Build camera sets
@@ -477,11 +461,17 @@ def render_sets(cfg: dict, config_path: str, epoch: int | None = None,
             load_camera(ci) for ci in tqdm(scene_info.test_cameras)]
         splits.append(("test", test_cameras))
 
-    # Optionally fit the sky SH on training-set sky pixels.
-    if sky_model is not None and fit_sky and sky_sh_coeffs is None:
-        print("Fitting sky SH coefficients to GT sky pixels…")
-        _fit_sky_model(sky_model, train_cameras,
-                       n_iters=fit_iters, lr=fit_lr)
+    # Use co-trained sky model from checkpoint if available;
+    # otherwise fit from GT sky pixels (old behaviour).
+    if sky_model is not None:
+        if sky_ckpt_state is not None and sky_sh_coeffs is None:
+            sky_model.load_state_dict(sky_ckpt_state)
+            sky_model.eval()
+            print("  Using co-trained sky model from checkpoint.")
+        elif fit_sky and sky_sh_coeffs is None:
+            print("Fitting sky SH coefficients to GT sky pixels…")
+            _fit_sky_model(sky_model, train_cameras,
+                           n_iters=fit_iters, lr=fit_lr)
 
     with torch.no_grad():
         times: list[float] = []
@@ -511,12 +501,8 @@ def render_sets(cfg: dict, config_path: str, epoch: int | None = None,
                 result = render(camera, gaussians, bg_color)
                 if sky_model is not None:
                     sky_bg = _compute_sky_bg(camera, sky_model)
-                    sky_mask = camera.guidance.get("mask")
-                    if sky_mask is not None:
-                        sky_mask = sky_mask.to("cuda")
                     result['rgb'] = _composite_sky(
-                        result['rgb'], result['acc'], sky_bg,
-                        sky_mask=sky_mask, dilate_px=sky_mask_dilate)
+                        result['rgb'], result['acc'], sky_bg)
 
                 torch.cuda.synchronize()
                 t1 = time.time()
@@ -537,7 +523,9 @@ def render_sets(cfg: dict, config_path: str, epoch: int | None = None,
                 )
 
                 # ── Depth ─────────────────────────────────────────
-                depth = result['depth'].detach().permute(1, 2, 0).cpu().numpy()
+                acc_d = result['acc'].clamp(min=1e-6)
+                depth_t = result['depth_premul'] / acc_d
+                depth = depth_t.detach().permute(1, 2, 0).cpu().numpy()
                 imageio.imwrite(
                     os.path.join(save_dir, f'{name}_depth.png'),
                     _depth_colorize(depth),
@@ -618,8 +606,7 @@ def render_trajectory(cfg: dict, config_path: str, epoch: int | None = None, fps
                       output_dir: str | None = None,
                       fit_sky: bool = True,
                       fit_iters: int = 300,
-                      fit_lr: float = 1e-2,
-                      sky_mask_dilate: int = 0):
+                      fit_lr: float = 1e-2):
     """Render all frames in order and produce trajectory videos."""
     workspace = os.getcwd()
     data_cfg = cfg["data"]
@@ -657,7 +644,7 @@ def render_trajectory(cfg: dict, config_path: str, epoch: int | None = None, fps
     # Load trained model
     sh_degree = cfg.get("model", {}).get("sh_degree",
                 cfg.get("model", {}).get("gaussian", {}).get("sh_degree", 3))
-    gaussians, loaded_epoch = _load_checkpoint(
+    gaussians, loaded_epoch, sky_ckpt_state = _load_checkpoint(
         trained_model_dir, epoch, sh_degree)
 
     save_dir = os.path.join(
@@ -672,12 +659,18 @@ def render_trajectory(cfg: dict, config_path: str, epoch: int | None = None, fps
     all_cameras = [load_camera(ci) for ci in tqdm(all_cam_infos)]
     all_cameras = sorted(all_cameras, key=lambda c: c.id)
 
-    # Optionally fit the sky SH against training-set sky pixels.
-    if sky_model is not None and fit_sky and sky_sh_coeffs is None:
-        print("Fitting sky SH coefficients to GT sky pixels…")
-        train_cameras = [load_camera(ci) for ci in scene_info.train_cameras]
-        _fit_sky_model(sky_model, train_cameras,
-                       n_iters=fit_iters, lr=fit_lr)
+    # Use co-trained sky model from checkpoint if available;
+    # otherwise fit from GT sky pixels (old behaviour).
+    if sky_model is not None:
+        if sky_ckpt_state is not None and sky_sh_coeffs is None:
+            sky_model.load_state_dict(sky_ckpt_state)
+            sky_model.eval()
+            print("  Using co-trained sky model from checkpoint.")
+        elif fit_sky and sky_sh_coeffs is None:
+            print("Fitting sky SH coefficients to GT sky pixels…")
+            train_cameras = [load_camera(ci) for ci in scene_info.train_cameras]
+            _fit_sky_model(sky_model, train_cameras,
+                           n_iters=fit_iters, lr=fit_lr)
 
     with torch.no_grad():
         # Limit to max_frames if specified
@@ -698,12 +691,8 @@ def render_trajectory(cfg: dict, config_path: str, epoch: int | None = None, fps
             result = render(camera, gaussians, bg_color)
             if sky_model is not None:
                 sky_bg = _compute_sky_bg(camera, sky_model)
-                sky_mask = camera.guidance.get("mask")
-                if sky_mask is not None:
-                    sky_mask = sky_mask.to("cuda")
                 result['rgb'] = _composite_sky(
-                    result['rgb'], result['acc'], sky_bg,
-                    sky_mask=sky_mask, dilate_px=sky_mask_dilate)
+                    result['rgb'], result['acc'], sky_bg)
 
             # Extract camera direction from image name
             name = camera.image_name
@@ -725,7 +714,8 @@ def render_trajectory(cfg: dict, config_path: str, epoch: int | None = None, fps
             rgbs_gt.append(_tensor_to_uint8(camera.original_image[:3]))
             rgbs.append(_tensor_to_uint8(result['rgb']))
 
-            depth = result['depth'].detach().permute(1, 2, 0).cpu().numpy()
+            acc_d = result['acc'].clamp(min=1e-6)
+            depth = (result['depth_premul'] / acc_d).detach().permute(1, 2, 0).cpu().numpy()
             depths.append(depth)
 
             mask = camera.guidance.get("mask")
@@ -865,10 +855,6 @@ if __name__ == "__main__":
         "--fps", type=int, default=10,
         help="Video FPS (trajectory mode only).")
     parser.add_argument(
-        "--sky_mask_dilate", type=int, default=0,
-        help="Dilate the sky mask by this many pixels during compositing to "
-             "cover boundary floaters (e.g. 10-20). 0 = disabled.")
-    parser.add_argument(
         "--sky_sh_coeffs", type=float, nargs='+', default=None,
         help="Manual SH coefficients for the sky (skips fitting if provided).")
     parser.add_argument(
@@ -920,13 +906,11 @@ if __name__ == "__main__":
                         output_dir=output_dir,
                         fit_sky=fit_sky,
                         fit_iters=args.fit_iters,
-                        fit_lr=args.fit_lr,
-                        sky_mask_dilate=args.sky_mask_dilate)
+                        fit_lr=args.fit_lr)
         elif mode == "trajectory":
             render_trajectory(cfg, args.config, epoch=args.epoch, fps=args.fps,
                               sky_sh_coeffs=args.sky_sh_coeffs,
                               output_dir=output_dir,
                               fit_sky=fit_sky,
                               fit_iters=args.fit_iters,
-                              fit_lr=args.fit_lr,
-                              sky_mask_dilate=args.sky_mask_dilate)
+                              fit_lr=args.fit_lr)

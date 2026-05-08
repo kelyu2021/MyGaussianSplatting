@@ -9,6 +9,7 @@
 *.splat
 *.0
 data/
+data_512/
 **/*output*/
 *.bin
 *.vis

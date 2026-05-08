@@ -33,10 +33,6 @@ model:
     include_bkgd: true
     include_sky: false
   use_color_correction: true
-  # ── Learned per-scene sky dome (MLP over view direction) ──────────
-  use_sky_mlp: true
-  sky_n_freq: 6
-  sky_hidden: 64
 
 train:
   epochs: 300
@@ -59,7 +55,5 @@ optim:
   lambda_dssim: 0.2
   lambda_color_correction: 0.001
   lambda_depth: 0.5    # monocular depth supervision (data/cubemap_faces_da2)
-  # ── Sky-dome MLP ──────────────────────────────────────────────────
-  sky_lr: 1.0e-3
-  lambda_sky_rgb: 0.1   # direct sky-region L1 supervision
-  lambda_sky_acc: 0.01  # push Gaussian opacity → 0 in sky pixels
+  lambda_sky: 1.0    # supervise sky region with a constant blue color (data/cubemap_faces_mass13k_manual)
+  lambda_sky_acc: 0.01    # accumulate sky supervision gradients over multiple epochs (for stability)

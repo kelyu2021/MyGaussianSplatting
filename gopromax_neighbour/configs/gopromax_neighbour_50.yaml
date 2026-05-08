@@ -33,11 +33,7 @@ model:
     include_bkgd: true
     include_sky: false
   use_color_correction: true
-  # ── Learned per-scene sky dome (MLP over view direction) ──────────
-  use_sky_mlp: true
-  sky_n_freq: 6
-  sky_hidden: 64
-
+  
 train:
   epochs: 50
   test_epochs: [5, 10, 15, 20, 25, 50]

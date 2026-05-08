@@ -489,7 +489,48 @@ def _pil_to_torch(pil_img, resolution=None, mode=Image.BILINEAR):
     return arr.unsqueeze(0)          # grayscale → (1, H, W)
 
 
-def load_camera(cam_info: CameraInfo, resolution_scale: float = 1.0):
+def _dilate_and_blur_sky_mask(
+        mask_bool: torch.Tensor,
+        dilate_px: int,
+        blur_sigma: float,
+) -> tuple[torch.Tensor, "torch.Tensor | None"]:
+    """Morphologically dilate + optionally blur a sky mask.
+
+    mask_bool : (1, H, W) bool  — True = non-sky (foreground)
+    dilate_px : radius in pixels for non-sky dilation
+    blur_sigma: sigma for Gaussian boundary blur (0 = skip)
+
+    Returns
+    -------
+    dilated_bool : (1, H, W) bool   — hard dilated mask (drop-in for guidance["mask"])
+    soft_float   : (1, H, W) float  — blurred mask in [0,1], or None if blur_sigma <= 0
+    """
+    import cv2  # lazy import – not always needed
+
+    mask_np = mask_bool.squeeze(0).cpu().numpy().astype(np.uint8) * 255  # (H, W)
+
+    if dilate_px > 0:
+        k = 2 * dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask_np = cv2.dilate(mask_np, kernel, iterations=1)
+
+    dilated_bool = torch.from_numpy(mask_np > 127).unsqueeze(0)  # (1, H, W) bool
+
+    soft_float = None
+    if blur_sigma > 0.0:
+        ksize = int(6 * blur_sigma + 1) | 1  # next odd integer
+        blurred = cv2.GaussianBlur(
+            mask_np.astype(np.float32) / 255.0,
+            (ksize, ksize),
+            blur_sigma,
+        )
+        soft_float = torch.from_numpy(blurred).unsqueeze(0)  # (1, H, W) float [0,1]
+
+    return dilated_bool, soft_float
+
+
+def load_camera(cam_info: CameraInfo, resolution_scale: float = 1.0,
+               mask_dilate_px: int = 0, mask_blur_sigma: float = 0.0):
     """Build a Camera object from CameraInfo."""
     orig_w, orig_h = cam_info.width, cam_info.height
     scale = min(1.0, 1600 / orig_w)
@@ -504,7 +545,14 @@ def load_camera(cam_info: CameraInfo, resolution_scale: float = 1.0):
     guidance = {}
     for k, v in cam_info.guidance.items():
         if k in ("mask", "sky_mask", "acc_mask", "moving_mask"):
-            guidance[k] = _pil_to_torch(v, resolution, Image.NEAREST).bool()
+            m = _pil_to_torch(v, resolution, Image.NEAREST).bool()
+            if k in ("mask", "sky_mask") and (mask_dilate_px > 0 or mask_blur_sigma > 0.0):
+                dilated, soft = _dilate_and_blur_sky_mask(m, mask_dilate_px, mask_blur_sigma)
+                guidance[k] = dilated
+                if soft is not None:
+                    guidance[f"soft_{k}"] = soft
+            else:
+                guidance[k] = m
         elif k in ("lidar_depth", "mono_depth"):
             t = torch.from_numpy(v).float()
             if resolution is not None:
@@ -1450,6 +1498,8 @@ DEFAULT_CFG = {
         "mask_dir": "data/cubemap_faces_mass13k",
         "moving_mask_dir": "data/cubemap_faces_sam_moving",
         "images": "data/cubemap_faces",
+        "mask_dilate_px": 5,
+        "mask_blur_sigma": 3.0,
     },
 
     "model": {
@@ -2056,12 +2106,17 @@ def training(cfg: dict):
     print(f"Saved cameras.json ({len(json_cams)} cameras) to {cam_json_path}")
 
     # Build Camera objects
+    mask_dilate_px  = data_cfg.get("mask_dilate_px", 0)
+    mask_blur_sigma = data_cfg.get("mask_blur_sigma", 0.0)
+    print(f"[Mask] dilate_px={mask_dilate_px}  blur_sigma={mask_blur_sigma}")
     print("Loading training cameras …")
     train_cameras = [
-        load_camera(ci) for ci in tqdm(scene_info.train_cameras)]
+        load_camera(ci, mask_dilate_px=mask_dilate_px, mask_blur_sigma=mask_blur_sigma)
+        for ci in tqdm(scene_info.train_cameras)]
     print("Loading test cameras …")
     test_cameras = [
-        load_camera(ci) for ci in tqdm(scene_info.test_cameras)]
+        load_camera(ci, mask_dilate_px=mask_dilate_px, mask_blur_sigma=mask_blur_sigma)
+        for ci in tqdm(scene_info.test_cameras)]
 
     # ── Gaussian model ────────────────────────────────────────────────
     gaussians = GaussianModel(sh_degree=cfg["model"]["sh_degree"])
@@ -2200,10 +2255,15 @@ def training(cfg: dict):
 
             # ── Sky mask ──────────────────────────────────────────────
             sky_mask = None
+            soft_sky_mask = None
             if "mask" in cam.guidance:
                 sky_mask = cam.guidance["mask"]
                 sky_mask = (sky_mask.cuda(non_blocking=True)
                             if not sky_mask.is_cuda else sky_mask)
+                if "soft_mask" in cam.guidance:
+                    soft_sky_mask = cam.guidance["soft_mask"]
+                    soft_sky_mask = (soft_sky_mask.cuda(non_blocking=True)
+                                     if not soft_sky_mask.is_cuda else soft_sky_mask)
 
             # ── Moving object mask ────────────────────────────────────
             moving_mask = None
@@ -2213,16 +2273,11 @@ def training(cfg: dict):
                                if not moving_mask.is_cuda else moving_mask)
 
             # ── Combined mask (exclude sky + moving objects) ──────────
-            # Used for depth loss (sky has no depth) and for logging.
             mask = sky_mask
             if mask is not None and moving_mask is not None:
                 mask = mask & (~moving_mask)
             elif moving_mask is not None:
                 mask = ~moving_mask
-
-            # Moving-only mask: exclude moving objects but keep sky pixels.
-            # Used for the main RGB loss so sky colour is supervised too.
-            moving_only_mask = (~moving_mask) if moving_mask is not None else None
 
             # ── Render ────────────────────────────────────────────────
             render_pkg = render(cam, gaussians, bg_color)
@@ -2244,31 +2299,16 @@ def training(cfg: dict):
 
             scalar_dict: dict = {}
 
-            # ── RGB loss (L1 + D-SSIM) on all pixels (sky included) ───
-            # The SH sky model must only receive gradients from sky pixels:
-            # detach sky_bg in the non-sky (foreground) region so that the
-            # main RGB loss trains only the splats there.  In the sky region
-            # sky_bg keeps its full gradient so the SH model is supervised.
+            # ── RGB loss (L1 + D-SSIM) on foreground + sky composite ──
             lambda_l1 = optim_cfg.get("lambda_l1", 1.0)
             lambda_dssim = optim_cfg.get("lambda_dssim", 0.2)
 
-            if sky_mask is not None:
-                fg_region = sky_mask.float()          # 1 = non-sky, 0 = sky
-                # Non-sky: detach sky_bg (no gradient to SH model)
-                # Sky:     keep sky_bg gradient (SH model trained here)
-                sky_bg_for_loss = (
-                    sky_bg.detach() * fg_region +
-                    sky_bg          * (1.0 - fg_region))
-                composited_for_loss = image + (1.0 - acc) * sky_bg_for_loss
-            else:
-                composited_for_loss = composited
-
-            Ll1 = l1_loss(composited_for_loss, gt_image, moving_only_mask)
+            Ll1 = l1_loss(composited, gt_image, mask)
             scalar_dict["l1_loss"] = Ll1.item()
 
             loss = (
                 (1.0 - lambda_dssim) * lambda_l1 * Ll1 +
-                lambda_dssim * (1.0 - ssim(composited_for_loss, gt_image, mask=moving_only_mask)))
+                lambda_dssim * (1.0 - ssim(composited, gt_image, mask=mask)))
 
             # ── Sky SH loss (sky pixels only) ─────────────────────────
             # sky_bg is NOT detached here, so gradients flow to the SH
@@ -2276,7 +2316,9 @@ def training(cfg: dict):
             # Foreground pixels are excluded (sky_region_f == 0 there),
             # so the SH model only trains on actual sky pixels.
             if lambda_sky > 0 and sky_mask is not None:
-                sky_region_f = (1.0 - sky_mask.float())        # 1 where sky
+                # Use blurred soft mask at boundary if available
+                _sky_ref = soft_sky_mask if soft_sky_mask is not None else sky_mask.float()
+                sky_region_f = 1.0 - _sky_ref                  # 1 where sky
                 sky_sh_loss = lambda_sky * (
                     sky_bg * sky_region_f - gt_image * sky_region_f
                 ).abs().mean()
@@ -2295,7 +2337,8 @@ def training(cfg: dict):
             #     Push acc → 0 in sky regions (where sky_mask == False)
             lambda_sky_acc = optim_cfg.get("lambda_sky_acc", 0.01)
             if lambda_sky_acc > 0 and sky_mask is not None:
-                sky_region = 1.0 - sky_mask.float()     # 1 where sky
+                _sky_ref = soft_sky_mask if soft_sky_mask is not None else sky_mask.float()
+                sky_region = 1.0 - _sky_ref              # 1 where sky, feathered
                 sky_acc_loss = lambda_sky_acc * (acc * sky_region).mean()
                 scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
                 loss += sky_acc_loss

@@ -12,13 +12,16 @@ CUDA_VISIBLE_DEVICES=1 nohup python train.py --config configs/gopromax_neighbour
 # train_da2loss
 CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config configs/gopromax_neighbour_100.yaml --output-dir ./output_version_17_100_da2loss > ./output_version_17_100_da2loss/train.log 2>&1 &
 
-CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config configs/gopromax_neighbour_150.yaml --output-dir ./output_version_18_150_da2loss > ./output_version_18_150_da2loss/train.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config ./configs/gopromax_neighbour_150.yaml --output-dir ./output_version_18_150_da2loss_0.5_skymodel_1_0.05 > ./output_version_18_150_da2loss_0.5_skymodel_1_0.05/train.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config ./configs/gopromax_neighbour_150_2_0.01.yaml --output-dir ./output_version_18_150_da2loss_0.5_skymodel_2_0.01 > ./output_version_18_150_da2loss_0.5_skymodel_2_0.01/train.log 2>&1 &
+
 
 # train_gan_da2loss
 CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan_da2loss.py     --config configs/gopromax_neighbour_150.yaml     --model_root output_version_18_150_da2loss_0.5     --epoch 150     --road_width 0.3     --road_width_init_frac 0.05     --road_width_warmup_epochs 20     --gan_epochs 100     --jitter_faces front back     --jitter_directions left right     --output_dir output_version_18_150_da2loss_0.5_gan_0.3_100     > output_version_18_150_da2loss_0.5_gan_0.3_100/train_gan_da2loss.log 2>&1 &
 
 # single spherical harmonic sky
-python render_sky.py --config ./output_version_18_150_da2loss_0.5/gopromax_neighbour/sky_mask_v1/config.yaml --mode evaluate
+python render_spherical_harmonic_sky.py --config output_version_18_150_da2loss_0.5_skymodel/gopromax_neighbour/sky_mask_v1/config.yaml --mode trajectory
 
 # create sky on existing output
 python render_sky.py --mode make_video --output_dir output_version_18_150_da2loss_0.5/gopromax_neighbour/sky_mask_v1/render_with_sh_sky/train/ours_epoch_150 --fps 10
