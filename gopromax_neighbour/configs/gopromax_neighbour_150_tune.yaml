@@ -59,3 +59,5 @@ optim:
   lambda_depth: 0.5    # monocular depth supervision (data/cubemap_faces_da2)
   lambda_opacity_entropy: 0    # encourage sharper opacity (non-empty) distributions
   lambda_sky_acc: 0.5    # accumulate sky supervision gradients over multiple epochs (for stability) 
+  scaling_lr: 0.001
+  position_lr_init: 0.000016
