@@ -94,7 +94,7 @@ CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
 export HF_TOKEN=<your_token>
 python sds_score.py --model_id "Manojb/stable-diffusion-2-1-base" --image ./data/cubemap_faces/0001_back.jpg --prompt "A street level image of an outdoor scene"
 
-hfgKeFHreOvUXLfSdvljnJAQMOtzChasZNbj
+
 
 # render wobble
 python gopromax_neighbour/render_wobble.py \
