@@ -109,8 +109,10 @@ def make_caminfo_jittered(base_caminfo, pos, rot):
     T = -rot.T @ pos
     return base_caminfo._replace(R=rot, T=T)
 
-def render_video(gaussians, bg_color, caminfo_a, caminfo_b, steps, fps, sky_model=None):
+def render_video(gaussians, bg_color, caminfo_a, caminfo_b, steps, fps, sky_model=None, frames_dir=None):
     frames = []
+    if frames_dir is not None:
+        os.makedirs(frames_dir, exist_ok=True)
     pos_a = -caminfo_a.R @ caminfo_a.T
     pos_b = -caminfo_b.R @ caminfo_b.T
     # Keep rotation fixed (matches render.py for the on-path view).
@@ -128,7 +130,10 @@ def render_video(gaussians, bg_color, caminfo_a, caminfo_b, steps, fps, sky_mode
                 sky_bg = _compute_sky_bg(cam, sky_model)  # (3, H, W)
                 rgb = rgb + (1.0 - acc) * sky_bg
             rgb_np = rgb.detach().cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
-            frames.append((rgb_np * 255).astype(np.uint8))
+            frame = (rgb_np * 255).astype(np.uint8)
+            frames.append(frame)
+            if frames_dir is not None:
+                Image.fromarray(frame).save(os.path.join(frames_dir, f'frame_{i+1:04d}.png'))
     return frames
 
 def main():
@@ -170,14 +175,18 @@ def main():
     bg_color = torch.zeros(3, dtype=torch.float32, device='cuda')
 
     # Render all segments and concatenate
+    base_name = os.path.splitext(os.path.basename(args.img_name))[0]
     frames = []
-    frames += render_video(gaussians, bg_color, caminfo_on, caminfo_right, args.steps, args.fps, sky_model)
-    frames += render_video(gaussians, bg_color, caminfo_right, caminfo_on, args.steps, args.fps, sky_model)
-    frames += render_video(gaussians, bg_color, caminfo_on, caminfo_left, args.steps, args.fps, sky_model)
-    frames += render_video(gaussians, bg_color, caminfo_left, caminfo_on, args.steps, args.fps, sky_model)
+    frames += render_video(gaussians, bg_color, caminfo_on, caminfo_right, args.steps, args.fps, sky_model,
+                           frames_dir=os.path.join(args.output_dir, base_name, 'on2right'))
+    frames += render_video(gaussians, bg_color, caminfo_right, caminfo_on, args.steps, args.fps, sky_model,
+                           frames_dir=os.path.join(args.output_dir, base_name, 'right2on'))
+    frames += render_video(gaussians, bg_color, caminfo_on, caminfo_left, args.steps, args.fps, sky_model,
+                           frames_dir=os.path.join(args.output_dir, base_name, 'on2left'))
+    frames += render_video(gaussians, bg_color, caminfo_left, caminfo_on, args.steps, args.fps, sky_model,
+                           frames_dir=os.path.join(args.output_dir, base_name, 'left2on'))
 
     # Use image name as the video filename
-    base_name = os.path.splitext(os.path.basename(args.img_name))[0]
     out_path = os.path.join(args.output_dir, f'{base_name}.mp4')
     imageio.mimwrite(out_path, frames, fps=args.fps)
     print(f"Combined video saved to {out_path}")

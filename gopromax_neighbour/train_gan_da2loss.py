@@ -1414,6 +1414,8 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                 sd["epoch"] = epoch
                 sd["step"] = step
                 sd["pretrained_epoch"] = loaded_epoch
+                if sky_model is not None:
+                    sd["sky_model_state"] = sky_model.state_dict()
                 ckpt_path = os.path.join(
                     dirs["trained_model_dir"],
                     f"epoch_{epoch}.pth")

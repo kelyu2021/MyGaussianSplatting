@@ -94,6 +94,17 @@ CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
 # export HF_TOKEN=<your_token>
 python sds_score.py --model_id "Manojb/stable-diffusion-2-1-base" --image ./data/cubemap_faces/0001_back.jpg --prompt "A street level image of an outdoor scene"
 
+# SDS score vs. jitter distance plot
+python plot_sds_vs_jitter.py \
+    --img_name       0018_front \
+    --model_id "Manojb/stable-diffusion-2-1-base" \
+    --model_path     output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune/gopromax_neighbour/sky_mask_v1/trained_model/epoch_300.pth \
+    --cameras_json   output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune/gopromax_neighbour/sky_mask_v1/cameras.json \
+    --output_dir     output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune/gopromax_neighbour/sky_mask_v1/sds_plot \
+    --min_dist 0.0 --max_dist 4 --num_dists 120 --fps 20 \
+    --side right \
+    --prompt "A street level image of an outdoor scene"
+
 
 
 # render wobble

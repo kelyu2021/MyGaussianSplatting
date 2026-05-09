@@ -158,6 +158,91 @@ def getProjectionMatrixK(znear, zfar, K, H, W):
     return P
 
 
+def eval_sh(deg, sh, dirs):
+    """Evaluate spherical harmonics at given directions.
+
+    Args:
+        deg (int): SH degree.
+        sh (torch.Tensor): SH coefficients, shape (C, (deg+1)**2, 1).
+        dirs (torch.Tensor): Directions, shape (..., 3).
+
+    Returns:
+        torch.Tensor: Colors, shape (..., C).
+    """
+    if deg < 0:
+        return torch.zeros_like(dirs[..., :1]).expand(dirs.shape[:-1] + (sh.shape[0],))
+
+    C0 = 0.28209479177387814
+    C1 = 0.4886025119029199
+    C2 = [
+        1.0925484305920792,
+        -1.0925484305920792,
+        0.31539156525252005,
+        -1.0925484305920792,
+        0.5462742152960396
+    ]
+    C3 = [
+        -0.5900435899266435,
+        2.890611442640554,
+        -0.4570457994644658,
+        0.3731763325901154,
+        -0.4570457994644658,
+        1.445305721320277,
+        -0.5900435899266435
+    ]
+    C4 = [
+        2.5033429417967046,
+        -1.7701307697799304,
+        0.9461746957575601,
+        -0.6690465435572892,
+        0.10578554691520431,
+        -0.6690465435572892,
+        0.47108734787878004,
+        -1.7701307697799304,
+        0.6258357354491761,
+    ]
+
+    x, y, z = dirs.unbind(-1)
+    result = C0 * sh[:, 0]
+
+    if deg > 0:
+        result = result - C1 * y * sh[:, 1] + C1 * z * sh[:, 2] - C1 * x * sh[:, 3]
+
+    if deg > 1:
+        xx, yy, zz = x * x, y * y, z * z
+        xy, yz, xz = x * y, y * z, x * z
+        result = result + \
+            C2[0] * xy * sh[:, 4] + \
+            C2[1] * yz * sh[:, 5] + \
+            C2[2] * (2.0 * zz - xx - yy) * sh[:, 6] + \
+            C2[3] * xz * sh[:, 7] + \
+            C2[4] * (xx - yy) * sh[:, 8]
+
+    if deg > 2:
+        result = result + \
+            C3[0] * y * (3 * xx - yy) * sh[:, 9] + \
+            C3[1] * xy * z * sh[:, 10] + \
+            C3[2] * y * (4 * zz - xx - yy) * sh[:, 11] + \
+            C3[3] * z * (2 * zz - 3 * xx - 3 * yy) * sh[:, 12] + \
+            C3[4] * x * (4 * zz - xx - yy) * sh[:, 13] + \
+            C3[5] * z * (xx - yy) * sh[:, 14] + \
+            C3[6] * x * (xx - 3 * yy) * sh[:, 15]
+
+    if deg > 3:
+        result = result + \
+            C4[0] * xy * (xx - yy) * sh[:, 16] + \
+            C4[1] * yz * (3 * xx - yy) * sh[:, 17] + \
+            C4[2] * xy * (7 * zz - 1) * sh[:, 18] + \
+            C4[3] * yz * (7 * zz - 3) * sh[:, 19] + \
+            C4[4] * (zz * (35 * zz - 30) + 3) * sh[:, 20] + \
+            C4[5] * xz * (7 * zz - 3) * sh[:, 21] + \
+            C4[6] * (xx - yy) * (7 * zz - 1) * sh[:, 22] + \
+            C4[7] * xz * (xx - 3 * yy) * sh[:, 23] + \
+            C4[8] * (xx * (xx - 3 * yy) - yy * (3 * xx - yy)) * sh[:, 24]
+
+    return result.permute(1, 2, 0).squeeze(-1)
+
+
 def get_expon_lr_func(
     lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=0.01, max_steps=1_000_000,
 ):
@@ -176,94 +261,6 @@ def get_expon_lr_func(
             math.log(max(lr_final, 1e-10)) * t)
         return delay_rate * log_lerp
     return helper
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  §1b  Spherical-Harmonic Sky Model  (co-trained alongside Gaussians)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class SphericalHarmonicSky(nn.Module):
-    """Sky background represented by L0/L1/L2 Spherical Harmonics.
-
-    forward(dirs: (N,3)) → (N,3) RGB colors in [0, ∞).
-    sh_coeffs is an nn.Parameter so it is optimised jointly with the
-    Gaussian model, ensuring boundary Gaussians learn correct straight
-    colours against the actual sky rather than against black.
-    """
-
-    def __init__(self, sh_degree: int = 3):
-        super().__init__()
-        self.sh_degree = sh_degree
-        n_coeffs = (sh_degree + 1) ** 2
-        sh_coeffs = torch.zeros(3, n_coeffs)
-        sh_coeffs[:, 0] = 0.8           # L0 ambient ≈ grey sky
-        if sh_degree > 0:
-            sh_coeffs[:, 2] = 0.2       # L1,0  (vertical gradient)
-        self.sh_coeffs = nn.Parameter(sh_coeffs, requires_grad=True)
-
-    def forward(self, dirs: torch.Tensor) -> torch.Tensor:
-        """dirs: (N, 3) unit world-space directions → (N, 3) RGB."""
-        x = dirs[:, 0]
-        y = dirs[:, 1]
-        z = dirs[:, 2]
-        n_coeffs = self.sh_coeffs.shape[1]
-
-        C0 = 0.28209479177387814
-        C1 = 0.4886025119029199
-
-        # result: (3, N)
-        result = C0 * self.sh_coeffs[:, 0:1]
-
-        if self.sh_degree > 0 and n_coeffs >= 4:
-            result = result + C1 * self.sh_coeffs[:, 1:2] * (-y.unsqueeze(0))
-            result = result + C1 * self.sh_coeffs[:, 2:3] * z.unsqueeze(0)
-            result = result + C1 * self.sh_coeffs[:, 3:4] * (-x.unsqueeze(0))
-
-        if self.sh_degree > 1 and n_coeffs >= 9:
-            C2_0 = 1.0925484305920792
-            C2_1 = -1.0925484305920792
-            C2_2 = 0.31539156525252005
-            C2_3 = -1.0925484305920792
-            C2_4 = 0.5462742152960396
-            xx, yy, zz = x * x, y * y, z * z
-            xy, yz, xz = x * y, y * z, x * z
-            result = result + C2_0 * self.sh_coeffs[:, 4:5] * xy.unsqueeze(0)
-            result = result + C2_1 * self.sh_coeffs[:, 5:6] * yz.unsqueeze(0)
-            result = result + C2_2 * self.sh_coeffs[:, 6:7] * (2*zz - xx - yy).unsqueeze(0)
-            result = result + C2_3 * self.sh_coeffs[:, 7:8] * xz.unsqueeze(0)
-            result = result + C2_4 * self.sh_coeffs[:, 8:9] * (xx - yy).unsqueeze(0)
-
-        return result.t()   # (N, 3)
-
-
-@torch.no_grad()
-def _camera_view_dirs(camera) -> torch.Tensor:
-    """Per-pixel world-space view directions, shape (H, W, 3)."""
-    W = int(camera.image_width)
-    H = int(camera.image_height)
-    yy, xx = torch.meshgrid(
-        torch.arange(H, device="cuda", dtype=torch.float32) + 0.5,
-        torch.arange(W, device="cuda", dtype=torch.float32) + 0.5,
-        indexing="ij",
-    )
-    # Camera-space directions
-    dirs = torch.stack(
-        [(xx - W / 2) / camera.K[0, 0],
-         (yy - H / 2) / camera.K[1, 1],
-         torch.ones_like(xx)], dim=-1)
-    dirs = dirs / torch.linalg.norm(dirs, dim=-1, keepdim=True)
-    # Rotate to world space.  camera.R is the c2w rotation (3×3 numpy).
-    R = torch.from_numpy(camera.R).float().to("cuda")
-    dirs = (R.T @ dirs.reshape(-1, 3).T).T.reshape(H, W, 3)
-    return dirs
-
-
-def _compute_sky_bg(camera, sky_model: SphericalHarmonicSky) -> torch.Tensor:
-    """Evaluate the SH sky for every pixel of camera. Returns (3, H, W)."""
-    dirs = _camera_view_dirs(camera)
-    H, W = dirs.shape[:2]
-    bg = sky_model(dirs.reshape(-1, 3)).reshape(H, W, 3).permute(2, 0, 1)
-    return bg
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -481,8 +478,25 @@ class Camera(nn.Module):
 
 def _pil_to_torch(pil_img, resolution=None, mode=Image.BILINEAR):
     """PIL Image → (C, H, W) torch float in [0, 1]."""
+    # Convert to PIL Image if needed
+    if isinstance(pil_img, torch.Tensor):
+        arr = pil_img.detach().cpu()
+        if arr.ndim == 3 and arr.shape[0] in [1, 3]:
+            # (C, H, W) -> (H, W, C)
+            arr = arr.permute(1, 2, 0)
+        arr = arr.numpy()
+        if arr.dtype in [np.float32, np.float64]:
+            arr = (arr * 255).clip(0, 255).astype(np.uint8)
+        pil_img = Image.fromarray(arr)
+    elif isinstance(pil_img, np.ndarray):
+        if pil_img.dtype in [np.float32, np.float64]:
+            arr = (pil_img * 255).clip(0, 255).astype(np.uint8)
+        else:
+            arr = pil_img
+        pil_img = Image.fromarray(arr)
+    # Now pil_img is a PIL Image
     if resolution is not None:
-        pil_img = pil_img.resize(resolution, mode)
+        pil_img = pil_img.resize(resolution[::-1], mode)
     arr = torch.from_numpy(np.array(pil_img)).float() / 255.0
     if arr.ndim == 3:
         return arr.permute(2, 0, 1)
@@ -958,7 +972,7 @@ def render(camera: Camera, gaussians: GaussianModel, bg_color: torch.Tensor,
            scaling_modifier: float = 1.0):
     """Render Gaussians into a camera view.
 
-    Returns dict with keys: rgb, depth_premul, acc, viewspace_points,
+    Returns dict with keys: rgb, depth, acc, viewspace_points,
     visibility_filter, radii.
     """
     N = gaussians.num_points
@@ -992,7 +1006,7 @@ def render(camera: Camera, gaussians: GaussianModel, bg_color: torch.Tensor,
     rotations = gaussians.get_rotation
     shs = gaussians.get_features
 
-    rendered_color, radii, depth_premul, rendered_acc, _ = rasterizer(
+    rendered_color, radii, rendered_depth, rendered_acc, _ = rasterizer(
         means3D=means3D,
         means2D=screenspace_points,
         opacities=opacity,
@@ -1006,12 +1020,9 @@ def render(camera: Camera, gaussians: GaussianModel, bg_color: torch.Tensor,
 
     visibility_filter = radii > 0
 
-    # NOTE: ``depth_premul`` is the alpha-weighted ("premultiplied") depth
-    # ``sum_i w_i z_i`` straight from the rasterizer. The actual expected
-    # depth per pixel is ``depth_premul / acc`` (see helper below).
     return {
         "rgb": rendered_color,
-        "depth_premul": depth_premul,
+        "depth": rendered_depth,
         "acc": rendered_acc,
         "viewspace_points": screenspace_points,
         "visibility_filter": visibility_filter,
@@ -1095,117 +1106,49 @@ def psnr(rendered, gt, mask=None):
     return 10.0 * torch.log10(1.0 / mse.clamp(min=1e-10))
 
 
-def _ssi_normalize(d, valid):
-    """MiDaS-style scale-and-shift normalization (median + MAD).
+def depth_mono_loss(rendered_depth, mono_depth, acc, mask=None):
+    """Robust scale-shift-invariant depth loss for monocular depth.
 
-    For each image, t = median(d[valid]), s = mean(|d[valid] - t|),
-    then d_hat = (d - t) / s.  Operates on a single (H, W) tensor.
-    """
-    v = d[valid]
-    t = torch.median(v)
-    s = (v - t).abs().mean().clamp(min=1e-6)
-    return (d - t) / s, t, s
-
-
-def _gradient_matching_loss(diff, valid):
-    """Single-scale gradient matching term from Ranftl et al. (MiDaS).
-
-    L = (1/M) sum_p (|grad_x R(p)| + |grad_y R(p)|),
-    only counting pixels where both neighbouring pixels are valid.
-    """
-    # Zero-out invalid pixels so they don't contribute to gradients
-    diff = diff * valid.float()
-    gx = (diff[:, 1:] - diff[:, :-1]).abs()
-    gy = (diff[1:, :] - diff[:-1, :]).abs()
-    vx = valid[:, 1:] & valid[:, :-1]
-    vy = valid[1:, :] & valid[:-1, :]
-    nx = vx.sum().clamp(min=1)
-    ny = vy.sum().clamp(min=1)
-    return (gx * vx.float()).sum() / nx + (gy * vy.float()).sum() / ny
-
-
-def depth_mono_loss(depth_premul, mono_depth, acc, mask=None,
-                    num_scales: int = 4, alpha_gm: float = 0.5,
-                    trim: float = 0.2):
-    """Depth Anything V2 / MiDaS scale-and-shift-invariant depth loss.
-
-    Implements the loss used in the Depth Anything V2 paper for relative
-    depth pre-training (Ranftl et al., 2020):
-
-        L = L_ssi + alpha * L_gm
-
-    where L_ssi is the (trimmed) scale-and-shift-invariant MAE between
-    median-MAD-normalized disparities, and L_gm is a multi-scale
-    gradient-matching term on the same residual.
-
-    The DA-v2 prediction is a relative *disparity* (inverse depth), so we
-    convert the rendered metric depth to disparity (1/z) before
-    normalizing.  Both prediction and target are normalized independently
-    (per image) using their own median and mean-absolute-deviation.
+    Adapted from gopro360's LiDAR depth loss.  Since monocular depth
+    has unknown absolute scale, we first align it to the rendered depth
+    via least-squares scale+shift, then compute robust L1.
 
     Parameters
     ----------
-    depth_premul   : (1, H, W) premultiplied (alpha-weighted) depth from
-                                the rasterizer (= sum_i w_i z_i). It is
-                                divided by ``acc`` here to obtain the
-                                expected metric depth before computing
-                                disparity.
-    mono_depth     : (H, W)    monocular *disparity* from DA-v2 (sky==0)
-    acc            : (1, H, W) accumulated alpha from rasterizer
-    mask           : (1, H, W) optional; True = valid pixel
-    num_scales     : number of pyramid levels for gradient matching
-    alpha_gm       : weight of gradient-matching term (DA-v2 uses 0.5)
-    trim           : fraction of largest residuals to discard for L_ssi
+    rendered_depth : (1, H, W)  rendered depth from the rasterizer
+    mono_depth     : (H, W)     monocular relative depth (sky == 0)
+    acc            : (1, H, W)  accumulated alpha from rasterizer
+    mask           : (1, H, W)  optional; True = valid pixel
     """
-    # Per-pixel expected depth = premultiplied depth / accumulated alpha.
-    rd = (depth_premul / (acc + 1e-10)).squeeze(0)     # (H, W)
-    md = mono_depth                                     # (H, W) disparity
+    # Expected per-pixel depth (normalised by alpha), same as gopro360
+    rd = (rendered_depth / (acc + 1e-10)).squeeze(0)   # (H, W)
+    md = mono_depth                                     # (H, W)
 
     valid = md > 0
     if mask is not None:
         valid = valid & mask.squeeze(0)
-    valid = valid & torch.isfinite(rd) & (rd > 0)
 
     if valid.sum() < 10:
-        return depth_premul.new_tensor(0.0)
+        return rendered_depth.new_tensor(0.0)
 
-    # Convert rendered depth -> disparity to match DA-v2 output space.
-    rd_disp = torch.zeros_like(rd)
-    rd_disp[valid] = 1.0 / rd[valid].clamp(min=1e-6)
+    r = rd[valid]
+    m = md[valid]
 
-    # MiDaS-style normalization (median + MAD) — target stats detached
-    pred_n, _, _ = _ssi_normalize(rd_disp, valid)
+    # Closed-form least-squares: align mono → rendered  (detached)
     with torch.no_grad():
-        gt_n, _, _ = _ssi_normalize(md, valid)
+        m_mean = m.mean()
+        r_mean = r.mean()
+        m_c = m - m_mean
+        r_c = r - r_mean
+        scale = (m_c * r_c).sum() / (m_c * m_c).sum().clamp(min=1e-8)
+        shift = r_mean - scale * m_mean
 
-    diff = pred_n - gt_n
+    aligned_m = scale * m + shift          # fully detached target
 
-    # ── L_ssi: trimmed MAE on aligned residuals ───────────────────────
-    abs_err = diff[valid].abs()
-    if 0.0 < trim < 1.0:
-        keep = max(1, int((1.0 - trim) * abs_err.numel()))
-        abs_err, _ = torch.topk(abs_err, keep, largest=False)
-    l_ssi = abs_err.mean()
-
-    # ── L_gm: multi-scale gradient matching on the residual ───────────
-    l_gm = depth_premul.new_tensor(0.0)
-    cur_diff = diff
-    cur_valid = valid
-    for k in range(num_scales):
-        l_gm = l_gm + _gradient_matching_loss(cur_diff, cur_valid)
-        if k == num_scales - 1:
-            break
-        # Downsample by factor 2 (average pool); valid mask via min-pool
-        cur_diff = F.avg_pool2d(
-            cur_diff[None, None], kernel_size=2, stride=2,
-            ceil_mode=False).squeeze()
-        cur_valid = (-F.max_pool2d(
-            (-cur_valid.float())[None, None], kernel_size=2, stride=2,
-            ceil_mode=False)).squeeze().bool()
-        if cur_diff.numel() < 4:
-            break
-
-    return l_ssi + alpha_gm * l_gm
+    d_err = torch.abs(r - aligned_m)
+    # Robust: keep bottom 95 % of errors (discard outliers like gopro360)
+    d_err, _ = torch.topk(d_err, int(0.95 * d_err.numel()), largest=False)
+    return d_err.mean()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1421,30 +1364,14 @@ def read_scene(
             colors=pcd.colors[keep],
             normals=pcd.normals[keep])
 
-    # Use camera positions to compute scene_extent instead of the point-cloud
-    # 99th-percentile radius, which is dominated by far-away background points.
-    # All densification/pruning thresholds (percent_dense * scene_extent,
-    # percent_big_ws * scene_extent) and position_lr (spatial_lr_scale) are
-    # scaled by scene_radius, so using a far-scene value makes them too loose
-    # for close-range Gaussians.  Camera positions represent the capture volume
-    # where detail actually matters.
-    cam_positions = np.array([
-        (-qvec2rotmat(img.qvec).T @ img.tvec)
-        for img in images_bin.values()
-    ])
-    cam_centre = cam_positions.mean(axis=0)
-    cam_dists = np.linalg.norm(cam_positions - cam_centre, axis=1)
-    camera_extent = float(np.percentile(cam_dists, 90)) if len(cam_dists) > 1 else radius_pct
-    scene_radius = max(camera_extent * 2.0, 1.0)
-    print(f"[Scene] Point-cloud radius (p99): {radius_pct:.2f}  |  "
-          f"Camera-based scene_radius: {scene_radius:.2f}")
+    print(f"[Scene] Scene radius: {radius_pct:.2f}")
 
     return SceneInfo(
         point_cloud=pcd,
         train_cameras=train_cams,
         test_cameras=test_cams,
         scene_center=centre,
-        scene_radius=scene_radius,
+        scene_radius=radius_pct,
         ply_path=str(pcd_path))
 
 
@@ -1584,16 +1511,12 @@ def prepare_output(cfg: dict, workspace: str):
     }
 
 
-def save_log_images(log_dir: str, epoch: int, gt, rendered, depth_premul, acc,
-                    gt_depth=None, gt_acc=None,
-                    composited=None, sky_bg=None):
-    """Save a visualisation grid.
+def save_log_images(log_dir: str, epoch: int, gt, rendered, depth, acc,
+                    gt_depth=None, gt_acc=None):
+    """Save a 2x3 visualisation grid.
 
-    Row 1: GT RGB           | GT opacity          | GT depth
-    Row 2: raw render (blk) | predicted opacity   | predicted depth
-    Row 3: composited RGB   | SH sky background   | (empty)
-
-    Row 3 is only added when composited / sky_bg are provided.
+    Row 1: ground truth RGB | ground truth opacity | ground truth depth
+    Row 2: predicted RGB    | predicted opacity    | predicted depth
     """
     import torchvision
     gt_np = gt.detach().cpu()
@@ -1610,45 +1533,33 @@ def save_log_images(log_dir: str, epoch: int, gt, rendered, depth_premul, acc,
             t = t.unsqueeze(0)
         return t
 
-    def _depth_to_3ch(t, v_min=None, v_max=None, valid_mask=None,
-                      pct_lo: float = 0.0, pct_hi: float = 1.0):
+    def _depth_to_3ch(t, v_min=None, v_max=None, invert=False):
         """Normalise a depth tensor (any shape) to (3, H, W) in [0,1].
 
-        Uses the *same* convention as ``depth_anything_v2.py``:
-        linear min/max normalisation of the raw value, brightness = value
-        (large value -> light, small value -> dark). Pixels that are
-        non-finite or non-positive (e.g. sky == 0), or marked invalid by
-        ``valid_mask``, are rendered black.
+        Pixels that are non-finite or non-positive (e.g. sky == 0 or
+        negative DA2 outputs) are treated as invalid and rendered black,
+        while valid pixels are min/max normalised on a log1p scale.
 
-        If ``v_min``/``v_max`` are provided they are used instead of
-        per-image min/max so multiple depth maps share a scale. Otherwise,
-        ``pct_lo`` / ``pct_hi`` (in [0, 1]) select percentile bounds over
-        the valid pixels, which suppresses the influence of a few outlier
-        pixels (e.g. stray near-Gaussian leaks into sky tiles).
+        ``invert=False``: large value -> light (use this for inverse-depth /
+            disparity inputs like Depth-Anything mono depth, where larger = near).
+        ``invert=True``:  large value -> dark  (use this for true metric depth,
+            where larger = far).
+
+        If ``v_min``/``v_max`` (in log1p space) are provided they are used
+        instead of per-image min/max so multiple depth maps share a scale.
         """
         if t is None:
             return torch.zeros(3, h, w)
 
         valid = torch.isfinite(t) & (t > 0)
-        if valid_mask is not None:
-            valid = valid & valid_mask
         out = torch.zeros_like(t)
         if valid.any():
-            v = t[valid]
-            if v_min is None or v_max is None:
-                if pct_lo > 0.0 or pct_hi < 1.0:
-                    lo_q = float(torch.quantile(v, pct_lo))
-                    hi_q = float(torch.quantile(v, pct_hi))
-                else:
-                    lo_q = float(v.min())
-                    hi_q = float(v.max())
-                lo = lo_q if v_min is None else v_min
-                hi = hi_q if v_max is None else v_max
-            else:
-                lo, hi = v_min, v_max
-            denom = max(hi - lo, 1e-6)
+            v = torch.log1p(t[valid])
+            lo = v.min() if v_min is None else v_min
+            hi = v.max() if v_max is None else v_max
+            denom = (hi - lo).clamp(min=1e-6)
             n = ((v - lo) / denom).clamp(0.0, 1.0)
-            out[valid] = n
+            out[valid] = (1.0 - n) if invert else n
         return out.expand(3, -1, -1).contiguous()
 
     def _mask_to_3ch(t):
@@ -1663,86 +1574,22 @@ def save_log_images(log_dir: str, epoch: int, gt, rendered, depth_premul, acc,
         return t.expand(3, -1, -1).contiguous()
 
     gt_d_t   = _prep_depth(gt_depth)
-    # Convert premultiplied depth (sum_i w_i z_i) to expected depth
-    # (sum_i w_i z_i) / (sum_i w_i) before visualising, so the panel matches
-    # what ``depth_mono_loss`` actually optimises. Pixels with very low
-    # ``acc`` (e.g. sky regions where only stray near Gaussians leak in)
-    # are masked out: their expected depth is dominated by a single tiny
-    # contribution and would otherwise produce spurious bright/dark spikes
-    # after disparity inversion + min/max normalisation.
-    pred_acc_t = None
-    if depth_premul is not None and acc is not None:
-        pred_acc_t = acc.detach().cpu().float() if hasattr(acc, 'detach') \
-            else torch.as_tensor(acc).float()
-        dp = depth_premul.detach().cpu().float() if hasattr(depth_premul, 'detach') \
-            else torch.as_tensor(depth_premul).float()
-        pred_d_t = _prep_depth(dp / (pred_acc_t + 1e-10))
-        pred_acc_t = pred_acc_t.squeeze()
-        if pred_acc_t.ndim == 2:
-            pred_acc_t = pred_acc_t.unsqueeze(0)
-    else:
-        pred_d_t = _prep_depth(depth_premul)
+    pred_d_t = _prep_depth(depth)
 
-    # Both depth panels follow the convention used by depth_anything_v2.py
-    # *_depth_vis.png: linear min/max normalisation of the raw value, with
-    # brightness = value, sky/zero rendered black.
-    #
-    # GT mono depth (Depth-Anything *_depth_raw.npy) is disparity-like
-    # (large = near). The predicted depth from the rasterizer is metric
-    # (large = far); we convert it to disparity (1/d) so both panels share
-    # the convention "brightness = near". The two have different units
-    # (DA-v2 relative disparity vs. 1/metres), so each panel is normalised
-    # *independently* on its own min/max — sharing a range would clip the
-    # prediction to 0 (black) when its absolute scale differs.
-    gd = _depth_to_3ch(gt_d_t)
-
-    if pred_d_t is not None:
-        pred_valid = torch.isfinite(pred_d_t) & (pred_d_t > 0)
-        if pred_acc_t is not None:
-            # Stricter: stray near-Gaussians often leak with acc < 0.05.
-            pred_valid = pred_valid & (pred_acc_t > 5e-2)
-        # Use the GT non-sky mask if provided (gt_acc==1 -> non-sky).
-        # Erode it by a few pixels so 1-px boundary leakage is excluded.
-        if gt_acc is not None:
-            sky_mask_t = gt_acc.detach().cpu().float() if hasattr(gt_acc, 'detach') \
-                else torch.as_tensor(gt_acc).float()
-            sky_mask_t = sky_mask_t.squeeze()
-            if sky_mask_t.ndim == 2:
-                sky_mask_t = sky_mask_t.unsqueeze(0)
-            if sky_mask_t.shape == pred_valid.shape:
-                non_sky = (sky_mask_t > 0.5).float().unsqueeze(0)  # (1,1,H,W)
-                # Erode via min-pool with a small square kernel.
-                eroded = -F.max_pool2d(
-                    -non_sky, kernel_size=5, stride=1, padding=2)
-                pred_valid = pred_valid & (eroded.squeeze(0) > 0.5)
-        pred_disp = torch.zeros_like(pred_d_t)
-        pred_disp[pred_valid] = 1.0 / pred_d_t[pred_valid].clamp(min=1e-6)
-        # Robust min/max via 2nd / 98th percentiles to suppress remaining
-        # outliers (a handful of bright/dark spikes from stray Gaussians).
-        d = _depth_to_3ch(pred_disp, valid_mask=pred_valid,
-                          pct_lo=0.02, pct_hi=0.98)
-    else:
-        d = _depth_to_3ch(pred_d_t)
-
+    # GT mono depth (Depth-Anything *_depth_raw.npy) is inverse-depth /
+    # disparity-like: larger value = closer, so we do NOT invert.
+    # Predicted depth is true metric depth: larger value = farther, so we
+    # invert it. Both panels therefore use the convention light = near,
+    # dark = far. Because the two have different units (disparity vs.
+    # metric depth), they are normalised independently.
+    gd = _depth_to_3ch(gt_d_t,   invert=False)
     ga = _mask_to_3ch(gt_acc)
+    d  = _depth_to_3ch(pred_d_t, invert=True)
     a  = _mask_to_3ch(acc)
 
-    panels = [gt_np, ga, gd, rn_np, a, d]
-
-    # Row 3: composited (Gaussians + sky) and the sky background itself
-    if composited is not None or sky_bg is not None:
-        comp_np = (composited.detach().cpu().clamp(0, 1)
-                   if composited is not None
-                   else torch.zeros_like(gt_np))
-        sky_np  = (sky_bg.detach().cpu().clamp(0, 1)
-                   if sky_bg is not None
-                   else torch.zeros_like(gt_np))
-        blank   = torch.zeros_like(gt_np)
-        panels += [comp_np, sky_np, blank]
-
-    nrow = 3
+    # 2 rows x 3 cols: [gt_rgb, gt_opacity, gt_depth] / [pred_rgb, pred_opacity, pred_depth]
     grid = torchvision.utils.make_grid(
-        panels, nrow=nrow, padding=2, normalize=False)
+        [gt_np, ga, gd, rn_np, a, d], nrow=3, padding=2, normalize=False)
     path = os.path.join(log_dir, f"epoch_{epoch:04d}.png")
     torchvision.utils.save_image(grid, path)
 
@@ -1753,7 +1600,6 @@ def evaluate(
     eval_csv_path: str | None = None, split: str = "test",
     n_points: int | None = None,
     save_dir: str | None = None,
-    sky_model: "SphericalHarmonicSky | None" = None,
 ):
     """Run evaluation on test cameras and return mean metrics.
 
@@ -1787,24 +1633,16 @@ def evaluate(
         pkg = render(cam, gaussians, bg_color)
         image = pkg["rgb"].clamp(0.0, 1.0)
 
-        # Sky compositing for eval
-        sky_bg_eval = None
-        composited_eval = image
-        if sky_model is not None:
-            with torch.no_grad():
-                sky_bg_eval = _compute_sky_bg(cam, sky_model)  # (3,H,W)
-            composited_eval = (image + (1.0 - pkg["acc"]) * sky_bg_eval).clamp(0.0, 1.0)
-
-        l1_list.append(l1_loss(composited_eval, gt, mask).item())
-        psnr_list.append(psnr(composited_eval, gt, mask).item())
-        ssim_list.append(ssim(composited_eval, gt, mask=mask).item())
+        l1_list.append(l1_loss(image, gt, mask).item())
+        psnr_list.append(psnr(image, gt, mask).item())
+        ssim_list.append(ssim(image, gt, mask=mask).item())
 
         if lpips_fn is not None:
             lpips_val = lpips_fn(
-                composited_eval.unsqueeze(0), gt.unsqueeze(0)).item()
+                image.unsqueeze(0), gt.unsqueeze(0)).item()
             lpips_list.append(lpips_val)
 
-        # ── Save grid: rows=[GT, raw render, composited+sky] ────────
+        # ── Save 2×3 grid: [GT RGB | GT mask | GT depth] / [Pred RGB | Pred alpha | Pred depth] ──
         if img_dir is not None:
             name = cam.image_name
             H, W = int(cam.image_height), int(cam.image_width)
@@ -1826,9 +1664,7 @@ def evaluate(
                                valid: np.ndarray | None = None,
                                d_min: float | None = None,
                                d_max: float | None = None,
-                               invert: bool = True,
-                               pct_lo: float = 0.0,
-                               pct_hi: float = 1.0) -> np.ndarray:
+                               invert: bool = True) -> np.ndarray:
                 """Normalize depth to greyscale RGB. Convention: light = near,
                 dark = far, invalid pixels black.
 
@@ -1839,11 +1675,7 @@ def evaluate(
                                     *_depth_raw.npy), so we map directly.
 
                 If ``d_min``/``d_max`` are provided, they are used instead of
-                per-image min/max so multiple depth maps share a scale.
-                Otherwise, ``pct_lo`` / ``pct_hi`` (in [0, 1]) select
-                percentile bounds over the valid pixels, suppressing the
-                influence of a few outliers (e.g. stray near-Gaussian leaks
-                into sky tiles)."""
+                per-image min/max so multiple depth maps share a scale."""
                 d = depth_np.astype(np.float32)
                 out = np.zeros(d.shape, dtype=np.uint8)
                 if valid is None:
@@ -1851,15 +1683,10 @@ def evaluate(
                 if valid.any():
                     if d_min is None or d_max is None:
                         d_valid = d[valid]
-                        if pct_lo > 0.0 or pct_hi < 1.0:
-                            d_min = float(np.quantile(d_valid, pct_lo))
-                            d_max = float(np.quantile(d_valid, pct_hi))
-                        else:
-                            d_min = float(d_valid.min())
-                            d_max = float(d_valid.max())
+                        d_min = float(d_valid.min())
+                        d_max = float(d_valid.max())
                     if d_max - d_min > 1e-6:
                         n = (d - d_min) / (d_max - d_min)
-                        n = np.clip(n, 0.0, 1.0)
                         scaled = ((1.0 - n) if invert else n) * 255.0
                     else:
                         scaled = np.full_like(d, 255.0)
@@ -1886,76 +1713,32 @@ def evaluate(
                 md = None
 
             # ── Predicted panels ─────────────────────────────────────
-            pred_rgb_img = _to_rgb_uint8(composited_eval)
+            pred_rgb_img = _to_rgb_uint8(image)
 
             acc_np = pkg["acc"].detach().permute(1, 2, 0).cpu().numpy().squeeze()
             pred_alpha_img = np.stack(
                 [(np.clip(acc_np, 0, 1) * 255).astype(np.uint8)] * 3, axis=-1)
 
-            # Use expected depth (premultiplied / acc) so the panel matches
-            # what ``depth_mono_loss`` optimises.
-            depth_premul_np = pkg["depth_premul"].detach().permute(
-                1, 2, 0).cpu().numpy().squeeze()
-            # Stricter acc cutoff: stray near-Gaussians in sky tiles often
-            # leak with acc < 0.05 and cause bright outliers after disparity
-            # inversion.
-            pred_valid = acc_np > 5e-2
-            # If a GT non-sky mask is available, erode it by a few pixels
-            # so 1-px boundary leakage is excluded too.
-            if gt_mask is not None:
-                gm = gt_mask.detach().float().cpu().numpy().squeeze()
-                if gm.shape == pred_valid.shape:
-                    non_sky = (gm > 0.5).astype(np.float32)
-                    # Min-pool erosion via OpenCV-free trick: sliding min.
-                    k = 5
-                    pad = k // 2
-                    padded = np.pad(non_sky, pad, mode="edge")
-                    eroded = np.ones_like(non_sky)
-                    for di in range(k):
-                        for dj in range(k):
-                            eroded = np.minimum(
-                                eroded, padded[di:di + non_sky.shape[0],
-                                               dj:dj + non_sky.shape[1]])
-                    pred_valid = pred_valid & (eroded > 0.5)
-            depth_np = np.zeros_like(depth_premul_np, dtype=np.float32)
-            depth_np[pred_valid] = (
-                depth_premul_np[pred_valid]
-                / np.maximum(acc_np[pred_valid], 1e-10))
+            depth_np = pkg["depth"].detach().permute(1, 2, 0).cpu().numpy().squeeze()
+            pred_valid = acc_np > 1e-3
 
-            # Both depth panels follow the convention used by
-            # depth_anything_v2.py *_depth_vis.png: linear min/max
-            # normalisation, brightness = disparity (= near), sky/zero
-            # black. GT and prediction have different units (DA-v2 relative
-            # disparity vs. 1/metres), so each is normalised *independently*
-            # on its own min/max.
+            # GT mono depth (Depth-Anything *_depth_raw.npy) is inverse-depth
+            # (large value = near), predicted depth is metric depth (large
+            # value = far). They have different units, so each is normalised
+            # independently. Both panels share the convention
+            # light = near, dark = far.
             if md is not None:
-                md_valid = np.isfinite(md) & (md > 0)
-                gt_depth_img = _depth_to_grey(
-                    md, valid=md_valid, invert=False,
-                    pct_lo=0.02, pct_hi=0.98)
+                gt_depth_img = _depth_to_grey(md, invert=False)
             else:
                 gt_depth_img = np.full((H, W, 3), 255, dtype=np.uint8)
 
-            pred_disp = np.zeros_like(depth_np, dtype=np.float32)
-            pred_disp[pred_valid] = 1.0 / np.maximum(depth_np[pred_valid], 1e-6)
             pred_depth_img = _depth_to_grey(
-                pred_disp, valid=pred_valid, invert=False,
-                pct_lo=0.02, pct_hi=0.98)
+                depth_np, valid=pred_valid, invert=True)
 
-            # ── Compose grid ─────────────────────────────────────────
-            raw_rgb_img = _to_rgb_uint8(image)  # raw render (black bg, no SH)
-            row1 = np.concatenate([gt_rgb_img,   gt_mask_img,    gt_depth_img],   axis=1)
-            row2 = np.concatenate([raw_rgb_img,  pred_alpha_img, pred_depth_img], axis=1)
-            rows = [row1, row2]
-
-            # Row 3: composited (Gaussians + SH sky) | SH sky | blank
-            if sky_bg_eval is not None:
-                sky_img = _to_rgb_uint8(sky_bg_eval.clamp(0.0, 1.0))
-                blank   = np.zeros((H, W, 3), dtype=np.uint8)
-                row3 = np.concatenate([pred_rgb_img, sky_img, blank], axis=1)
-                rows.append(row3)
-
-            grid = np.concatenate(rows, axis=0)
+            # ── Compose 2×3 grid ────────────────────────────────────
+            row1 = np.concatenate([gt_rgb_img,   gt_mask_img,   gt_depth_img], axis=1)
+            row2 = np.concatenate([pred_rgb_img, pred_alpha_img, pred_depth_img], axis=1)
+            grid = np.concatenate([row1, row2], axis=0)
             Image.fromarray(grid).save(os.path.join(img_dir, f"{name}.png"))
 
     metrics = {
@@ -2093,13 +1876,6 @@ def training(cfg: dict):
 
     gaussians.training_setup(optim_cfg)
 
-    # ── SH sky model (co-trained) ─────────────────────────────────────
-    sky_sh_degree = optim_cfg.get("sky_sh_degree", cfg["model"]["sh_degree"])
-    sky_lr = optim_cfg.get("sky_sh_lr", 1e-2)
-    sky_model = SphericalHarmonicSky(sh_degree=sky_sh_degree).cuda()
-    sky_optimizer = torch.optim.Adam(
-        [sky_model.sh_coeffs], lr=sky_lr, eps=1e-15)
-
     # ── Schedule parameters ───────────────────────────────────────────
     test_epochs_set = set(train_cfg.get("test_epochs", []))
     save_epochs_set = set(train_cfg.get("save_epochs", []))
@@ -2120,23 +1896,6 @@ def training(cfg: dict):
     print(f"  checkpoints  epochs {sorted(checkpoint_epochs_set)}")
     print(f"  save PLY     epochs {sorted(save_epochs_set)}")
 
-    # ── Sky model startup summary ─────────────────────────────────────
-    n_sky_mask = sum(1 for c in train_cameras if "mask" in c.guidance)
-    n_moving_mask = sum(1 for c in train_cameras if "moving_mask" in c.guidance)
-    n_depth = sum(1 for c in train_cameras if "mono_depth" in c.guidance)
-    lambda_sky = optim_cfg.get("lambda_sky", 1.0)
-    lambda_sky_acc = optim_cfg.get("lambda_sky_acc", 0.01)
-    print(f"\n{'─'*72}")
-    print(f"  Sky model: SH degree={sky_sh_degree}  "
-          f"n_coeffs={sky_model.sh_coeffs.shape[1]}  lr={sky_lr:.2e}")
-    print(f"  lambda_sky={lambda_sky}  lambda_sky_acc={lambda_sky_acc}")
-    print(f"  Cameras with sky_mask   : {n_sky_mask}/{len(train_cameras)}")
-    print(f"  Cameras with moving_mask: {n_moving_mask}/{len(train_cameras)}")
-    print(f"  Cameras with mono_depth : {n_depth}/{len(train_cameras)}")
-    if n_sky_mask == 0:
-        print("  WARNING: no sky masks found – sky_pixel_loss will be skipped")
-    print(f"{'─'*72}\n")
-
     # ── Resume from checkpoint ────────────────────────────────────────
     start_epoch = 0
     step = 0
@@ -2151,9 +1910,6 @@ def training(cfg: dict):
         if "optimizer_state" in state:
             gaussians.optimizer.load_state_dict(state["optimizer_state"])
         gaussians._sync_auxiliary_tensors()
-        if "sky_model_state" in state:
-            sky_model.load_state_dict(state["sky_model_state"])
-            print(f"  Sky model loaded from checkpoint.")
         print(f"Resumed from {latest}  (epoch {start_epoch})")
 
     # ── CSV metric files ──────────────────────────────────────────────
@@ -2229,75 +1985,33 @@ def training(cfg: dict):
                                if not moving_mask.is_cuda else moving_mask)
 
             # ── Combined mask (exclude sky + moving objects) ──────────
-            # Used for depth loss (sky has no depth) and for logging.
             mask = sky_mask
             if mask is not None and moving_mask is not None:
                 mask = mask & (~moving_mask)
             elif moving_mask is not None:
                 mask = ~moving_mask
 
-            # Moving-only mask: exclude moving objects but keep sky pixels.
-            # Used for the main RGB loss so sky colour is supervised too.
-            moving_only_mask = (~moving_mask) if moving_mask is not None else None
-
             # ── Render ────────────────────────────────────────────────
             render_pkg = render(cam, gaussians, bg_color)
             image = render_pkg["rgb"]
             acc = render_pkg["acc"]
-            depth_premul = render_pkg["depth_premul"]
+            depth = render_pkg["depth"]
             viewspace_pts = render_pkg["viewspace_points"]
             visibility = render_pkg["visibility_filter"]
             radii = render_pkg["radii"]
 
-            # ── Sky compositing (co-trained SH sky model) ─────────────
-            #   bg_color is black, so image = acc * c_straight (premul).
-            #   We composite the sky behind Gaussians so that boundary
-            #   Gaussians learn c_straight consistent with the real sky,
-            #   preventing oversaturation at inference.
-            lambda_sky = optim_cfg.get("lambda_sky", 1.0)
-            sky_bg = _compute_sky_bg(cam, sky_model)           # (3, H, W)
-            composited = image + (1.0 - acc) * sky_bg          # alpha-blend
-
             scalar_dict: dict = {}
 
-            # ── RGB loss (L1 + D-SSIM) on all pixels (sky included) ───
-            # The SH sky model must only receive gradients from sky pixels:
-            # detach sky_bg in the non-sky (foreground) region so that the
-            # main RGB loss trains only the splats there.  In the sky region
-            # sky_bg keeps its full gradient so the SH model is supervised.
+            # ── RGB loss (L1 + D-SSIM) ───────────────────────────────
             lambda_l1 = optim_cfg.get("lambda_l1", 1.0)
             lambda_dssim = optim_cfg.get("lambda_dssim", 0.2)
 
-            if sky_mask is not None:
-                fg_region = sky_mask.float()          # 1 = non-sky, 0 = sky
-                # Non-sky: detach sky_bg (no gradient to SH model)
-                # Sky:     keep sky_bg gradient (SH model trained here)
-                sky_bg_for_loss = (
-                    sky_bg.detach() * fg_region +
-                    sky_bg          * (1.0 - fg_region))
-                composited_for_loss = image + (1.0 - acc) * sky_bg_for_loss
-            else:
-                composited_for_loss = composited
-
-            Ll1 = l1_loss(composited_for_loss, gt_image, moving_only_mask)
+            Ll1 = l1_loss(image, gt_image, mask)
             scalar_dict["l1_loss"] = Ll1.item()
 
             loss = (
                 (1.0 - lambda_dssim) * lambda_l1 * Ll1 +
-                lambda_dssim * (1.0 - ssim(composited_for_loss, gt_image, mask=moving_only_mask)))
-
-            # ── Sky SH loss (sky pixels only) ─────────────────────────
-            # sky_bg is NOT detached here, so gradients flow to the SH
-            # model. sky_bg has no splat parameters, so splats are safe.
-            # Foreground pixels are excluded (sky_region_f == 0 there),
-            # so the SH model only trains on actual sky pixels.
-            if lambda_sky > 0 and sky_mask is not None:
-                sky_region_f = (1.0 - sky_mask.float())        # 1 where sky
-                sky_sh_loss = lambda_sky * (
-                    sky_bg * sky_region_f - gt_image * sky_region_f
-                ).abs().mean()
-                scalar_dict["sky_sh_loss"] = sky_sh_loss.item()
-                loss += sky_sh_loss
+                lambda_dssim * (1.0 - ssim(image, gt_image, mask=mask)))
 
             # ── SH regularisation ─────────────────────────────────────
             lambda_sh = optim_cfg.get("lambda_sh_reg", 1e-3)
@@ -2333,7 +2047,7 @@ def training(cfg: dict):
                 mono_depth = (mono_depth.cuda(non_blocking=True)
                               if not mono_depth.is_cuda else mono_depth)
                 d_loss = lambda_depth * depth_mono_loss(
-                    depth_premul, mono_depth, acc, mask)
+                    depth, mono_depth, acc, mask)
                 scalar_dict["depth_loss"] = d_loss.item()
                 loss += d_loss
 
@@ -2347,10 +2061,6 @@ def training(cfg: dict):
                 scalar_dict["psnr"] = psnr_val
 
             loss.backward()
-
-            # ── Sky model update ──────────────────────────────────────
-            sky_optimizer.step()
-            sky_optimizer.zero_grad(set_to_none=True)
 
             iter_end.record()
 
@@ -2371,11 +2081,6 @@ def training(cfg: dict):
                 if tb_writer and cam_idx % 10 == 0:
                     for k, v in scalar_dict.items():
                         tb_writer.add_scalar(f"train/{k}", v, step)
-                    # Sky SH L0 coefficient (ambient level per channel)
-                    sky_l0 = sky_model.sh_coeffs[:, 0].detach()
-                    tb_writer.add_scalar("sky/L0_R", sky_l0[0].item(), step)
-                    tb_writer.add_scalar("sky/L0_G", sky_l0[1].item(), step)
-                    tb_writer.add_scalar("sky/L0_B", sky_l0[2].item(), step)
 
                 # ── Adaptive density control ──────────────────────────
                 if epoch <= densify_until_epoch:
@@ -2449,10 +2154,6 @@ def training(cfg: dict):
                     f"  LR={cur_lr:.2e}  "
                     f"GPU={gpu_mem:.2f} GB  "
                     f"SH={gaussians.active_sh_degree}\n"
-                    f"  Sky   │ SH_L0=[{sky_model.sh_coeffs[0,0].item():.4f}, "
-                    f"{sky_model.sh_coeffs[1,0].item():.4f}, "
-                    f"{sky_model.sh_coeffs[2,0].item():.4f}]  "
-                    f"sky_mask_cams={n_sky_mask}/{len(train_cameras)}\n"
                     f"{'─'*72}")
 
             # ── Write train CSV row ───────────────────────────────────
@@ -2472,15 +2173,13 @@ def training(cfg: dict):
                     ])
 
             # ── Save log images ───────────────────────────────────────
-            if epoch % 5 == 0:
+            if epoch % 20 == 0:
                 try:
                     save_log_images(
                         dirs["log_images_dir"], epoch,
-                        gt_image, image, depth_premul, acc,
+                        gt_image, image, depth, acc,
                         gt_depth=cam.guidance.get("mono_depth"),
-                        gt_acc=cam.guidance.get("mask"),
-                        composited=composited,
-                        sky_bg=sky_bg)
+                        gt_acc=cam.guidance.get("mask"))
                 except Exception as e:
                     tqdm.write(f"  [E{epoch}] log image save failed: {e}")
 
@@ -2525,15 +2224,13 @@ def training(cfg: dict):
                          epoch, tb_writer,
                          eval_csv_path=eval_csv_path, split="test",
                          n_points=gaussians.num_points,
-                         save_dir=dirs["model_path"],
-                         sky_model=sky_model)
+                         save_dir=dirs["model_path"])
                 evaluate(train_cameras[:len(test_cameras)],
                          gaussians, bg_color,
                          epoch, tb_writer,
                          eval_csv_path=eval_csv_path, split="train",
                          n_points=gaussians.num_points,
-                         save_dir=dirs["model_path"],
-                         sky_model=sky_model)
+                         save_dir=dirs["model_path"])
 
             # ── Save checkpoint ───────────────────────────────────────
             is_final = (epoch == num_epochs)
@@ -2541,7 +2238,6 @@ def training(cfg: dict):
                 sd = gaussians.save_state_dict(is_final=is_final)
                 sd["epoch"] = epoch
                 sd["step"] = step
-                sd["sky_model_state"] = sky_model.state_dict()
                 ckpt_path = os.path.join(
                     dirs["trained_model_dir"], f"epoch_{epoch}.pth")
                 torch.save(sd, ckpt_path)
@@ -2578,31 +2274,7 @@ def main():
     if args.max_frames is not None:
         cfg.setdefault("data", {})["max_frames"] = args.max_frames
 
-    # ── Config logging (written into train.log when stdout is redirected) ──
-    config_path = os.path.abspath(args.config)
-    print(f"[Config] --config = {args.config}")
-    print(f"[Config] resolved path = {config_path}")
-    if os.path.exists(config_path):
-        try:
-            mtime = os.path.getmtime(config_path)
-            print(f"[Config] file mtime (epoch seconds) = {mtime:.0f}")
-        except Exception as e:
-            print(f"[Config] WARNING: could not read mtime: {e}")
-    else:
-        print("[Config] WARNING: config path does not exist on disk")
-
     print(f"Task: {cfg['task']}  Exp: {cfg['exp_name']}")
-    train_cfg = cfg.get("train", {})
-    optim_cfg = cfg.get("optim", {})
-    print(f"[Config] output_root = {cfg.get('output_root')}")
-    print(f"[Config] epochs = {train_cfg.get('epochs')}")
-    print(f"[Config] test_epochs = {train_cfg.get('test_epochs')}")
-    print(f"[Config] checkpoint_epochs = {train_cfg.get('checkpoint_epochs')}")
-    print(f"[Config] save_epochs = {train_cfg.get('save_epochs')}")
-    print(f"[Config] optim.lambda_depth = {optim_cfg.get('lambda_depth')}")
-    print(f"[Config] optim.lambda_sky_acc = {optim_cfg.get('lambda_sky_acc')}")
-    print(f"[Config] optim.lambda_l1 = {optim_cfg.get('lambda_l1')}")
-    print(f"[Config] optim.lambda_dssim = {optim_cfg.get('lambda_dssim')}")
 
     # Reproducibility
     set_seed(0)
