@@ -90,6 +90,11 @@ CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
     --output_dir output_version_18_150_da2loss_0.5_v2_gan_0.3_100 \
     > output_version_18_150_da2loss_0.5_v2_gan_0.3_100/train_gan.log 2>&1 &
 
+# score distillation sampling
+export HF_TOKEN=<your_token>
+python sds_score.py --image ./data/cubemap_faces/0001_back.jpg --prompt "A street level image of an outdoor scene"
+
+REMOVED_HF_TOKEN
 
 # render wobble
 python gopromax_neighbour/render_wobble.py \

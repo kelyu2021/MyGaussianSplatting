@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────────────────────────────
+#  GoPro Max Neighbour – Gaussian Splatting with Sky Mask
+# ─────────────────────────────────────────────────────────────────────
+#
+#  Usage:
+#      cd MyGaussianSplatting/gopromax_neighbour
+#      python train.py --cfg_file configs/gopromax_neighbour.yaml
+#
+#  All relative paths are resolved from the workspace (cwd).
+
+task: gopromax_neighbour
+exp_name: sky_mask_v1
+gpus: [0, 1]
+
+# COLMAP model directory (contains sparse/ and fused.ply)
+source_path: data/colmap_pointcloud_dense
+
+data:
+  type: GOPROMAX_NEIGHBOUR
+  white_background: false
+  split_test: 8
+  max_frames: 30    # set to 0 to use all frames
+  point_cloud_path: data/colmap_pointcloud_dense/fused.ply
+  mask_dir: data/cubemap_faces_mass13k_manual
+  depth_dir: data/cubemap_faces_da2
+  # Cubemap face images (original, converted from panoramic)
+  images: data/cubemap_faces
+
+model:
+  gaussian:
+    sh_degree: 3
+  nsg:
+    include_bkgd: true
+    include_sky: false
+  use_color_correction: true
+
+train:
+  epochs: 150
+  test_epochs: [5, 10, 15, 20, 25, 50, 75, 100, 125, 150]
+  save_epochs: [50, 100, 150]
+  checkpoint_epochs: [50, 100, 150]
+
+optim:
+  densification_interval: 100
+  densify_from_epoch: 3
+  densify_until_epoch: 90
+  densify_grad_threshold_bkgd: 0.0002
+  position_lr_init: 0.00016
+  position_lr_final: 1.6e-06
+  position_lr_max_epochs: 135
+  opacity_reset_epoch_interval: 18
+  prune_epoch_interval: 30
+  prune_min_opacity: 0.003
+  lambda_l1: 1.0
+  lambda_dssim: 0.2
+  lambda_sky: 1    # supervise sky region with a constant blue color (data/cubemap_faces_mass13k_manual)
+  lambda_sky_acc: 0.01    # accumulate sky supervision gradients over multiple epochs (for stability)
+  lambda_color_correction: 0.001
+  lambda_depth: 0.5    # monocular depth supervision (data/cubemap_faces_da2)
+  lambda_opacity_entropy: 0    # encourage sharper opacity (non-empty) distributions
+  lambda_sky_acc: 0.5    # accumulate sky supervision gradients over multiple epochs (for stability) 
+
+  # solve the blur of close scene
+  densify_grad_threshold: 0.0001  # was 0.0002 — triggers more splits near camera
+  max_screen_size: 40             # was 20 — don't prune large nearby Gaussians
+  percent_big_ws: 0.0             # was 0.1 — disable world-space size pruning
+  densify_until_epoch: 135        # was 90 — allow more epochs of aggressive densification to capture close details
+  lambda_screen_size: 0.0005   # start ~1e-4 to 1e-3
+  screen_size_threshold: 30.0  # pixels; ~20–50 depending on image resolution
