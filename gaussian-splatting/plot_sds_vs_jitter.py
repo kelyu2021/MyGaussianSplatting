@@ -31,6 +31,7 @@ import json
 import math
 import os
 import sys
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -141,6 +142,67 @@ def jitter_camera(cam_dict, offset_m: float) -> Camera:
 
 
 # ---------------------------------------------------------------------------
+# Mask helpers
+# ---------------------------------------------------------------------------
+
+def load_combined_mask(img_name: str, sky_mask_dir: Optional[str],
+                       moving_mask_dir: Optional[str],
+                       target_hw: Tuple[int, int]) -> Optional[np.ndarray]:
+    """
+    Load and combine sky + moving-object masks into a single boolean array.
+
+    Returns an (H, W) bool array where True = pixel should be zeroed out,
+    or None if no mask directories were given / files are missing.
+
+    Sky mask   (mass13k_manual, JPEG, grayscale): sky   = value < 128
+    Moving mask (sam_manual,    PNG,  grayscale): moving = value == 255
+    """
+    import cv2  # available in the gaussian-splatting env
+
+    H, W = target_hw
+    combined = np.zeros((H, W), dtype=bool)
+    found_any = False
+    stem = os.path.splitext(img_name)[0]  # strip extension if present
+
+    if sky_mask_dir:
+        for ext in ('.jpg', '.jpeg', '.png'):
+            p = os.path.join(sky_mask_dir, stem + ext)
+            if os.path.exists(p):
+                sky = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+                sky = cv2.resize(sky, (W, H), interpolation=cv2.INTER_NEAREST)
+                combined |= (sky < 128)
+                found_any = True
+                print(f"Sky mask loaded: {p}")
+                break
+        else:
+            print(f"[warn] Sky mask not found for '{stem}' in {sky_mask_dir}")
+
+    if moving_mask_dir:
+        for ext in ('.png', '.jpg', '.jpeg'):
+            p = os.path.join(moving_mask_dir, stem + ext)
+            if os.path.exists(p):
+                mov = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+                mov = cv2.resize(mov, (W, H), interpolation=cv2.INTER_NEAREST)
+                combined |= (mov == 255)
+                found_any = True
+                print(f"Moving mask loaded: {p}")
+                break
+        else:
+            print(f"[warn] Moving mask not found for '{stem}' in {moving_mask_dir}")
+
+    return combined if found_any else None
+
+
+def apply_mask(frame: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+    """Zero out masked pixels (sky / moving objects) in an HxWx3 uint8 frame."""
+    if mask is None:
+        return frame
+    out = frame.copy()
+    out[mask] = 0
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -228,7 +290,13 @@ def main():
                         help='FPS for output video(s)')
     parser.add_argument('--save_renders', action='store_true',
                         help='Save each frame as a PNG')
-    parser.add_argument('--meters_per_unit', type=float, default=2,
+    parser.add_argument('--sky_mask_dir', default=None,
+                        help='Dir of sky masks (cubemap_faces_mass13k_manual); '
+                             'sky = pixel < 128. Omit to skip.')
+    parser.add_argument('--moving_mask_dir', default=None,
+                        help='Dir of moving-object masks (cubemap_faces_sam_manual); '
+                             'moving = pixel == 255. Omit to skip.')
+    parser.add_argument('--meters_per_unit', type=float, default=2.4,
                         help='World-unit → metres scale for x-axis (default 1)')
     parser.add_argument('--errorbar_style',
                         choices=['band', 'errorbar', 'both'], default='band')
@@ -282,6 +350,17 @@ def main():
     frames_dir = os.path.join(args.output_dir, base_name)
     os.makedirs(frames_dir, exist_ok=True)
 
+    # ---- Load masks (once, same for all jitter offsets) -------------------
+    # Determine render resolution from a zero-jitter camera
+    _probe_cam = jitter_camera(cam_dict, 0.0)
+    _render_H, _render_W = _probe_cam.image_height, _probe_cam.image_width
+    combined_mask = load_combined_mask(
+        args.img_name,
+        sky_mask_dir=args.sky_mask_dir,
+        moving_mask_dir=args.moving_mask_dir,
+        target_hw=(_render_H, _render_W),
+    )
+
     for idx, dist in enumerate(distances):
         print(f"[{idx+1}/{len(distances)}] offset = {dist:.4f} world units")
 
@@ -292,26 +371,30 @@ def main():
         frames_right.append(frame_r)
         frames_left.append(frame_l)
 
+        # Apply sky + moving-object masks before saving / scoring
+        masked_r = apply_mask(frame_r, combined_mask)
+        masked_l = apply_mask(frame_l, combined_mask)
+
         # Always save every rendered frame into the per-image subfolder
-        Image.fromarray(frame_r).save(
+        Image.fromarray(masked_r).save(
             os.path.join(frames_dir,
                          f'render_{idx+1:04d}_right_{dist:.4f}.png'))
-        Image.fromarray(frame_l).save(
+        Image.fromarray(masked_l).save(
             os.path.join(frames_dir,
                          f'render_{idx+1:04d}_left_{dist:.4f}.png'))
 
         if not args.skip_sds:
             for rep in range(args.num_repeats):
                 if args.side == 'right':
-                    img = Image.fromarray(frame_r)
+                    img = Image.fromarray(masked_r)
                 elif args.side == 'left':
-                    img = Image.fromarray(frame_l)
+                    img = Image.fromarray(masked_l)
                 else:
-                    sr = compute_sds_score(Image.fromarray(frame_r),
+                    sr = compute_sds_score(Image.fromarray(masked_r),
                                            args.prompt,
                                            num_samples=args.num_samples,
                                            sd_components=sd_components)
-                    sl = compute_sds_score(Image.fromarray(frame_l),
+                    sl = compute_sds_score(Image.fromarray(masked_l),
                                            args.prompt,
                                            num_samples=args.num_samples,
                                            sd_components=sd_components)
@@ -326,18 +409,20 @@ def main():
                 all_scores[idx].append(score)
                 print(f"    rep {rep+1}/{args.num_repeats} SDS = {score:.6f}")
 
-    # ---- Save videos -------------------------------------------------------
-    for tag, frames in [('right', frames_right), ('left', frames_left)]:
+    # ---- Save videos (using masked frames) ---------------------------------
+    masked_right = [apply_mask(f, combined_mask) for f in frames_right]
+    masked_left  = [apply_mask(f, combined_mask) for f in frames_left]
+    for tag, frames in [('right', masked_right), ('left', masked_left)]:
         vid_path = os.path.join(args.output_dir, f'{base_name}_{tag}.mp4')
         imageio.mimwrite(vid_path, frames, fps=args.fps, quality=8)
         print(f"Video saved: {vid_path}")
 
     # Combined: center → right → center → left → center (no duplicate frames at junctions)
     frames_combined = (
-        frames_right +                        # center → right
-        list(reversed(frames_right))[1:] +   # right  → center
-        frames_left[1:] +                     # center → left
-        list(reversed(frames_left))[1:]       # left   → center
+        masked_right +                        # center → right
+        list(reversed(masked_right))[1:] +   # right  → center
+        masked_left[1:] +                     # center → left
+        list(reversed(masked_left))[1:]       # left   → center
     )
     combined_path = os.path.join(args.output_dir, f'{base_name}_combined.mp4')
     imageio.mimwrite(combined_path, frames_combined, fps=args.fps, quality=8)

@@ -9,13 +9,18 @@ nohup python train.py --config configs/gopromax_neighbour_2400.yaml --max_frames
 
 CUDA_VISIBLE_DEVICES=1 nohup python train.py --config configs/gopromax_neighbour_360.yaml --output-dir ./output_version_11_360 > ./output_version_11_360/train.log 2>&1 &
 
-# train_da2loss
+# train with sky
+CUDA_VISIBLE_DEVICES=0 nohup python train_w_sky.py --config configs/gopromax_neighbour_150.yaml --output-dir ./output/24_150_0.5_w_sky > ./output/24_150_0.5_w_sky/train.log 2>&1 &
+
+# train_da2loss w skymask
 CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config configs/gopromax_neighbour_100.yaml --output-dir ./output_version_17_100_da2loss > ./output_version_17_100_da2loss/train.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config ./configs/gopromax_neighbour_150.yaml --output-dir ./output_version_18_150_da2loss_0.5_skymodel_1_0.05 > ./output_version_18_150_da2loss_0.5_skymodel_1_0.05/train.log 2>&1 &
 
 CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config ./configs/gopromax_neighbour_150_2_0.01.yaml --output-dir ./output_version_18_150_da2loss_0.5_skymodel_2_0.01 > ./output_version_18_150_da2loss_0.5_skymodel_2_0.01/train.log 2>&1 &
 
+# train_da2loss wo skymask
+CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss_wo_skymask.py --config ./configs/gopromax_neighbour_150_tune.yaml --output-dir ./output/23_150_da2loss_0.5_tune > ./output/23_150_da2loss_0.5_tune/train.log 2>&1 &
 
 # train_gan_da2loss
 CUDA_VISIBLE_DEVICES=1 nohup python -u train_gan_da2loss.py --config configs/gopromax_neighbour_300_tune.yaml /

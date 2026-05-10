@@ -58,4 +58,5 @@ optim:
   lambda_color_correction: 0.001
   lambda_depth: 0.5    # monocular depth supervision (data/cubemap_faces_da2)
   lambda_opacity_entropy: 0    # encourage sharper opacity (non-empty) distributions
+  lambda_acc_mask: 0.5         # BCE loss pushing rendered acc to GT mask
 
