@@ -241,9 +241,9 @@ def main():
             ax.errorbar(distances_m, sds_mean, yerr=sds_std,
                         fmt='none', ecolor='C0', capsize=3, alpha=0.8)
         # Scatter raw samples for transparency
-        for i, d in enumerate(distances_m):
-            ax.scatter(np.full(args.num_repeats, d), scores_arr[i],
-                       s=8, color='C0', alpha=0.3, zorder=1)
+        # for i, d in enumerate(distances_m):
+        #     ax.scatter(np.full(args.num_repeats, d), scores_arr[i],
+        #                s=8, color='C0', alpha=0.3, zorder=1)
         ax.legend(loc='best', fontsize=8)
 
     ax.set_xlabel('Jitter distance (m)')
