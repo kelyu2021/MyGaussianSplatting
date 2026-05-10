@@ -41,6 +41,7 @@ import copy
 import shutil
 import argparse
 import csv
+import traceback
 from pathlib import Path
 from random import shuffle, seed as set_seed, choice as random_choice
 from collections import OrderedDict
@@ -92,6 +93,30 @@ except ImportError:
 
 os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Sky-compositing helper
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The pre-trained checkpoint produced by train_da2loss.py supervises the
+# *composited* image (Gaussian render + SH-sky background), not the raw
+# render. To keep the GAN fine-tuning consistent with that training
+# convention, every loss / metric / critic input below uses the composited
+# image when a sky_model is present.
+
+def _compose_with_sky(rgb: torch.Tensor, acc: torch.Tensor, cam,
+                      sky_model) -> torch.Tensor:
+    """Alpha-blend the SH sky background behind ``rgb``.
+
+    Returns ``rgb`` unchanged when ``sky_model`` is None. The sky model is
+    frozen during GAN fine-tuning, so this introduces no extra trainable
+    parameters.
+    """
+    if sky_model is None:
+        return rgb
+    sky_bg = _compute_sky_bg(cam, sky_model)
+    return rgb + (1.0 - acc) * sky_bg
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -450,26 +475,21 @@ def evaluate_gan(
         if moving_mask is not None:
             moving_mask = moving_mask.cuda(non_blocking=True)
 
-        mask = sky_mask
-        if mask is not None and moving_mask is not None:
-            mask = mask & (~moving_mask)
-        elif moving_mask is not None:
-            mask = ~moving_mask
+        # Match train_da2loss.py: only exclude moving objects from metrics;
+        # sky pixels are included because the composited image supplies them.
+        metric_mask = (~moving_mask) if moving_mask is not None else None
 
         # Render on-road (once per camera; metrics computed once)
         pkg_on = render(cam, gaussians, bg_color)
         image_on = pkg_on["rgb"]
-        # SH sky composited image for display (row 2 col 1)
-        if sky_model is not None:
-            _sky_bg_on = _compute_sky_bg(cam, sky_model)
-            image_on_display = (image_on + (1.0 - pkg_on["acc"]) * _sky_bg_on).clamp(0.0, 1.0)
-        else:
-            image_on_display = image_on
+        # SH sky composited image (used for both metrics and display)
+        image_on_display = _compose_with_sky(
+            image_on, pkg_on["acc"], cam, sky_model).clamp(0.0, 1.0)
 
-        # Metrics (on-road)
-        l1_list.append(l1_loss(image_on, gt, mask).item())
-        psnr_list.append(psnr(image_on, gt, mask).item())
-        ssim_list.append(ssim(image_on, gt, mask=mask).item())
+        # Metrics on the composited image (consistent with train_da2loss.py)
+        l1_list.append(l1_loss(image_on_display, gt, metric_mask).item())
+        psnr_list.append(psnr(image_on_display, gt, metric_mask).item())
+        ssim_list.append(ssim(image_on_display, gt, mask=metric_mask).item())
 
         endpoint_pkgs = {}
         if video_dir is not None:
@@ -499,11 +519,8 @@ def evaluate_gan(
                 pkg_off = render(jit_cam, gaussians, bg_color)
             image_off = pkg_off["rgb"]
             # SH sky composited image for display (row 3 col 1)
-            if sky_model is not None:
-                _sky_bg_off = _compute_sky_bg(jit_cam, sky_model)
-                image_off_display = (image_off + (1.0 - pkg_off["acc"]) * _sky_bg_off).clamp(0.0, 1.0)
-            else:
-                image_off_display = image_off
+            image_off_display = _compose_with_sky(
+                image_off, pkg_off["acc"], jit_cam, sky_model).clamp(0.0, 1.0)
 
             if img_dir is not None:
                 name = cam.image_name
@@ -788,7 +805,9 @@ def _load_checkpoint(ckpt_dir: str, epoch: int | None, sh_degree: int):
     if epoch is not None:
         ckpt_path = ckpt_dir / f"epoch_{epoch}.pth"
     else:
-        ckpt_files = sorted(ckpt_dir.glob("epoch_*.pth"))
+        ckpt_files = sorted(
+            ckpt_dir.glob("epoch_*.pth"),
+            key=lambda p: int(p.stem.split("_")[1]))
         if not ckpt_files:
             raise FileNotFoundError(f"No checkpoints in {ckpt_dir}")
         ckpt_path = ckpt_files[-1]
@@ -830,6 +849,7 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                  lr_critic: float, lr_generator: float,
                  road_width_warmup_epochs: int,
                  road_width_init_frac: float,
+                 lambda_adv: float = 1.0,
                  jitter_faces: tuple[str, ...] = ("front", "back"),
                  jitter_directions_default: tuple[str, ...] = (
                      "left", "right")):
@@ -1023,8 +1043,16 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                                                  forward=forward_dir,
                                                  lateral=lateral_dir)
                 with torch.no_grad():
-                    real_img = render(cam, gaussians, bg_color)["rgb"].detach()
-                    fake_img = render(jit_cam, gaussians, bg_color)["rgb"].detach()
+                    real_pkg = render(cam, gaussians, bg_color)
+                    fake_pkg = render(jit_cam, gaussians, bg_color)
+                    # Composite SH sky so the critic sees inference-style
+                    # imagery (matches the convention of train_da2loss.py).
+                    real_img = _compose_with_sky(
+                        real_pkg["rgb"], real_pkg["acc"], cam, sky_model
+                    ).clamp(0.0, 1.0).detach()
+                    fake_img = _compose_with_sky(
+                        fake_pkg["rgb"], fake_pkg["acc"], jit_cam, sky_model
+                    ).clamp(0.0, 1.0).detach()
                 real_score = critic(real_img.unsqueeze(0))
                 fake_score = critic(fake_img.unsqueeze(0))
                 loss_c = fake_score.mean() - real_score.mean()
@@ -1060,6 +1088,7 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
     print(f"  lambda_gp    = {lambda_gp}")
     print(f"  lambda_recon = {lambda_recon}")
     print(f"  lambda_dssim = {lambda_dssim}")
+    print(f"  lambda_adv   = {lambda_adv}")
     print(f"  lr_critic    = {lr_critic}")
     print(f"  lr_generator = {lr_generator}")
 
@@ -1120,11 +1149,20 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                 moving_mask = (moving_mask.cuda(non_blocking=True)
                                if not moving_mask.is_cuda else moving_mask)
 
+            # ``mask`` (sky_mask & ~moving_mask) is used by the depth and
+            # sky-acc losses, matching train_da2loss.py.
             mask = sky_mask
             if mask is not None and moving_mask is not None:
                 mask = mask & (~moving_mask)
             elif moving_mask is not None:
                 mask = ~moving_mask
+
+            # ``recon_mask`` (~moving_mask only) is used by the L1/SSIM
+            # reconstruction loss. Sky pixels are intentionally INCLUDED
+            # because the composited render supplies them via the SH sky
+            # background — same convention as train_da2loss.py's
+            # ``moving_only_mask``.
+            recon_mask = (~moving_mask) if moving_mask is not None else None
 
             gt_image = cam.original_image
             gt_image = (gt_image.cuda(non_blocking=True)
@@ -1150,15 +1188,19 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                 if global_step_idx % (critic_iters + 1) < critic_iters:
                     critic.train()
 
-                    # Render on-road (real) — detach from Gaussian graph
+                    # Render both views and composite the SH sky so the
+                    # critic sees images in the same colour space as
+                    # inference (matches train_da2loss.py).
                     with torch.no_grad():
                         real_pkg = render(cam, gaussians, bg_color)
-                        real_img = real_pkg["rgb"].detach()  # (3, H, W)
+                        real_img = _compose_with_sky(
+                            real_pkg["rgb"], real_pkg["acc"],
+                            cam, sky_model).clamp(0.0, 1.0).detach()
 
-                    # Render off-road (fake) — detach from Gaussian graph
-                    with torch.no_grad():
                         fake_pkg = render(jit_cam, gaussians, bg_color)
-                        fake_img = fake_pkg["rgb"].detach()  # (3, H, W)
+                        fake_img = _compose_with_sky(
+                            fake_pkg["rgb"], fake_pkg["acc"],
+                            jit_cam, sky_model).clamp(0.0, 1.0).detach()
 
                     # Critic scores
                     real_score = critic(real_img.unsqueeze(0))  # (1, 1)
@@ -1200,25 +1242,35 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                     # Render on-road (for reconstruction loss)
                     real_pkg = render(cam, gaussians, bg_color)
                     real_img = real_pkg["rgb"]
-                    viewspace_pts = real_pkg["viewspace_points"]
-                    visibility = real_pkg["visibility_filter"]
-                    radii = real_pkg["radii"]
 
                     # Render off-road (for adversarial loss)
                     fake_pkg = render(jit_cam, gaussians, bg_color)
                     fake_img = fake_pkg["rgb"]
 
+                    # Sky-composite both renders (matches the inference /
+                    # train_da2loss.py convention). sky_model is frozen,
+                    # so no extra trainable parameters are involved.
+                    real_comp = _compose_with_sky(
+                        real_img, real_pkg["acc"], cam, sky_model)
+                    fake_comp = _compose_with_sky(
+                        fake_img, fake_pkg["acc"], jit_cam, sky_model)
+
                     # --- Adversarial loss: fool the critic ---
-                    fake_score = critic(fake_img.unsqueeze(0))
-                    loss_adv = -fake_score.mean()
-                    # Clamp to prevent large adversarial gradients
-                    loss_adv = loss_adv.clamp(-50.0, 50.0)
+                    # Feed the composited fake to the critic so the
+                    # signal includes the sky region.
+                    fake_score = critic(fake_comp.unsqueeze(0))
+                    loss_adv = lambda_adv * (-fake_score.mean())
 
                     # --- Reconstruction loss on on-road view ---
-                    Ll1 = l1_loss(real_img, gt_image, mask)
+                    # L1 + D-SSIM on the composited image vs GT, using
+                    # the sky-inclusive ~moving_mask (same as
+                    # train_da2loss.py's moving_only_mask).
+                    lambda_l1 = optim_cfg.get("lambda_l1", 1.0)
+                    Ll1 = l1_loss(real_comp, gt_image, recon_mask)
                     loss_recon = (
-                        (1.0 - lambda_dssim) * Ll1 +
-                        lambda_dssim * (1.0 - ssim(real_img, gt_image, mask=mask)))
+                        (1.0 - lambda_dssim) * lambda_l1 * Ll1 +
+                        lambda_dssim * (1.0 - ssim(real_comp, gt_image,
+                                                    mask=recon_mask)))
 
                     # --- SH regularisation ---
                     lambda_sh = optim_cfg.get("lambda_sh_reg", 1e-3)
@@ -1266,10 +1318,15 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                     ep_gen_loss += loss_g.item()
                     ep_recon_loss += loss_recon.item()
 
-                    # Logging metrics (detached)
+                    # Logging metrics (detached, on composited images so
+                    # the numbers match the eval/test PSNR).
                     with torch.no_grad():
-                        cur_psnr_on = psnr(real_img, gt_image, mask).item()
-                        cur_psnr_off = psnr(fake_img, gt_image, mask).item()
+                        cur_psnr_on = psnr(
+                            real_comp.clamp(0.0, 1.0),
+                            gt_image, recon_mask).item()
+                        cur_psnr_off = psnr(
+                            fake_comp.clamp(0.0, 1.0),
+                            gt_image, recon_mask).item()
                         ep_psnr_on += cur_psnr_on
                         ep_psnr_off += cur_psnr_off
 
@@ -1289,25 +1346,17 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                     # Stash for end-of-epoch log images (last direction)
                     if dir_idx == len(_jitter_directions) - 1:
                         log_gt_on = gt_image.detach()
-                        _raw_on = real_img.detach()
                         log_depth_on = real_pkg["depth"].detach()
                         log_acc_on = real_pkg["acc"].detach()
-                        _raw_off = fake_img.detach()
                         log_depth_off = fake_pkg["depth"].detach()
                         log_acc_off = fake_pkg["acc"].detach()
                         log_sky_mask = sky_mask
                         log_moving_mask = moving_mask
                         log_mono_depth = cam.guidance.get("mono_depth")
-                        # Apply SH sky compositing for display panels
-                        if sky_model is not None:
-                            with torch.no_grad():
-                                _sky_on = _compute_sky_bg(cam, sky_model)
-                                log_render_on = (_raw_on + (1.0 - log_acc_on) * _sky_on).clamp(0.0, 1.0)
-                                _sky_off = _compute_sky_bg(jit_cam, sky_model)
-                                log_render_off = (_raw_off + (1.0 - log_acc_off) * _sky_off).clamp(0.0, 1.0)
-                        else:
-                            log_render_on = _raw_on
-                            log_render_off = _raw_off
+                        # Display the composited images (already computed
+                        # above for the loss); they include SH sky.
+                        log_render_on = real_comp.detach().clamp(0.0, 1.0)
+                        log_render_off = fake_comp.detach().clamp(0.0, 1.0)
 
                 ep_count += 1
 
@@ -1384,7 +1433,7 @@ def training_gan(cfg: dict, model_root: str, road_width: float,
                     mono_depth=log_mono_depth,
                 )
             except Exception:
-                pass
+                traceback.print_exc()
 
         # ── Evaluation every 10 epochs ────────────────────────────
         if epoch % 10 == 0 or epoch == gan_epochs:
@@ -1481,6 +1530,9 @@ def main():
         "--lambda_dssim", type=float, default=0.2,
         help="D-SSIM weight within reconstruction loss (default: 0.2).")
     parser.add_argument(
+        "--lambda_adv", type=float, default=1.0,
+        help="Adversarial loss weight on the generator step (default: 1.0).")
+    parser.add_argument(
         "--lr_critic", type=float, default=1e-4,
         help="Critic learning rate (default: 1e-4).")
     parser.add_argument(
@@ -1535,6 +1587,7 @@ def main():
         lambda_gp=args.lambda_gp,
         lambda_recon=args.lambda_recon,
         lambda_dssim=args.lambda_dssim,
+        lambda_adv=args.lambda_adv,
         lr_critic=args.lr_critic,
         lr_generator=args.lr_generator,
         road_width_warmup_epochs=args.road_width_warmup_epochs,

@@ -18,7 +18,12 @@ CUDA_VISIBLE_DEVICES=1 nohup python train_da2loss.py --config ./configs/gopromax
 
 
 # train_gan_da2loss
-CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan_da2loss.py     --config configs/gopromax_neighbour_150.yaml     --model_root output_version_18_150_da2loss_0.5     --epoch 150     --road_width 0.3     --road_width_init_frac 0.05     --road_width_warmup_epochs 20     --gan_epochs 100     --jitter_faces front back     --jitter_directions left right     --output_dir output_version_18_150_da2loss_0.5_gan_0.3_100     > output_version_18_150_da2loss_0.5_gan_0.3_100/train_gan_da2loss.log 2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup python -u train_gan_da2loss.py --config configs/gopromax_neighbour_300_tune.yaml /
+  --model_root output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune /
+  --epoch 300 --road_width 4 --road_width_init_frac 0.01 --road_width_warmup_epochs 20 /
+  --gan_epochs 100 --jitter_faces front back --jitter_directions left right /
+  --output_dir output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune_critic_100_v2 /
+  > output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune_critic_100_v2/train_gan_da2loss.log 2>&1 &
 
 # single spherical harmonic sky
 python render_spherical_harmonic_sky.py --config output_version_18_150_da2loss_0.5_skymodel/gopromax_neighbour/sky_mask_v1/config.yaml --mode trajectory
@@ -64,7 +69,7 @@ cat output/<task>/<exp>_gan/train_metrics.csv
 cat output/<task>/<exp>_gan/eval_metrics.csv
 
 # gan-style
-CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
+<!-- CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
     --config configs/gopromax_neighbour_180.yaml \
     --model_root output_version_15_180 \
     --epoch 180 \
@@ -88,24 +93,34 @@ CUDA_VISIBLE_DEVICES=0 nohup python -u train_gan.py \
     --jitter_faces front back \
     --jitter_directions left right \
     --output_dir output_version_18_150_da2loss_0.5_v2_gan_0.3_100 \
-    > output_version_18_150_da2loss_0.5_v2_gan_0.3_100/train_gan.log 2>&1 &
+    > output_version_18_150_da2loss_0.5_v2_gan_0.3_100/train_gan.log 2>&1 & -->
 
 # score distillation sampling
 # export HF_TOKEN=<your_token>
 python sds_score.py --model_id "Manojb/stable-diffusion-2-1-base" --image ./data/cubemap_faces/0001_back.jpg --prompt "A street level image of an outdoor scene"
 
 # SDS score vs. jitter distance plot
-python plot_sds_vs_jitter.py \
-    --img_name       0018_front \
+CUDA_VISIBLE_DEVICES=0 python plot_sds_vs_jitter.py \
+    --img_name       0017_front \
     --model_id "Manojb/stable-diffusion-2-1-base" \
     --model_path     output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune/gopromax_neighbour/sky_mask_v1/trained_model/epoch_300.pth \
     --cameras_json   output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune/gopromax_neighbour/sky_mask_v1/cameras.json \
     --output_dir     output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune/gopromax_neighbour/sky_mask_v1/sds_plot \
-    --min_dist 0.0 --max_dist 4 --num_dists 120 --fps 20 \
+    --min_dist 0.0 --max_dist 4 --num_dists 25 --fps 10 \
     --side right \
-    --prompt "A street level image of an outdoor scene"
+    --prompt "A street level image of an outdoor scene" \
+    --num_repeats 8 --num_samples 32 --errorbar_style band
 
-
+CUDA_VISIBLE_DEVICES=0 python plot_sds_vs_jitter.py \
+    --img_name       0017_front \
+    --model_id "Manojb/stable-diffusion-2-1-base" \
+    --model_path     output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune_critic_100_v2/gopromax_neighbour/sky_mask_v1_gan/trained_model/epoch_100.pth \
+    --cameras_json   output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune_critic_100_v2/gopromax_neighbour/sky_mask_v1_gan/cameras.json \
+    --output_dir     output/22_300_da2loss_0.5_skymodel_1_0.01_0.5_tune_critic_100_v2/gopromax_neighbour/sky_mask_v1_gan/sds_plot \
+    --min_dist 0.0 --max_dist 4 --num_dists 25 --fps 10 \
+    --side right \
+    --prompt "A street level image of an outdoor scene" \
+    --num_repeats 8 --num_samples 32 --errorbar_style band
 
 # render wobble
 python gopromax_neighbour/render_wobble.py \

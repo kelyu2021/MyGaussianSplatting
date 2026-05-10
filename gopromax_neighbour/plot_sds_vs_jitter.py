@@ -90,6 +90,16 @@ def main():
                         help='FPS for output video(s) (default: 10)')
     parser.add_argument('--save_renders', action='store_true',
                         help='Also save each rendered frame as a PNG')
+    parser.add_argument('--meters_per_unit', type=float, default=7.0,
+                        help='World units → meters scale for x-axis display. '
+                             'Estimate 7 m.')
+    parser.add_argument('--num_repeats', type=int, default=1,
+                        help='Number of independent SDS evaluations per distance '
+                             '(used to estimate mean/std). Default: 1.')
+    parser.add_argument('--errorbar_style', choices=['band', 'errorbar', 'both'],
+                        default='band',
+                        help='How to display variance: shaded band (±1 std), '
+                             'errorbars, or both. Default: band.')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -119,15 +129,34 @@ def main():
 
     # ---- Sweep distances ----------------------------------------------------
     distances = np.linspace(args.min_dist, args.max_dist, args.num_dists)
-    sds_scores = []
+    # all_scores[i] holds a list of independent SDS evaluations at distances[i]
+    all_scores = [[] for _ in range(len(distances))]
     video_frames_right = []
     video_frames_left  = []
+
+    def _score_for_side(frame_r, frame_l):
+        if args.side == 'right':
+            return compute_sds_score(Image.fromarray(frame_r), args.prompt,
+                                     num_samples=args.num_samples,
+                                     sd_components=sd_components)
+        elif args.side == 'left':
+            return compute_sds_score(Image.fromarray(frame_l), args.prompt,
+                                     num_samples=args.num_samples,
+                                     sd_components=sd_components)
+        else:  # both – average right and left
+            sr = compute_sds_score(Image.fromarray(frame_r), args.prompt,
+                                   num_samples=args.num_samples,
+                                   sd_components=sd_components)
+            sl = compute_sds_score(Image.fromarray(frame_l), args.prompt,
+                                   num_samples=args.num_samples,
+                                   sd_components=sd_components)
+            return (sr + sl) / 2.0
 
     for idx, dist in enumerate(distances):
         print(f"[{idx+1}/{len(distances)}] distance = {dist:.4f}")
 
-        # Always render both sides (needed for combined video).
-        # SDS is only computed for the requested side(s).
+        # Render once per position (geometry is deterministic). SDS is the
+        # stochastic part – we re-evaluate it `num_repeats` times for stats.
         frame_r = render_at_offset(gaussians, bg_color, caminfo_base,  dist, sky_model)
         frame_l = render_at_offset(gaussians, bg_color, caminfo_base, -dist, sky_model)
         video_frames_right.append(frame_r)
@@ -139,38 +168,35 @@ def main():
             Image.fromarray(frame_l).save(
                 os.path.join(args.output_dir, f'render_{idx+1:04d}_left_{dist:.4f}.png'))
 
-        if args.side == 'right':
-            score = compute_sds_score(Image.fromarray(frame_r), args.prompt,
-                                      num_samples=args.num_samples,
-                                      sd_components=sd_components)
-        elif args.side == 'left':
-            score = compute_sds_score(Image.fromarray(frame_l), args.prompt,
-                                      num_samples=args.num_samples,
-                                      sd_components=sd_components)
-        else:  # both – average right and left
-            score_r = compute_sds_score(Image.fromarray(frame_r), args.prompt,
-                                        num_samples=args.num_samples,
-                                        sd_components=sd_components)
-            score_l = compute_sds_score(Image.fromarray(frame_l), args.prompt,
-                                        num_samples=args.num_samples,
-                                        sd_components=sd_components)
-            score = (score_r + score_l) / 2.0
+        for rep in range(args.num_repeats):
+            score = _score_for_side(frame_r, frame_l)
+            all_scores[idx].append(score)
+            print(f"    rep {rep+1}/{args.num_repeats} SDS = {score:.6f}")
 
-        sds_scores.append(score)
-        print(f"    SDS score = {score:.6f}")
+    scores_arr = np.array(all_scores, dtype=np.float64)  # (num_dists, num_repeats)
+    sds_mean = scores_arr.mean(axis=1)
+    sds_std  = scores_arr.std(axis=1, ddof=1) if args.num_repeats > 1 else np.zeros_like(sds_mean)
 
     # ---- Save raw data (npz + csv) ------------------------------------------
     base_name = os.path.splitext(os.path.basename(args.img_name))[0]
     data_path = os.path.join(args.output_dir, f'{base_name}_sds_vs_jitter.npz')
-    np.savez(data_path, distances=distances, sds_scores=np.array(sds_scores))
+    np.savez(data_path,
+             distances=distances,
+             sds_scores_all=scores_arr,
+             sds_mean=sds_mean,
+             sds_std=sds_std)
     print(f"Raw data saved to {data_path}")
 
     csv_path = os.path.join(args.output_dir, f'{base_name}_sds_vs_jitter.csv')
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['jitter_distance', 'sds_score'])
-        for dist, score in zip(distances, sds_scores):
-            writer.writerow([f'{dist:.6f}', f'{score:.8f}'])
+        header = ['jitter_distance', 'sds_mean', 'sds_std'] + \
+                 [f'sds_rep_{i+1}' for i in range(args.num_repeats)]
+        writer.writerow(header)
+        for i, dist in enumerate(distances):
+            row = [f'{dist:.6f}', f'{sds_mean[i]:.8f}', f'{sds_std[i]:.8f}'] + \
+                  [f'{s:.8f}' for s in scores_arr[i]]
+            writer.writerow(row)
     print(f"CSV saved to {csv_path}")
 
     # ---- Save video(s) -----------------------------------------------------
@@ -198,8 +224,29 @@ def main():
 
     # ---- Plot ---------------------------------------------------------------
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(distances, sds_scores, marker='o', linewidth=1.5, markersize=5)
-    ax.set_xlabel('Jitter distance')
+    distances_m = distances * args.meters_per_unit
+
+    # Mean line
+    ax.plot(distances_m, sds_mean, marker='o', linewidth=1.5, markersize=5,
+            color='C0', label=f'mean (n={args.num_repeats})')
+
+    # Variance display
+    if args.num_repeats > 1:
+        if args.errorbar_style in ('band', 'both'):
+            ax.fill_between(distances_m,
+                            sds_mean - sds_std,
+                            sds_mean + sds_std,
+                            alpha=0.25, color='C0', label='±1 std')
+        if args.errorbar_style in ('errorbar', 'both'):
+            ax.errorbar(distances_m, sds_mean, yerr=sds_std,
+                        fmt='none', ecolor='C0', capsize=3, alpha=0.8)
+        # Scatter raw samples for transparency
+        for i, d in enumerate(distances_m):
+            ax.scatter(np.full(args.num_repeats, d), scores_arr[i],
+                       s=8, color='C0', alpha=0.3, zorder=1)
+        ax.legend(loc='best', fontsize=8)
+
+    ax.set_xlabel('Jitter distance (m)')
     ax.set_ylabel('SDS score (lower = more realistic)')
     ax.set_title(f'SDS score vs. lateral jitter — {base_name}')
     ax.grid(True, linestyle='--', alpha=0.5)
