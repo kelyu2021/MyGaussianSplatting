@@ -24,24 +24,26 @@ cp data/colmap_pointcloud_dense/fused.ply \
 cd /home/lyuk4/GitHub/MyGaussianSplatting/gaussian-splatting 
 conda activate gopro_360 
 
-CUDA_VISIBLE_DEVICES=0 python train_neighbour.py \
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour.py \
   -s data/colmap_pointcloud_sparse \
   --images ../cubemap_faces \
   --depths ../cubemap_faces_da2_png \
   --depth_l1_weight_init 1.0 \
   --depth_l1_weight_final 0.01 \
   -m output/run_01 \
-  --disable_viewer
+  --disable_viewer > train.log 2>&1 &
 
 cd C:\Users\lyuk4\Documents\MiamiUniversity\GaussianSplatting\viewers\bin
 
 ./SIBR_viewers/install/bin/SIBR_gaussianViewer_app \
   -m output/run_01
 
+CUDA_VISIBLE_DEVICES=1 python render.py -m output/run_01
+CUDA_VISIBLE_DEVICES=1 python render.py -m output/run_01 --skip_train
 
 # Render only (no SDS scoring, much faster):
 CUDA_VISIBLE_DEVICES=0 python plot_sds_vs_jitter.py \
-  --img_name    0001_front \
+  --img_name    0017_front \
   --model_dir   output/run_01 \
   --output_dir  output/run_01/sds_plot \
   --min_dist    0.0 \
@@ -53,10 +55,10 @@ CUDA_VISIBLE_DEVICES=0 python plot_sds_vs_jitter.py \
 
 # With SDS scoring:
 CUDA_VISIBLE_DEVICES=0 python plot_sds_vs_jitter.py \
-  --img_name    0001_front \
+  --img_name    0019_front \
   --model_dir   output/run_01 \
   --output_dir  output/run_01/sds_plot \
-  --min_dist 0.0 --max_dist 4 --fps 10 \
-  --num_dists 25 --num_repeats 8 --num_samples 32 --errorbar_style band
+  --min_dist 0.0 --max_dist 12 --fps 10 \
+  --num_dists 25 --num_repeats 8 --num_samples 32 --errorbar_style band \
   --prompt      "A street level image of an outdoor scene" \
   --model_id    "Manojb/stable-diffusion-2-1-base"

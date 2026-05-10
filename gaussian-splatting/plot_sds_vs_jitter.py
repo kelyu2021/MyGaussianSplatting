@@ -82,7 +82,7 @@ def make_camera(cam_dict, R: np.ndarray, T: np.ndarray, uid: int = 0) -> Camera:
     explicit (R, T) pair.
 
     cameras.json convention (written by camera_to_JSON):
-        rotation  : R  (3×3, world-to-camera rotation matrix)
+        rotation  : R  (3×3, camera-to-world rotation matrix, i.e. R_c2w)
         position  : camera centre in world coordinates
         fx, fy    : focal lengths in pixels
         width, height
@@ -120,22 +120,23 @@ def jitter_camera(cam_dict, offset_m: float) -> Camera:
     camera's right axis (+offset → right, -offset → left).
 
     cameras.json stores:
-        rotation  : R_w2c  (3×3)  — world-to-camera rotation
-        position  : C      (3,)   — camera centre in world coordinates
+        rotation  : R_c2w  (3×3, camera-to-world rotation matrix,
+                            written by camera_to_JSON as W2C[:3,:3]
+                            where W2C = inv(extrinsic))
+        position  : camera centre in world coordinates
 
-    Relationship:  T (tvec) = R_w2c @ (-C)  = -R_w2c @ C
-    The right axis in world coords is the first column of R_c2w = R_w2c.T,
-    i.e.  right_world = R_w2c[0, :]   (first row of R_w2c, which equals
-                                        first column of R_c2w).
+    Relationship:  T (tvec) = R_w2c @ (-C)  = -R_c2w.T @ C
+    The right axis in world coords is the first *column* of R_c2w,
+    i.e.  right_world = R_c2w[:, 0].
     """
-    R_w2c = np.array(cam_dict['rotation'], dtype=np.float64)   # (3,3)
+    R_c2w = np.array(cam_dict['rotation'], dtype=np.float64)   # (3,3)
     C     = np.array(cam_dict['position'], dtype=np.float64)   # (3,)
 
-    right_world = R_w2c[0, :]          # unit right vector in world coords
+    right_world = R_c2w[:, 0]          # unit right vector in world coords (first column of R_c2w)
     C_new       = C + right_world * offset_m
-    T_new       = -R_w2c @ C_new       # tvec for new position
+    T_new       = -(R_c2w.T) @ C_new  # tvec for new position: R_w2c @ (-C_new)
 
-    return make_camera(cam_dict, R=R_w2c.astype(np.float32),
+    return make_camera(cam_dict, R=R_c2w.astype(np.float32),
                        T=T_new.astype(np.float32))
 
 
@@ -227,7 +228,7 @@ def main():
                         help='FPS for output video(s)')
     parser.add_argument('--save_renders', action='store_true',
                         help='Save each frame as a PNG')
-    parser.add_argument('--meters_per_unit', type=float, default=5,
+    parser.add_argument('--meters_per_unit', type=float, default=2,
                         help='World-unit → metres scale for x-axis (default 1)')
     parser.add_argument('--errorbar_style',
                         choices=['band', 'errorbar', 'both'], default='band')
@@ -276,6 +277,11 @@ def main():
     frames_right = []
     frames_left  = []
 
+    # Per-image subfolder for frames
+    base_name = args.img_name
+    frames_dir = os.path.join(args.output_dir, base_name)
+    os.makedirs(frames_dir, exist_ok=True)
+
     for idx, dist in enumerate(distances):
         print(f"[{idx+1}/{len(distances)}] offset = {dist:.4f} world units")
 
@@ -286,13 +292,13 @@ def main():
         frames_right.append(frame_r)
         frames_left.append(frame_l)
 
-        if args.save_renders:
-            Image.fromarray(frame_r).save(
-                os.path.join(args.output_dir,
-                             f'render_{idx+1:04d}_right_{dist:.4f}.png'))
-            Image.fromarray(frame_l).save(
-                os.path.join(args.output_dir,
-                             f'render_{idx+1:04d}_left_{dist:.4f}.png'))
+        # Always save every rendered frame into the per-image subfolder
+        Image.fromarray(frame_r).save(
+            os.path.join(frames_dir,
+                         f'render_{idx+1:04d}_right_{dist:.4f}.png'))
+        Image.fromarray(frame_l).save(
+            os.path.join(frames_dir,
+                         f'render_{idx+1:04d}_left_{dist:.4f}.png'))
 
         if not args.skip_sds:
             for rep in range(args.num_repeats):
@@ -321,7 +327,6 @@ def main():
                 print(f"    rep {rep+1}/{args.num_repeats} SDS = {score:.6f}")
 
     # ---- Save videos -------------------------------------------------------
-    base_name = args.img_name
     for tag, frames in [('right', frames_right), ('left', frames_left)]:
         vid_path = os.path.join(args.output_dir, f'{base_name}_{tag}.mp4')
         imageio.mimwrite(vid_path, frames, fps=args.fps, quality=8)
