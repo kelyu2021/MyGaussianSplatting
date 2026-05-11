@@ -21,9 +21,9 @@ data:
   split_test: 8
   max_frames: 30    # set to 0 to use all frames
   point_cloud_path: data/colmap_pointcloud_dense/fused.ply
-  mask_dir: data/cubemap_faces_mass13k_manual
+  # mask_dir: data/cubemap_faces_mass13k_manual
   depth_dir: data/cubemap_faces_da2
-  # Cubemap face images (original, converted from panoramic)
+  moving_mask_dir: data/cubemap_faces_sam_moving
   images: data/cubemap_faces
 
 model:
