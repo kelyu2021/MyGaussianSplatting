@@ -1456,29 +1456,21 @@ DEFAULT_CFG = {
     "task": "gopromax_neighbour",
     "exp_name": "default",
     "output_root": "output",
-    "gpus": [0],
-    "source_path": "data/colmap_pointcloud_dense",
+    "gpus": [0, 1],
+    "source_path": "",
 
     "data": {
         "white_background": False,
         "split_test": 8,
-        "point_cloud_path": "data/colmap_pointcloud_dense/fused.ply",
-        "mask_dir": "data/cubemap_faces_mass13k",
-        "moving_mask_dir": "data/cubemap_faces_sam_moving",
-        "images": "data/cubemap_faces",
+        "point_cloud_path": "",
+        "mask_dir": "",
+        "moving_mask_dir": "",
+        "images": "",
     },
 
     "model": {
         "sh_degree": 3,
     },
-
-    "train": {
-        "epochs": 180,
-        "test_epochs": [30, 60, 90, 120, 150, 180],
-        "save_epochs": [180],
-        "checkpoint_epochs": [60, 120, 180],
-    },
-
     "optim": {
         "position_lr_init": 0.00016,
         "position_lr_final": 1.6e-06,

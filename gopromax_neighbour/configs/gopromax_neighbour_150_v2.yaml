@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────────────
+#  GoPro Max Neighbour – Gaussian Splatting with Sky Mask
+# ─────────────────────────────────────────────────────────────────────
+#
+#  Usage:
+#      cd MyGaussianSplatting/gopromax_neighbour
+#      python train.py --cfg_file configs/gopromax_neighbour.yaml
+#
+#  All relative paths are resolved from the workspace (cwd).
+
+task: gopromax_neighbour
+exp_name: without_sky_mask_epoch_150
+gpus: [0, 1]
+
+# COLMAP model directory (contains sparse/ and fused.ply)
+source_path: data/colmap_pointcloud_dense
+
+data:
+  type: GOPROMAX_NEIGHBOUR
+  white_background: false
+  split_test: 8
+  max_frames: 30    # set to 0 to use all frames
+  point_cloud_path: data/colmap_pointcloud_dense/fused.ply
+  # mask_dir: data/cubemap_faces_mass13k_manual
+  depth_dir: data/cubemap_faces_da2
+  moving_mask_dir: data/cubemap_faces_sam_moving
+  # Cubemap face images (original, converted from panoramic)
+  images: data/cubemap_faces
+
+model:
+  gaussian:
+    sh_degree: 3
+
+train:
+  epochs: 150
+  test_epochs: [5, 10, 15, 20, 25, 50, 75, 100, 125, 150]
+  save_epochs: [50, 100, 150]
+  checkpoint_epochs: [50, 100, 150]
+
+optim:
+  densify_from_epoch: 10
+  densify_until_epoch: 120
+  position_lr_init: 0.000016
+  position_lr_final: 0.0000016
+  position_lr_max_epochs: 150
+  opacity_reset_epoch_interval: 5
+  prune_epoch_interval: 5
+  prune_min_opacity: 0.003
+  lambda_l1: 1.0
+  lambda_dssim: 0.2
+  lambda_sky: 1    # supervise sky region with a constant blue color (data/cubemap_faces_mass13k_manual)
+  lambda_sky_acc: 0.01    # accumulate sky supervision gradients over multiple epochs (for stability)
+  lambda_color_correction: 0.001
+  lambda_depth: 1    # monocular depth supervision (data/cubemap_faces_da2)
+  lambda_opacity_entropy: 0    # encourage sharper opacity (non-empty) distributions
+  lambda_acc_mask: 0.5         # BCE loss pushing rendered acc to GT mask
+  scaling_lr: 0.0001
