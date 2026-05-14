@@ -1578,14 +1578,17 @@ def prepare_output(cfg: dict, workspace: str):
 
 def save_log_images(log_dir: str, epoch: int, gt, rendered, depth_premul, acc,
                     gt_depth=None, gt_acc=None,
-                    composited=None, sky_bg=None):
+                    composited=None, sky_bg=None,
+                    sky_region=None):
     """Save a visualisation grid.
 
-    Row 1: GT RGB           | GT opacity          | GT depth
+    Row 1: GT RGB           | 1-sky_region mask   | GT depth
     Row 2: raw render (blk) | predicted opacity   | predicted depth
     Row 3: composited RGB   | SH sky background   | (empty)
 
     Row 3 is only added when composited / sky_bg are provided.
+    sky_region: (1,H,W) float tensor, 1=sky 0=non-sky (same as used in training).
+    Row 1 col 2 shows 1-sky_region so white=non-sky, black=sky.
     """
     import torchvision
     gt_np = gt.detach().cpu()
@@ -1716,7 +1719,17 @@ def save_log_images(log_dir: str, epoch: int, gt, rendered, depth_premul, acc,
     else:
         d = _depth_to_3ch(pred_d_t)
 
-    ga = _mask_to_3ch(gt_acc)
+    # Row 1 col 2: 1 - sky_region (white=non-sky/valid, black=sky)
+    # Falls back to gt_acc (sky mask) if sky_region not provided.
+    if sky_region is not None:
+        sr = sky_region.detach().cpu().float() if hasattr(sky_region, 'detach') \
+            else torch.as_tensor(sky_region).float()
+        sr = sr.squeeze()
+        if sr.ndim == 2:
+            sr = sr.unsqueeze(0)
+        ga = (1.0 - sr).clamp(0.0, 1.0).expand(3, -1, -1).contiguous()
+    else:
+        ga = _mask_to_3ch(gt_acc)
     a  = _mask_to_3ch(acc)
 
     panels = [gt_np, ga, gd, rn_np, a, d]
@@ -1862,20 +1875,28 @@ def evaluate(
             # ── GT panels ────────────────────────────────────────────
             gt_rgb_img = _to_rgb_uint8(gt[:3])
 
-            gt_mask = cam.guidance.get("mask")
-            if gt_mask is not None:
-                m = gt_mask.detach().float().cpu().numpy().squeeze()
-                gt_mask_img = np.stack(
-                    [(np.clip(m, 0, 1) * 255).astype(np.uint8)] * 3, axis=-1)
-            else:
-                gt_mask_img = np.zeros((H, W, 3), dtype=np.uint8)
-
+            # Fetch mono_depth first — needed by both the sky mask fallback
+            # and the GT depth panel below.
             mono_depth = cam.guidance.get("mono_depth")
             if mono_depth is not None:
                 md = mono_depth.detach().cpu().numpy().squeeze() \
                     if torch.is_tensor(mono_depth) else np.asarray(mono_depth).squeeze()
             else:
                 md = None
+
+            # Row 1 col 2: sky mask – primary source is mask_dir (mask=1
+            # means valid/non-sky).  Fallback: DA-v2 disparity==0 → sky.
+            gt_sky_mask = cam.guidance.get("mask")
+            if gt_sky_mask is not None:
+                m = gt_sky_mask.detach().float().cpu().numpy().squeeze()
+                gt_mask_img = np.stack(
+                    [(np.clip(m, 0, 1) * 255).astype(np.uint8)] * 3, axis=-1)
+            elif mono_depth is not None:
+                # depth==0 → sky; invert so white=non-sky, black=sky
+                non_sky_f = (md != 0).astype(np.uint8) * 255
+                gt_mask_img = np.stack([non_sky_f] * 3, axis=-1)
+            else:
+                gt_mask_img = np.zeros((H, W, 3), dtype=np.uint8)
 
             # ── Predicted panels ─────────────────────────────────────
             pred_rgb_img = _to_rgb_uint8(composited_eval)
@@ -1892,23 +1913,6 @@ def evaluate(
             # leak with acc < 0.05 and cause bright outliers after disparity
             # inversion.
             pred_valid = acc_np > 5e-2
-            # If a GT non-sky mask is available, erode it by a few pixels
-            # so 1-px boundary leakage is excluded too.
-            if gt_mask is not None:
-                gm = gt_mask.detach().float().cpu().numpy().squeeze()
-                if gm.shape == pred_valid.shape:
-                    non_sky = (gm > 0.5).astype(np.float32)
-                    # Min-pool erosion via OpenCV-free trick: sliding min.
-                    k = 5
-                    pad = k // 2
-                    padded = np.pad(non_sky, pad, mode="edge")
-                    eroded = np.ones_like(non_sky)
-                    for di in range(k):
-                        for dj in range(k):
-                            eroded = np.minimum(
-                                eroded, padded[di:di + non_sky.shape[0],
-                                               dj:dj + non_sky.shape[1]])
-                    pred_valid = pred_valid & (eroded > 0.5)
             depth_np = np.zeros_like(depth_premul_np, dtype=np.float32)
             depth_np[pred_valid] = (
                 depth_premul_np[pred_valid]
@@ -2190,6 +2194,7 @@ def training(cfg: dict):
         epoch_psnr_sum = 0.0
         epoch_ssim_sum = 0.0
         epoch_count = 0
+        _sky_region = None   # last sky region mask; updated each camera iter
 
         # ── Increase SH degree every 3 epochs ────────────────────────
         if epoch % 3 == 0:
@@ -2207,11 +2212,29 @@ def training(cfg: dict):
                         if not gt_image.is_cuda else gt_image)
 
             # ── Sky mask ──────────────────────────────────────────────
-            sky_mask = None
+            # ── Sky / Ground masks ────────────────────────────────────
+            # Convention (more readable):
+            #   sky_mask    : True where pixel IS sky        (1 = sky)
+            #   ground_mask : True where pixel is non-sky    (1 = ground)
+            # Source priority for ground_mask:
+            #   1) explicit mask from mask_dir (accurate; used for SH
+            #      training and RGB gradient routing)
+            #   2) DA-v2 depth>0 proxy (low quality; only used as a
+            #      fallback for the sky-acc penalty below)
+            ground_mask = None  # bool, True = non-sky pixel
+            sky_mask = None     # bool, True = sky pixel
+            sky_proxy = None    # bool, True = sky from depth==0 (low quality)
+
             if "mask" in cam.guidance:
-                sky_mask = cam.guidance["mask"]
-                sky_mask = (sky_mask.cuda(non_blocking=True)
-                            if not sky_mask.is_cuda else sky_mask)
+                ground_mask = cam.guidance["mask"]
+                ground_mask = (ground_mask.cuda(non_blocking=True)
+                               if not ground_mask.is_cuda else ground_mask)
+                sky_mask = ~ground_mask
+            if "mono_depth" in cam.guidance:
+                _md_sky = cam.guidance["mono_depth"]
+                _md_sky = (_md_sky.cuda(non_blocking=True)
+                           if not _md_sky.is_cuda else _md_sky)
+                sky_proxy = (_md_sky == 0)
 
             # ── Moving object mask ────────────────────────────────────
             moving_mask = None
@@ -2222,7 +2245,9 @@ def training(cfg: dict):
 
             # ── Combined mask (exclude sky + moving objects) ──────────
             # Used for depth loss (sky has no depth) and for logging.
-            mask = sky_mask
+            mask = ground_mask
+            if mask is not None and moving_mask is None:
+                mask = mask
             if mask is not None and moving_mask is not None:
                 mask = mask & (~moving_mask)
             elif moving_mask is not None:
@@ -2254,39 +2279,39 @@ def training(cfg: dict):
 
             # ── RGB loss (L1 + D-SSIM) on all pixels (sky included) ───
             # The SH sky model must only receive gradients from sky pixels:
-            # detach sky_bg in the non-sky (foreground) region so that the
-            # main RGB loss trains only the splats there.  In the sky region
-            # sky_bg keeps its full gradient so the SH model is supervised.
+            # detach sky_bg in the ground (non-sky) region so that the
+            # main RGB loss trains only the splats there.  In the sky
+            # region sky_bg keeps its full gradient so the SH model is
+            # supervised.
             lambda_l1 = optim_cfg.get("lambda_l1", 1.0)
             lambda_dssim = optim_cfg.get("lambda_dssim", 0.2)
 
-            if sky_mask is not None:
-                fg_region = sky_mask.float()          # 1 = non-sky, 0 = sky
-                # Non-sky: detach sky_bg (no gradient to SH model)
-                # Sky:     keep sky_bg gradient (SH model trained here)
-                sky_bg_for_loss = (
-                    sky_bg.detach() * fg_region +
-                    sky_bg          * (1.0 - fg_region))
+            if ground_mask is not None:
+                ground_f = ground_mask.float()        # 1 = ground, 0 = sky
+                sky_f    = 1.0 - ground_f             # 1 = sky,    0 = ground
+                # Ground: detach sky_bg (no gradient to SH model)
+                # Sky:    keep sky_bg gradient (SH model trained here)
+                sky_bg_for_loss = sky_bg.detach() * ground_f + sky_bg * sky_f
                 composited_for_loss = image + (1.0 - acc) * sky_bg_for_loss
             else:
                 composited_for_loss = composited
 
-            Ll1 = l1_loss(composited_for_loss, gt_image, moving_only_mask)
+            Ll1 = l1_loss(composited_for_loss, gt_image, None)
             scalar_dict["l1_loss"] = Ll1.item()
 
             loss = (
                 (1.0 - lambda_dssim) * lambda_l1 * Ll1 +
-                lambda_dssim * (1.0 - ssim(composited_for_loss, gt_image, mask=moving_only_mask)))
+                lambda_dssim * (1.0 - ssim(composited_for_loss, gt_image, mask=None)))
 
             # ── Sky SH loss (sky pixels only) ─────────────────────────
             # sky_bg is NOT detached here, so gradients flow to the SH
             # model. sky_bg has no splat parameters, so splats are safe.
-            # Foreground pixels are excluded (sky_region_f == 0 there),
-            # so the SH model only trains on actual sky pixels.
+            # Ground pixels are excluded (sky_f == 0 there), so the SH
+            # model only trains on actual sky pixels.
             if lambda_sky > 0 and sky_mask is not None:
-                sky_region_f = (1.0 - sky_mask.float())        # 1 where sky
+                sky_f = sky_mask.float()                       # 1 where sky
                 sky_sh_loss = lambda_sky * (
-                    sky_bg * sky_region_f - gt_image * sky_region_f
+                    sky_bg * sky_f - gt_image * sky_f
                 ).abs().mean()
                 scalar_dict["sky_sh_loss"] = sky_sh_loss.item()
                 loss += sky_sh_loss
@@ -2300,20 +2325,51 @@ def training(cfg: dict):
                 loss += sh_reg
 
             # ── Sky opacity penalty ───────────────────────────────────
-            #     Push acc → 0 in sky regions (where sky_mask == False)
+            #     Push acc → 0 in sky regions so no Gaussians float there.
+            #     Use explicit sky_mask if available, else fall back to
+            #     DA-v2 depth==0 proxy (cheap and reasonably accurate for
+            #     this purpose; false positives only locally suppress
+            #     opacity, they do NOT corrupt the SH sky model).
             lambda_sky_acc = optim_cfg.get("lambda_sky_acc", 0.01)
-            if lambda_sky_acc > 0 and sky_mask is not None:
-                sky_region = 1.0 - sky_mask.float()     # 1 where sky
-                sky_acc_loss = lambda_sky_acc * (acc * sky_region).mean()
-                scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
-                loss += sky_acc_loss
+            if lambda_sky_acc > 0:
+                _sky_region = None
+
+                if sky_mask is not None:
+                    _sky_region = sky_mask.float()             # 1 where sky
+                    _ground_region = 1.0 - _sky_region.float()   # 1 where ground
+                elif sky_proxy is not None:
+                    _sky_region = sky_proxy.float()            # 1 where sky
+                    _ground_region = 1.0 - _sky_region.float()   # 1 where ground
+
+                if _sky_region is not None:
+                    # sky_acc_loss = lambda_sky_acc * (acc * _sky_region).mean()
+                    sky_acc_loss = lambda_sky_acc * (
+                        (acc * _sky_region).mean() +
+                        ((1.0 - acc) * _ground_region).mean()
+                    )
+                    scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
+                    loss += sky_acc_loss
 
             # ── Opacity entropy regularisation ─────────────────────
             #     Push opacity toward 0 or 1 to prevent semi-transparent
             #     layers stacking at incorrect depths.
+            #
+            #     IMPORTANT: only apply this term to *visible* Gaussians
+            #     (those that contributed to the current view).  The
+            #     entropy gradient ``log((1-p)/p)`` is bistable around
+            #     p=0.5: any opacity below 0.5 is pushed toward 0.  Right
+            #     after ``reset_opacity()`` *every* opacity is clamped to
+            #     ~0.01, so applying this loss indiscriminately drives
+            #     all invisible Gaussians (which receive no RGB
+            #     counter-gradient) below ``min_opacity`` within ~100
+            #     iterations.  The next densify-and-prune call then mass-
+            #     prunes the entire point cloud, collapsing the renders
+            #     to black.  Restricting the loss to visible Gaussians
+            #     gives them a chance to be pulled up by the RGB
+            #     gradient and leaves the rest untouched.
             lambda_oe = optim_cfg.get("lambda_opacity_entropy", 0.0)
-            if lambda_oe > 0:
-                o = gaussians.get_opacity.clamp(1e-6, 1.0 - 1e-6)
+            if lambda_oe > 0 and visibility.any():
+                o = gaussians.get_opacity[visibility].clamp(1e-6, 1.0 - 1e-6)
                 oe_loss = lambda_oe * -(o * o.log() + (1 - o) * (1 - o).log()).mean()
                 scalar_dict["opacity_entropy_loss"] = oe_loss.item()
                 loss += oe_loss
@@ -2325,7 +2381,7 @@ def training(cfg: dict):
                 mono_depth = (mono_depth.cuda(non_blocking=True)
                               if not mono_depth.is_cuda else mono_depth)
                 d_loss = lambda_depth * depth_mono_loss(
-                    depth_premul, mono_depth, acc, mask)
+                    depth_premul, mono_depth, acc, None)
                 scalar_dict["depth_loss"] = d_loss.item()
                 loss += d_loss
 
@@ -2333,8 +2389,8 @@ def training(cfg: dict):
 
             # ── SSIM / PSNR for logging (detached) ────────────────────
             with torch.no_grad():
-                ssim_val = ssim(image, gt_image, mask=mask).item()
-                psnr_val = psnr(image, gt_image, mask).item()
+                ssim_val = ssim(composited, gt_image, mask=None).item()
+                psnr_val = psnr(composited, gt_image, mask=None).item()
                 scalar_dict["ssim"] = ssim_val
                 scalar_dict["psnr"] = psnr_val
 
@@ -2470,9 +2526,10 @@ def training(cfg: dict):
                         dirs["log_images_dir"], epoch,
                         gt_image, image, depth_premul, acc,
                         gt_depth=cam.guidance.get("mono_depth"),
-                        gt_acc=cam.guidance.get("mask"),
+                        gt_acc=mask,
                         composited=composited,
-                        sky_bg=sky_bg)
+                        sky_bg=sky_bg,
+                        sky_region=_sky_region)
                 except Exception as e:
                     tqdm.write(f"  [E{epoch}] log image save failed: {e}")
 

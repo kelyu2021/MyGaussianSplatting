@@ -21,7 +21,7 @@ data:
   split_test: 8
   max_frames: 30    # set to 0 to use all frames
   point_cloud_path: data/colmap_pointcloud_dense/fused.ply
-  # mask_dir: data/cubemap_faces_mass13k_manual
+  mask_dir: ""
   depth_dir: data/cubemap_faces_da2
   moving_mask_dir: data/cubemap_faces_sam_moving
   # Cubemap face images (original, converted from panoramic)
@@ -49,9 +49,8 @@ optim:
   lambda_l1: 1.0
   lambda_dssim: 0.2
   lambda_sky: 1    # supervise sky region with a constant blue color (data/cubemap_faces_mass13k_manual)
-  lambda_sky_acc: 0.01    # accumulate sky supervision gradients over multiple epochs (for stability)
+  lambda_sky_acc: 0.5    # accumulate sky supervision gradients over multiple epochs (for stability)
   lambda_color_correction: 0.001
-  lambda_depth: 4    # monocular depth supervision (data/cubemap_faces_da2)
-  lambda_opacity_entropy: 0    # encourage sharper opacity (non-empty) distributions
-  lambda_acc_mask: 1       # BCE loss pushing rendered acc to GT mask
-  scaling_lr: 0.0001
+  lambda_depth: 0.5   # monocular depth supervision (data/cubemap_faces_da2)
+  lambda_opacity_entropy: 0.005    # encourage sharper opacity (non-empty) distributions
+  scaling_lr: 0.0005
