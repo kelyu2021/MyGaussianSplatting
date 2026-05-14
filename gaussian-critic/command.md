@@ -8,12 +8,13 @@ python depth_anything_v2.py \
     --output_dir data/da2
 
 # sparse point cloud
-python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 0 --matcher exhaustive
+python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --sky_mask_dir data/mass13k_manual --output_dir data/colmap_pointcloud_sparse --use_gpu 0 --matcher exhaustive
 
 # dense point cloud
 python colmap_pointcloud_dense.py \
   --sparse_dir data/colmap_pointcloud_sparse/sparse/0 \
   --image_dir data/cubemap_faces \
+  ----sky_mask_dir data/mass13k_manual \
   --output_dir data/colmap_pointcloud_dense \
   --use_gpu 0
 
