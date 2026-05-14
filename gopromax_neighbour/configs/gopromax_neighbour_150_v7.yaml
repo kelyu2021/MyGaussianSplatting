@@ -39,11 +39,11 @@ train:
 
 optim:
   densify_from_epoch: 10
-  densify_until_epoch: 120
+  densify_until_epoch: 150
   position_lr_init: 0.000016
   position_lr_final: 0.0000016
   position_lr_max_epochs: 150
-  opacity_reset_epoch_interval: 5
+  opacity_reset_epoch_interval: 20
   prune_epoch_interval: 5
   prune_min_opacity: 0.003
   lambda_l1: 1.0
