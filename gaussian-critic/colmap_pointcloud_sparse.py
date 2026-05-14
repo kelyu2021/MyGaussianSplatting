@@ -93,6 +93,7 @@ def main() -> None:
             colmap, "exhaustive_matcher",
             "--database_path", str(db),
             "--SiftMatching.use_gpu", gpu,
+            "--SiftMatching.num_threads", "1",
         ], "Exhaustive feature matching")
     else:
         run_colmap([

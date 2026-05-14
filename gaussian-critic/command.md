@@ -1,5 +1,12 @@
 # -------------------------------------prepare date and setup env start---------------------------------
 
+## depth data
+cd gopromax_neighbour
+python depth_anything_v2.py \
+    --image_dir  data/cubemap_faces \
+    --mask_dir   data/mass13k_manual \
+    --output_dir data/da2
+
 # sparse point cloud
 python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 0 --matcher exhaustive
 
@@ -10,7 +17,7 @@ python colmap_pointcloud_dense.py \
   --output_dir data/colmap_pointcloud_dense \
   --use_gpu 0
 
-# Step 1: convert .npy → 16-bit inverse-depth PNGs
+# Step 1: convert .npy → 16-bit inverse-depth PNGs ? do not need
 python utils/convert_depth_npy_to_png.py \
   --input_dir  data/cubemap_faces_da2 \
   --output_dir data/cubemap_faces_da2_png
@@ -18,7 +25,7 @@ python utils/convert_depth_npy_to_png.py \
 # Step 2: compute scale/offset alignment with COLMAP
 python utils/make_depth_scale.py \
   --base_dir data/colmap_pointcloud_sparse \
-  --depths_dir data/cubemap_faces_da2_png
+  --depths_dir data/cubemap_faces_da2
 
 cp data/colmap_pointcloud_dense/fused.ply \
    data/colmap_pointcloud_sparse/sparse/0/points3D.ply
@@ -32,13 +39,13 @@ conda activate gopro_360
 CUDA_VISIBLE_DEVICES=1 python train.py \
   -s data/colmap_pointcloud_sparse \
   --images ../cubemap_faces \
-  --depths ../cubemap_faces_da2_png \
+  --depths ../cubemap_faces_da2 \
   --depth_l1_weight_init 1.0 \
   --depth_l1_weight_final 0.01 \
   -m output/run_01 \
   --disable_viewer \
   --sky_sh_degree 3
-  
+
 # -------------------------------------train  end  ---------------------------------------------------
 
 # -------------------------------------SIBR viewer start    ------------------------------------------
