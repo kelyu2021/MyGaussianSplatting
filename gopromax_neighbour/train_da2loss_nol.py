@@ -2330,25 +2330,25 @@ def training(cfg: dict):
             #     DA-v2 depth==0 proxy (cheap and reasonably accurate for
             #     this purpose; false positives only locally suppress
             #     opacity, they do NOT corrupt the SH sky model).
-            lambda_sky_acc = optim_cfg.get("lambda_sky_acc", 0.01)
-            if lambda_sky_acc > 0:
-                _sky_region = None
+            # lambda_sky_acc = optim_cfg.get("lambda_sky_acc", 0.01)
+            # if lambda_sky_acc > 0:
+            #     _sky_region = None
 
-                if sky_mask is not None:
-                    _sky_region = sky_mask.float()             # 1 where sky
-                    _ground_region = 1.0 - _sky_region.float()   # 1 where ground
-                elif sky_proxy is not None:
-                    _sky_region = sky_proxy.float()            # 1 where sky
-                    _ground_region = 1.0 - _sky_region.float()   # 1 where ground
+            #     if sky_mask is not None:
+            #         _sky_region = sky_mask.float()             # 1 where sky
+            #         _ground_region = 1.0 - _sky_region.float()   # 1 where ground
+            #     elif sky_proxy is not None:
+            #         _sky_region = sky_proxy.float()            # 1 where sky
+            #         _ground_region = 1.0 - _sky_region.float()   # 1 where ground
 
-                if _sky_region is not None:
-                    # sky_acc_loss = lambda_sky_acc * (acc * _sky_region).mean()
-                    sky_acc_loss = lambda_sky_acc * (
-                        (acc * _sky_region).mean() 
-                        # + ((1.0 - acc) * _ground_region).mean()
-                    )
-                    scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
-                    loss += sky_acc_loss
+            #     if _sky_region is not None:
+            #         # sky_acc_loss = lambda_sky_acc * (acc * _sky_region).mean()
+            #         sky_acc_loss = lambda_sky_acc * (
+            #             (acc * _sky_region).mean() 
+            #             # + ((1.0 - acc) * _ground_region).mean()
+            #         )
+            #         scalar_dict["sky_acc_loss"] = sky_acc_loss.item()
+            #         loss += sky_acc_loss
 
             # ── Opacity entropy regularisation ─────────────────────
             #     Push opacity toward 0 or 1 to prevent semi-transparent
