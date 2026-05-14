@@ -10,17 +10,23 @@
 #
 
 import os
+import re
+import csv
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.sky_model import SkyModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
+import math
+import torch.nn.functional as F
+import torchvision
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -40,7 +46,120 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+try:
+    from lpipsPyTorch.modules.lpips import LPIPS as LPIPSCriterion
+    LPIPS_AVAILABLE = True
+except Exception:
+    LPIPS_AVAILABLE = False
+
+def _write_csv(csv_path, row_dict):
+    """Append one metrics row to a CSV file, writing the header on first write."""
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(row_dict.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row_dict)
+
+
+def _frame_num(image_name):
+    """Return the leading integer from an image name (e.g. '0008_front' -> 8)."""
+    m = re.match(r'^(\d+)', image_name)
+    return int(m.group(1)) if m else -1
+
+
+def depth_to_vis(depth_map):
+    """Normalise a depth/inv-depth tensor (1, H, W) to an RGB visualisation (3, H, W).
+
+    Uses full min-max normalisation so that GT depths remain visible even after
+    the COLMAP scale/offset alignment (which can produce negative values for far
+    pixels that would otherwise be masked out by a > 0 filter).
+    """
+    d = depth_map.squeeze(0).float()
+    lo, hi = d.min(), d.max()
+    if hi > lo:
+        d_norm = (d - lo) / (hi - lo + 1e-8)
+    else:
+        d_norm = torch.zeros_like(d)
+    return d_norm.unsqueeze(0).expand(3, -1, -1).clamp(0, 1).contiguous()
+
+
+def save_log_images(iteration, log_cameras, gaussians, pipe, sky_model,
+                    dataset, model_path, SPARSE_ADAM_AVAILABLE):
+    """Save a 3-row diagnostic grid for every log camera.
+
+    Row 1 : GT RGB          | GT Depth
+    Row 2 : Rendered RGB    | Rendered Depth
+    Row 3 : Composited      | SH Sky (camera-view)
+    """
+    log_dir = os.path.join(model_path, "log_images", f"iter_{iteration:06d}")
+    os.makedirs(log_dir, exist_ok=True)
+
+    for viewpoint_cam in log_cameras:
+        with torch.no_grad():
+            H, W = viewpoint_cam.image_height, viewpoint_cam.image_width
+
+            # Render with black background
+            bg_black = torch.zeros(3, device="cuda")
+            render_pkg = render(viewpoint_cam, gaussians, pipe, bg_black,
+                                use_trained_exp=dataset.train_test_exp,
+                                separate_sh=SPARSE_ADAM_AVAILABLE)
+            render_rgb   = render_pkg["render"].clamp(0, 1)   # (3, H, W)
+            render_depth = render_pkg["depth"]                # (1, H, W) or (H, W)
+            if render_depth.dim() == 2:
+                render_depth = render_depth.unsqueeze(0)
+
+            # ---- sky compositing ----
+            if sky_model is not None:
+                render_white = render(viewpoint_cam, gaussians, pipe,
+                                      torch.ones(3, device="cuda"),
+                                      use_trained_exp=dataset.train_test_exp,
+                                      separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                unoccupied = (render_white - render_rgb).clamp(0, 1).mean(dim=0, keepdim=True)
+                fx = W / (2.0 * math.tan(viewpoint_cam.FoVx * 0.5))
+                fy = H / (2.0 * math.tan(viewpoint_cam.FoVy * 0.5))
+                ys = torch.arange(H, device="cuda", dtype=torch.float32)
+                xs = torch.arange(W, device="cuda", dtype=torch.float32)
+                grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+                dirs_cam = torch.stack([
+                    (grid_x - W * 0.5 + 0.5) / fx,
+                    (grid_y - H * 0.5 + 0.5) / fy,
+                    torch.ones_like(grid_x)
+                ], dim=-1).view(-1, 3)
+                R_c2w = viewpoint_cam.world_view_transform[:3, :3]
+                dirs_world = F.normalize(dirs_cam @ R_c2w.T, dim=-1)
+                sky_colors = sky_model(dirs_world)
+                sky_image  = sky_colors.view(H, W, 3).permute(2, 0, 1).clamp(0, 1)
+                composited = (render_rgb + unoccupied * sky_image).clamp(0, 1)
+                sky_vis    = sky_image
+            else:
+                composited = render_rgb
+                sky_vis    = torch.zeros(3, H, W, device="cuda")
+
+            # ---- GT panels ----
+            gt_rgb = viewpoint_cam.original_image.clamp(0, 1)   # (3, H, W)
+            if viewpoint_cam.invdepthmap is not None:
+                gt_depth_vis = depth_to_vis(viewpoint_cam.invdepthmap)
+            else:
+                gt_depth_vis = torch.zeros(3, H, W, device="cuda")
+            # Convert rendered metric depth → inverse depth to match GT (Depth Anything V2)
+            inv_render_depth = torch.where(
+                render_depth > 0,
+                1.0 / render_depth.clamp(min=1e-6),
+                torch.zeros_like(render_depth)
+            )
+            render_depth_vis = depth_to_vis(inv_render_depth)
+
+            # ---- 3 × 2 grid (row-major, nrow=2) ----
+            panels = [gt_rgb, gt_depth_vis,
+                      render_rgb, render_depth_vis,
+                      composited, sky_vis]
+            grid = torchvision.utils.make_grid(panels, nrow=2, padding=4, pad_value=1.0)
+            save_path = os.path.join(log_dir, f"{viewpoint_cam.image_name}.png")
+            torchvision.utils.save_image(grid, save_path)
+
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sky_sh_degree=0):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -50,8 +169,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # Cameras whose frame number is divisible by 8 are used for log images
+    log_cameras = [cam for cam in scene.getTrainCameras()
+                   if _frame_num(cam.image_name) > 0 and _frame_num(cam.image_name) % 8 == 0]
+
+    # Sky model: learnable SH environment for background pixels
+    if sky_sh_degree > 0:
+        sky_model = SkyModel(sky_sh_degree).cuda()
+        sky_optimizer = torch.optim.Adam(sky_model.parameters(), lr=opt.feature_lr)
+    else:
+        sky_model = None
+        sky_optimizer = None
+
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        ckpt = torch.load(checkpoint)
+        if len(ckpt) == 3:
+            model_params, sky_coeffs, first_iter = ckpt
+            if sky_model is not None and sky_coeffs is not None:
+                sky_model.sh_coeffs.data.copy_(sky_coeffs)
+        else:
+            model_params, first_iter = ckpt
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -67,6 +205,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    ema_ssim_for_log = 0.0
+
+    lpips_criterion = LPIPSCriterion('vgg').cuda() if LPIPS_AVAILABLE else None
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -106,10 +247,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
+        bg = torch.zeros(3, device="cuda") if sky_model is not None else (
+            torch.rand((3), device="cuda") if opt.random_background else background)
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        # Sky compositing: replace unoccupied background with learnable SH sky
+        if sky_model is not None:
+            with torch.no_grad():
+                render_white = render(viewpoint_cam, gaussians, pipe, torch.ones(3, device="cuda"),
+                                      use_trained_exp=dataset.train_test_exp,
+                                      separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+            # unoccupied fraction per pixel: render_white - render_black = (1 - alpha_gauss)
+            unoccupied = (render_white - image).clamp(0, 1).mean(dim=0, keepdim=True).detach()
+            # Per-pixel world-space ray directions from camera intrinsics
+            H, W = viewpoint_cam.image_height, viewpoint_cam.image_width
+            fx = W / (2.0 * math.tan(viewpoint_cam.FoVx * 0.5))
+            fy = H / (2.0 * math.tan(viewpoint_cam.FoVy * 0.5))
+            ys = torch.arange(H, device="cuda", dtype=torch.float32)
+            xs = torch.arange(W, device="cuda", dtype=torch.float32)
+            grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+            dirs_cam = torch.stack([
+                (grid_x - W * 0.5 + 0.5) / fx,
+                (grid_y - H * 0.5 + 0.5) / fy,
+                torch.ones_like(grid_x)
+            ], dim=-1).view(-1, 3)
+            # C2W rotation: upper-left 3x3 of world_view_transform (= world_to_cam transposed)
+            R_c2w = viewpoint_cam.world_view_transform[:3, :3]
+            dirs_world = F.normalize(dirs_cam @ R_c2w.T, dim=-1)  # (H*W, 3)
+            sky_colors = sky_model(dirs_world)                     # (H*W, 3)
+            sky_image = sky_colors.view(H, W, 3).permute(2, 0, 1) # (3, H, W)
+            image = image + unoccupied * sky_image
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -145,20 +314,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
+            ema_loss_for_log  = 0.4 * loss.item()       + 0.6 * ema_loss_for_log
+            ema_Ll1depth_for_log = 0.4 * Ll1depth       + 0.6 * ema_Ll1depth_for_log
+            ema_ssim_for_log  = 0.4 * ssim_value.item() + 0.6 * ema_ssim_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                n_gauss = gaussians.get_xyz.shape[0]
+                progress_bar.set_postfix({
+                    "Loss":   f"{ema_loss_for_log:.6f}",
+                    "DepthL": f"{ema_Ll1depth_for_log:.6f}",
+                    "SSIM":   f"{ema_ssim_for_log:.4f}",
+                    "#GS":    f"{n_gauss/1000:.1f}k",
+                    "SH":     gaussians.active_sh_degree,
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            # Per-iteration TensorBoard scalars
+            if tb_writer:
+                tb_writer.add_scalar('train/l1_loss',         Ll1.item(),             iteration)
+                tb_writer.add_scalar('train/total_loss',      loss.item(),            iteration)
+                tb_writer.add_scalar('train/ssim',            ssim_value.item(),      iteration)
+                tb_writer.add_scalar('train/depth_l1_loss',   ema_Ll1depth_for_log,   iteration)
+                tb_writer.add_scalar('train/depth_l1_weight', depth_l1_weight(iteration), iteration)
+                tb_writer.add_scalar('scene/num_gaussians',   gaussians.get_xyz.shape[0], iteration)
+                tb_writer.add_scalar('scene/active_sh_degree', gaussians.active_sh_degree, iteration)
+                for pg in gaussians.optimizer.param_groups:
+                    tb_writer.add_scalar(f'lr/{pg["name"]}', pg['lr'], iteration)
+                if sky_model is not None:
+                    tb_writer.add_scalar('sky/sh_coeff_norm', sky_model.sh_coeffs.norm().item(), iteration)
+
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
+                            testing_iterations, scene, render,
+                            (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp),
+                            dataset.train_test_exp, sky_model=sky_model, lpips_criterion=lpips_criterion)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+
+            # Log diagnostic images every 1000 iterations
+            if iteration % 1000 == 0 and log_cameras:
+                save_log_images(iteration, log_cameras, gaussians, pipe, sky_model,
+                                dataset, scene.model_path, SPARSE_ADAM_AVAILABLE)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -177,6 +376,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                if sky_optimizer is not None:
+                    sky_optimizer.step()
+                    sky_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
@@ -187,7 +389,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                sky_coeffs_ckpt = sky_model.sh_coeffs.data if sky_model is not None else None
+                torch.save((gaussians.capture(), sky_coeffs_ckpt, iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -211,44 +414,79 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations,
+                    scene: Scene, renderFunc, renderArgs, train_test_exp,
+                    sky_model=None, lpips_criterion=None):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
+        tb_writer.add_scalar('train/iter_time_ms', elapsed, iteration)
 
-    # Report test and samples of training set
+    # Full evaluation at designated iterations
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        csv_path = os.path.join(scene.model_path, "metrics.csv")
+        validation_configs = (
+            {'name': 'test',  'cameras': scene.getTestCameras()},
+            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())]
+                                          for idx in range(5, 30, 5)]}
+        )
 
         for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if train_test_exp:
-                        image = image[..., image.shape[-1] // 2:]
-                        gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+            if not config['cameras']:
+                continue
+            l1_sum = psnr_sum = ssim_sum = lpips_sum = 0.0
+            n = len(config['cameras'])
+
+            for idx, viewpoint in enumerate(config['cameras']):
+                image    = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                if train_test_exp:
+                    image    = image[...,    image.shape[-1] // 2:]
+                    gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+
+                if tb_writer and idx < 5:
+                    tb_writer.add_images(f"{config['name']}_view_{viewpoint.image_name}/render",
+                                         image[None], global_step=iteration)
+                    if iteration == testing_iterations[0]:
+                        tb_writer.add_images(f"{config['name']}_view_{viewpoint.image_name}/ground_truth",
+                                             gt_image[None], global_step=iteration)
+
+                l1_sum   += l1_loss(image, gt_image).mean().double()
+                psnr_sum += psnr(image, gt_image).mean().double()
+                ssim_sum += ssim(image, gt_image).mean().double()
+                if lpips_criterion is not None:
+                    lpips_sum += lpips_criterion(image.unsqueeze(0), gt_image.unsqueeze(0)).item()
+
+            l1_avg    = float(l1_sum   / n)
+            psnr_avg  = float(psnr_sum / n)
+            ssim_avg  = float(ssim_sum / n)
+            lpips_avg = float(lpips_sum / n) if lpips_criterion is not None else float('nan')
+
+            print("\n[ITER {:6d}] Evaluating {:5s}: "
+                  "L1 {:.5f} | PSNR {:.3f} dB | SSIM {:.4f} | LPIPS {:.4f}".format(
+                  iteration, config['name'], l1_avg, psnr_avg, ssim_avg, lpips_avg))
+
+            if tb_writer:
+                tb_writer.add_scalar(f"{config['name']}/l1",    l1_avg,   iteration)
+                tb_writer.add_scalar(f"{config['name']}/psnr",  psnr_avg, iteration)
+                tb_writer.add_scalar(f"{config['name']}/ssim",  ssim_avg, iteration)
+                if lpips_criterion is not None:
+                    tb_writer.add_scalar(f"{config['name']}/lpips", lpips_avg, iteration)
+
+            _write_csv(csv_path, {
+                'iteration': iteration,
+                'split':     config['name'],
+                'l1':        l1_avg,
+                'psnr':      psnr_avg,
+                'ssim':      ssim_avg,
+                'lpips':     lpips_avg,
+                'num_gaussians': scene.gaussians.get_xyz.shape[0],
+            })
 
         if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+            tb_writer.add_histogram('scene/opacity_histogram', scene.gaussians.get_opacity, iteration)
+            tb_writer.add_scalar('scene/num_gaussians', scene.gaussians.get_xyz.shape[0], iteration)
+            if sky_model is not None:
+                tb_writer.add_scalar('sky/sh_coeff_norm', sky_model.sh_coeffs.norm().item(), iteration)
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -267,6 +505,8 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--sky_sh_degree", type=int, default=0,
+                        help="SH degree for learnable sky model (0 = disabled, 3 = recommended)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -279,7 +519,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sky_sh_degree)
 
     # All done
     print("\nTraining complete.")
