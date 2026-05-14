@@ -13,9 +13,38 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+
+def prepare_colmap_masks(image_dir: Path, sky_mask_dir: Path) -> Path:
+    """
+    Build a temp directory of COLMAP-format masks from sky masks.
+    Convention assumed: sky=255 (white) in input masks.
+    COLMAP ignores features where mask pixel == 0, so sky regions are inverted to 0.
+    Mask files are named <image_filename>.png per COLMAP convention
+    (e.g. image '0001_front.jpg' → mask '0001_front.jpg.png').
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="colmap_masks_"))
+    count = 0
+    for img_path in sorted(image_dir.iterdir()):
+        if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            continue
+        mask_path = sky_mask_dir / (img_path.stem + ".png")
+        if not mask_path.exists():
+            continue
+        mask = Image.open(mask_path).convert("L")
+        inv_mask = Image.fromarray(255 - np.array(mask))
+        inv_mask.save(tmp / (img_path.name + ".png"))  # COLMAP naming convention
+        count += 1
+    print(f"  Prepared {count} COLMAP mask(s) in {tmp}")
+    return tmp
 
 
 def run_colmap(cmd: list[str], desc: str) -> None:
@@ -48,6 +77,9 @@ def main() -> None:
     ap.add_argument("--matcher", default="exhaustive",
                     choices=["exhaustive", "sequential"],
                     help="Feature matching strategy.")
+    ap.add_argument("--sky_mask_dir", default=None,
+                    help="Directory of sky masks (sky=white/255). "
+                         "Masked pixels are excluded from feature extraction.")
     args = ap.parse_args()
 
     script_dir = Path(__file__).parent.resolve()
@@ -76,8 +108,20 @@ def main() -> None:
     colmap = args.colmap_exe
     gpu = str(args.use_gpu)
 
+    # Prepare sky masks for COLMAP (inverted, COLMAP naming convention)
+    tmp_mask_dir = None
+    colmap_mask_dir = None
+    if args.sky_mask_dir:
+        sky_mask_dir = Path(args.sky_mask_dir)
+        if not sky_mask_dir.is_absolute():
+            sky_mask_dir = (script_dir / sky_mask_dir).resolve()
+        if not sky_mask_dir.exists():
+            sys.exit(f"ERROR: Sky mask directory not found: {sky_mask_dir}")
+        tmp_mask_dir = prepare_colmap_masks(image_dir, sky_mask_dir)
+        colmap_mask_dir = tmp_mask_dir
+
     # Step 1: Feature extraction
-    run_colmap([
+    feat_cmd = [
         colmap, "feature_extractor",
         "--database_path", str(db),
         "--image_path", str(image_dir),
@@ -85,7 +129,10 @@ def main() -> None:
         "--ImageReader.single_camera", "0",
         "--SiftExtraction.use_gpu", gpu,
         "--SiftExtraction.max_num_features", "8192",
-    ], "Feature extraction (SIFT)")
+    ]
+    if colmap_mask_dir:
+        feat_cmd += ["--ImageReader.mask_path", str(colmap_mask_dir)]
+    run_colmap(feat_cmd, "Feature extraction (SIFT)")
 
     # Step 2: Feature matching
     if args.matcher == "exhaustive":
@@ -93,7 +140,7 @@ def main() -> None:
             colmap, "exhaustive_matcher",
             "--database_path", str(db),
             "--SiftMatching.use_gpu", gpu,
-            "--SiftMatching.num_threads", "1",
+            # "--SiftMatching.num_threads", "1",
         ], "Exhaustive feature matching")
     else:
         run_colmap([
@@ -130,6 +177,10 @@ def main() -> None:
         "--output_path", str(ply),
         "--output_type", "PLY",
     ], "Export point cloud to PLY")
+
+    # Clean up temporary mask directory
+    if tmp_mask_dir and tmp_mask_dir.exists():
+        shutil.rmtree(tmp_mask_dir)
 
     # Summary
     print(f"\n{'═' * 60}")
