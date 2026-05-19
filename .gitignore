@@ -33,3 +33,5 @@ gopromax_neighbour/output/
 gopromax_neighbour/output*/
 huggingface/depth-anything-3/workspace/
 Wan2.1/Wan2.1-T2V-14B
+archive/Wan2.1/Wan2.1-T2V-14B
+.safetensors

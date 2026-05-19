@@ -8,8 +8,8 @@ Outputs
 -------
 For each input ``NNNN_face.jpg`` two files are written:
 
-* ``NNNN_face_depth_raw.npy``  – float32 (H, W) inverse-depth in model units
-* ``NNNN_face_depth_vis.png``  – uint8 colormapped visualisation
+* ``NNNN_face.npy``  – float32 (H, W) relative inverse-depth (disparity) in model units. Larger = closer.
+* ``NNNN_face.png``  – uint8 colormapped visualisation
 
 Usage
 -----

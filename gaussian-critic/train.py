@@ -86,12 +86,6 @@ def depth_to_vis(depth_map):
 
 def save_log_images(iteration, log_cameras, gaussians, pipe, sky_model,
                     dataset, model_path, SPARSE_ADAM_AVAILABLE):
-    """Save a 3-row diagnostic grid for every log camera.
-
-    Row 1 : GT RGB          | GT Depth
-    Row 2 : Rendered RGB    | Rendered Depth
-    Row 3 : Composited      | SH Sky (camera-view)
-    """
     log_dir = os.path.join(model_path, "log_images", f"iter_{iteration:06d}")
     os.makedirs(log_dir, exist_ok=True)
 
@@ -133,8 +127,16 @@ def save_log_images(iteration, log_cameras, gaussians, pipe, sky_model,
                 composited = (render_rgb + unoccupied * sky_image).clamp(0, 1)
                 sky_vis    = sky_image
             else:
+                render_white = render(viewpoint_cam, gaussians, pipe,
+                                      torch.ones(3, device="cuda"),
+                                      use_trained_exp=dataset.train_test_exp,
+                                      separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
                 composited = render_rgb
                 sky_vis    = torch.zeros(3, H, W, device="cuda")
+
+            # ---- opacity: fraction of pixel covered by gaussians ----
+            opacity_vis = (1.0 - (render_white - render_rgb).clamp(0, 1).mean(dim=0, keepdim=True)
+                           ).expand(3, -1, -1).clamp(0, 1).contiguous()
 
             # ---- GT panels ----
             gt_rgb = viewpoint_cam.original_image.clamp(0, 1)   # (3, H, W)
@@ -142,24 +144,26 @@ def save_log_images(iteration, log_cameras, gaussians, pipe, sky_model,
                 gt_depth_vis = depth_to_vis(viewpoint_cam.invdepthmap)
             else:
                 gt_depth_vis = torch.zeros(3, H, W, device="cuda")
-            # Convert rendered metric depth → inverse depth to match GT (Depth Anything V2)
-            inv_render_depth = torch.where(
-                render_depth > 0,
-                1.0 / render_depth.clamp(min=1e-6),
-                torch.zeros_like(render_depth)
-            )
-            render_depth_vis = depth_to_vis(inv_render_depth)
+            # 3DGS renders metric depth, near = samll value -> dark = far.
+            render_depth_vis = depth_to_vis(1.0 / render_depth.clamp(min=1e-6))
+            if viewpoint_cam.alpha_mask is not None:
+                gt_alpha_vis = viewpoint_cam.alpha_mask.clamp(0, 1).expand(3, -1, -1).contiguous()
+            else:
+                gt_alpha_vis = torch.zeros(3, H, W, device="cuda")
 
-            # ---- 3 × 2 grid (row-major, nrow=2) ----
-            panels = [gt_rgb, gt_depth_vis,
-                      render_rgb, render_depth_vis,
+            # ---- 3 × 3 grid (row-major, nrow=3) ----
+            # Row 1: GT RGB        | GT Depth       | GT Alpha mask
+            # Row 2: Rendered RGB  | Rendered Depth | Rendered Opacity
+            # Row 3: Composited    | SH Sky         | (padded)
+            panels = [gt_rgb,     gt_depth_vis,     gt_alpha_vis,
+                      render_rgb, render_depth_vis,  opacity_vis,
                       composited, sky_vis]
-            grid = torchvision.utils.make_grid(panels, nrow=2, padding=4, pad_value=1.0)
+            grid = torchvision.utils.make_grid(panels, nrow=3, padding=4, pad_value=1.0)
             save_path = os.path.join(log_dir, f"{viewpoint_cam.image_name}.png")
             torchvision.utils.save_image(grid, save_path)
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sky_sh_degree=0):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sky_sh_degree=0, max_frame=-1):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -170,8 +174,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
 
+    # Optionally restrict to frames <= max_frame
+    def _in_frame_range(cam):
+        return max_frame < 0 or _frame_num(cam.image_name) <= max_frame
+
+    train_cameras = [cam for cam in scene.getTrainCameras() if _in_frame_range(cam)]
+
     # Cameras whose frame number is divisible by 8 are used for log images
-    log_cameras = [cam for cam in scene.getTrainCameras()
+    log_cameras = [cam for cam in train_cameras
                    if _frame_num(cam.image_name) > 0 and _frame_num(cam.image_name) % 8 == 0]
 
     # Sky model: learnable SH environment for background pixels
@@ -201,7 +211,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    viewpoint_stack = scene.getTrainCameras().copy()
+    viewpoint_stack = train_cameras.copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
@@ -232,12 +242,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
+        if iteration % 2000 == 0:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_stack = train_cameras.copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
@@ -318,7 +328,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth       + 0.6 * ema_Ll1depth_for_log
             ema_ssim_for_log  = 0.4 * ssim_value.item() + 0.6 * ema_ssim_for_log
 
-            if iteration % 10 == 0:
+            if iteration % 100 == 0:
                 n_gauss = gaussians.get_xyz.shape[0]
                 progress_bar.set_postfix({
                     "Loss":   f"{ema_loss_for_log:.6f}",
@@ -327,7 +337,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "#GS":    f"{n_gauss/1000:.1f}k",
                     "SH":     gaussians.active_sh_degree,
                 })
-                progress_bar.update(10)
+                progress_bar.update(100)
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -358,6 +368,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration % 1000 == 0 and log_cameras:
                 save_log_images(iteration, log_cameras, gaussians, pipe, sky_model,
                                 dataset, scene.model_path, SPARSE_ADAM_AVAILABLE)
+
+            # Quick train-subset metrics every 1000 iterations
+            if iteration % 1000 == 0 and log_cameras and tb_writer:
+                psnr_sum = ssim_sum = lpips_sum = 0.0
+                n = len(log_cameras)
+                for viewpoint in log_cameras:
+                    img = torch.clamp(render(viewpoint, gaussians, pipe, background,
+                                             use_trained_exp=dataset.train_test_exp,
+                                             separate_sh=SPARSE_ADAM_AVAILABLE)["render"], 0.0, 1.0)
+                    gt = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    psnr_sum += psnr(img, gt).mean().double()
+                    if FUSED_SSIM_AVAILABLE:
+                        ssim_sum += fused_ssim(img.unsqueeze(0), gt.unsqueeze(0)).double()
+                    else:
+                        ssim_sum += ssim(img, gt).mean().double()
+                    if lpips_criterion is not None:
+                        lpips_sum += lpips_criterion(img.unsqueeze(0), gt.unsqueeze(0)).item()
+                tb_writer.add_scalar('train_quick/psnr', float(psnr_sum / n), iteration)
+                tb_writer.add_scalar('train_quick/ssim', float(ssim_sum / n), iteration)
+                if lpips_criterion is not None:
+                    tb_writer.add_scalar('train_quick/lpips', float(lpips_sum / n), iteration)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -503,10 +534,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--sky_sh_degree", type=int, default=0,
                         help="SH degree for learnable sky model (0 = disabled, 3 = recommended)")
+    parser.add_argument("--max_frame", type=int, default=30,
+                        help="Only use images with frame number <= max_frame (-1 = all frames)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -519,7 +552,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sky_sh_degree)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sky_sh_degree, args.max_frame)
 
     # All done
     print("\nTraining complete.")

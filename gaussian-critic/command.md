@@ -1,24 +1,20 @@
-# -------------------------------------prepare date and setup env start---------------------------------
-
-## depth data
-cd gopromax_neighbour
-python depth_anything_v2.py \
-    --image_dir  data/cubemap_faces \
-    --mask_dir   data/mass13k_manual \
-    --output_dir data/da2
-
 # sparse point cloud
-python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --sky_mask_dir data/mass13k_manual --output_dir data/colmap_pointcloud_sparse --use_gpu 0 --matcher exhaustive
+python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 0 --matcher exhaustive
 
 # dense point cloud
 python colmap_pointcloud_dense.py \
   --sparse_dir data/colmap_pointcloud_sparse/sparse/0 \
   --image_dir data/cubemap_faces \
-  --sky_mask_dir data/mass13k_manual \
   --output_dir data/colmap_pointcloud_dense \
   --use_gpu 0
 
-# Step 1: convert .npy → 16-bit inverse-depth PNGs ? do not need
+python depth_anything_v2.py \
+    --image_dir  data/cubemap_faces \
+    --mask_dir   data/cubemap_faces_mass13k_manual \
+    --output_dir data/da2
+
+# Step 1: convert .npy → 16-bit inverse-depth PNGs
+# this is  trash
 python utils/convert_depth_npy_to_png.py \
   --input_dir  data/cubemap_faces_da2 \
   --output_dir data/cubemap_faces_da2_png
@@ -26,7 +22,7 @@ python utils/convert_depth_npy_to_png.py \
 # Step 2: compute scale/offset alignment with COLMAP
 python utils/make_depth_scale.py \
   --base_dir data/colmap_pointcloud_sparse \
-  --depths_dir data/cubemap_faces_da2
+  --depths_dir data/da2
 
 cp data/colmap_pointcloud_dense/fused.ply \
    data/colmap_pointcloud_sparse/sparse/0/points3D.ply
@@ -34,29 +30,22 @@ cp data/colmap_pointcloud_dense/fused.ply \
 cd /home/lyuk4/GitHub/MyGaussianSplatting/gaussian-splatting 
 conda activate gopro_360 
 
-# -------------------------------------prepare date and setup env end---------------------------------
-
-# -------------------------------------train  start---------------------------------------------------
-CUDA_VISIBLE_DEVICES=1 python train.py \
+CUDA_VISIBLE_DEVICES=1 nohup python train.py \
   -s data/colmap_pointcloud_sparse \
   --images ../cubemap_faces \
-  --depths ../cubemap_faces_da2 \
+  --depths ../da2 \
   --depth_l1_weight_init 1.0 \
   --depth_l1_weight_final 0.01 \
-  -m output/run_01 \
+  -m output/run_02 \
   --disable_viewer \
-  --sky_sh_degree 3
+  --sky_sh_degree 3 > output/run_02/train.log 2>&1 &
 
-# -------------------------------------train  end  ---------------------------------------------------
-
-# -------------------------------------SIBR viewer start    ------------------------------------------
 cd C:\Users\lyuk4\Documents\MiamiUniversity\GaussianSplatting\viewers\bin
 
 ./SIBR_viewers/install/bin/SIBR_gaussianViewer_app \
   -m output/run_01
-# -------------------------------------SIBR viewer end     -------------------------------------------
 
-# -------------------------------------jitter start      ---------------------------------------------
+
 # Render only (no SDS scoring, much faster):
 CUDA_VISIBLE_DEVICES=0 python plot_sds_vs_jitter.py \
   --img_name    0001_front \
@@ -78,4 +67,3 @@ CUDA_VISIBLE_DEVICES=1 python plot_sds_vs_jitter.py \
   --num_dists 25 --num_repeats 8 --num_samples 32 --errorbar_style band
   --prompt      "A street level image of an outdoor scene" \
   --model_id    "Manojb/stable-diffusion-2-1-base"
-# -------------------------------------jitter end        ---------------------------------------------

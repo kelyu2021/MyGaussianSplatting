@@ -17,59 +17,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
-
-
-def populate_dense_masks(output_dir: Path, sky_mask_dir: Path) -> int:
-    """
-    After image_undistorter, write inverted sky masks into <output_dir>/masks/
-    so that patch_match_stereo and stereo_fusion ignore sky pixels.
-
-    COLMAP dense convention: mask pixel == 0  →  pixel is masked (ignored).
-    Input sky masks assumed sky=255 (white) → inverted to 0 for COLMAP.
-
-    Matches undistorted images in <output_dir>/images/ to sky masks by stem.
-    Returns number of masks written.
-    """
-    images_dir = output_dir / "images"
-    if not images_dir.exists():
-        print("  WARNING: undistorted images dir not found, skipping masks.")
-        return 0
-
-    # Index all available sky masks by lowercase stem
-    sky_index = {
-        p.stem.lower(): p
-        for p in sky_mask_dir.iterdir()
-        if p.suffix.lower() == ".png"
-    }
-    if not sky_index:
-        print(f"  WARNING: no .png masks found in {sky_mask_dir}")
-        return 0
-
-    masks_dir = output_dir / "masks"
-    masks_dir.mkdir(exist_ok=True)
-
-    count = 0
-    for img_path in sorted(images_dir.rglob("*")):
-        if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
-            continue
-        mask_src = sky_index.get(img_path.stem.lower())
-        if mask_src is None:
-            continue
-        # Mirror the images/ subdirectory structure inside masks/
-        rel = img_path.relative_to(images_dir)
-        mask_dst = masks_dir / rel.parent / (img_path.stem + ".png")
-        mask_dst.parent.mkdir(parents=True, exist_ok=True)
-        mask = Image.open(mask_src).convert("L")
-        Image.fromarray(255 - np.array(mask)).save(mask_dst)
-        count += 1
-
-    print(f"  Written {count} dense mask(s) to {masks_dir}")
-    if count == 0:
-        print(f"  (image stems: {list(sky_index.keys())[:5]} …)")
-    return count
-
 
 def run_colmap(cmd: list[str], desc: str) -> None:
     """Run a COLMAP CLI command; abort on failure."""
@@ -100,9 +47,6 @@ def main() -> None:
                     help="Path to the COLMAP executable.")
     ap.add_argument("--use_gpu", type=int, default=1, choices=[0, 1],
                     help="Use GPU for PatchMatch stereo (1=yes, 0=no).")
-    ap.add_argument("--sky_mask_dir", default=None,
-                    help="Directory of sky masks (sky=white/255). "
-                         "Masked pixels are excluded from depth estimation.")
     args = ap.parse_args()
 
     script_dir = Path(__file__).parent.resolve()
@@ -125,15 +69,6 @@ def main() -> None:
     colmap = args.colmap_exe
     gpu = str(args.use_gpu)
 
-    # Resolve sky_mask_dir early so we can report errors before COLMAP runs
-    sky_mask_dir = None
-    if args.sky_mask_dir:
-        sky_mask_dir = Path(args.sky_mask_dir)
-        if not sky_mask_dir.is_absolute():
-            sky_mask_dir = (script_dir / sky_mask_dir).resolve()
-        if not sky_mask_dir.exists():
-            sys.exit(f"ERROR: Sky mask directory not found: {sky_mask_dir}")
-
     # Step 1: Undistort images
     run_colmap([
         colmap, "image_undistorter",
@@ -142,13 +77,6 @@ def main() -> None:
         "--output_path", str(output_dir),
         "--output_type", "COLMAP",
     ], "Image undistortion")
-
-    # Step 1b: Populate <output_dir>/masks/ from sky masks so that
-    # patch_match_stereo and stereo_fusion skip sky pixels.
-    if sky_mask_dir:
-        n = populate_dense_masks(output_dir, sky_mask_dir)
-        if n == 0:
-            print("  WARNING: 0 masks written — sky masking will be skipped.")
 
     # Step 2: PatchMatch stereo (depth & normal maps)
     run_colmap([
