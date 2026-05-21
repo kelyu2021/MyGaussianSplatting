@@ -144,8 +144,7 @@ def save_log_images(iteration, log_cameras, gaussians, pipe, sky_model,
                 gt_depth_vis = depth_to_vis(viewpoint_cam.invdepthmap)
             else:
                 gt_depth_vis = torch.zeros(3, H, W, device="cuda")
-            # 3DGS renders metric depth, near = samll value -> dark = far.
-            render_depth_vis = depth_to_vis(1.0 / render_depth.clamp(min=1e-6))
+            render_depth_vis = depth_to_vis(render_depth)
             if viewpoint_cam.alpha_mask is not None:
                 gt_alpha_vis = viewpoint_cam.alpha_mask.clamp(0, 1).expand(3, -1, -1).contiguous()
             else:

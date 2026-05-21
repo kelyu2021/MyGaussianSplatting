@@ -30,7 +30,7 @@ CUDA_VISIBLE_DEVICES=0 python train_neighbour.py \
   --depths ../cubemap_faces_da2_png \
   --depth_l1_weight_init 1.0 \
   --depth_l1_weight_final 0.01 \
-  -m output/run_01 \
+  -m output/run_02 \
   --disable_viewer
 
 cd C:\Users\lyuk4\Documents\MiamiUniversity\GaussianSplatting\viewers\bin

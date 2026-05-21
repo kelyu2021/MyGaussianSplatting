@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import sys
 import os
 
-path = sys.argv[1] if len(sys.argv) > 1 else "test/0001_back_depth_raw.npy"
+path = sys.argv[1] if len(sys.argv) > 1 else "test/0002_back_depth_raw.npy"
 arr = np.load(path)
 
 print(f"shape: {arr.shape}, dtype: {arr.dtype}, min: {arr.min():.4f}, max: {arr.max():.4f}")

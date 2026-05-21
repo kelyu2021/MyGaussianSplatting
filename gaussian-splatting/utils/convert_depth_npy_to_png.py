@@ -20,20 +20,36 @@ from pathlib import Path
 
 
 def convert(npy_path: Path, output_dir: Path) -> None:
-    depth = np.load(npy_path).astype(np.float32)  # metric depth in metres
+    depth = np.load(npy_path).astype(np.float32)  # DA2 inverse depth (disparity)
 
-    # Inverse depth: far = small value, near = large value
-    # Guard against zero/negative depth
-    inv_depth = np.where(depth > 0, 1.0 / depth, 0.0)
+    print(f'da2 inverse depth  min={depth.min():.4f}  max={depth.max():.4f}')
 
-    # Normalise to [0, 65535] using per-image max so relative structure is preserved.
-    # make_depth_scale.py computes a per-image scale/offset to align with COLMAP,
-    # so the absolute scale here does not matter.
-    max_val = inv_depth.max()
-    if max_val > 0:
-        inv_depth_u16 = (inv_depth / max_val * 65535).astype(np.uint16)
+    # Valid pixels: DA2 values near zero or negative are sky/invalid and produce
+    # astronomically large direct-depth values that crush the normalisation range.
+    # Use the 1st percentile of positive values as a lower bound to exclude them.
+    pos_mask = depth > 0
+    if pos_mask.any():
+        low_thresh = np.percentile(depth[pos_mask], 0.3)
     else:
-        inv_depth_u16 = np.zeros_like(inv_depth, dtype=np.uint16)
+        low_thresh = 0.0
+    valid_mask = depth >= low_thresh
+
+    direct_depth = np.where(valid_mask, 1.0 / depth, 0.0)
+
+    # Normalise to [0, 65535] over valid pixels only (percentile clip for outliers).
+    # make_depth_scale.py fits a per-image scale/offset to COLMAP, so absolute
+    # scale does not matter — only the relative structure needs to be preserved.
+    valid_vals = direct_depth[valid_mask]
+    print(f'direct depth (valid)  min={valid_vals.min():.4f}  max={valid_vals.max():.4f}')
+    if valid_vals.size > 0:
+        d_lo, d_hi = np.percentile(valid_vals, [0.3, 99.7])
+        direct_depth_clipped = np.clip(direct_depth, d_lo, d_hi)
+        direct_depth_clipped[~valid_mask] = 0.0
+        scale = d_hi - d_lo
+        direct_depth_u16 = ((direct_depth_clipped - d_lo) / (scale + 1e-8) * 65535).astype(np.uint16)
+        direct_depth_u16[~valid_mask] = 0
+    else:
+        direct_depth_u16 = np.zeros_like(direct_depth, dtype=np.uint16)
 
     # Strip '_depth_raw' suffix and change extension to .png
     stem = npy_path.stem  # e.g. '0001_front_depth_raw'
@@ -42,7 +58,7 @@ def convert(npy_path: Path, output_dir: Path) -> None:
     out_name = stem + '.png'
 
     out_path = output_dir / out_name
-    cv2.imwrite(str(out_path), inv_depth_u16)
+    cv2.imwrite(str(out_path), direct_depth_u16)
     print(f"  {npy_path.name} -> {out_name}")
 
 
