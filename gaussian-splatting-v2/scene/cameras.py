@@ -58,12 +58,21 @@ class Camera(nn.Module):
         self.image_height = self.original_image.shape[1]
 
         self.invdepthmap = None
+        self.invmonodepth_raw = None
         self.depth_reliable = False
         if invdepthmap is not None:
             self.depth_mask = torch.ones_like(self.alpha_mask)
             self.invdepthmap = cv2.resize(invdepthmap, resolution)
             self.invdepthmap[self.invdepthmap < 0] = 0
             self.depth_reliable = True
+
+            # Keep an un-scaled copy of the mono signal for logging/diagnostics
+            # (this is what comes straight off disk; the field below gets
+            # multiplied by depth_params["scale"]/offset for supervision).
+            raw = self.invdepthmap.copy()
+            if raw.ndim != 2:
+                raw = raw[..., 0]
+            self.invmonodepth_raw = torch.from_numpy(raw[None]).to(self.data_device)
 
             if depth_params is not None:
                 if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:

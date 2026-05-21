@@ -8,8 +8,12 @@ Outputs
 -------
 For each input ``NNNN_face.jpg`` two files are written:
 
-* ``NNNN_face_depth_raw.npy``  – float32 (H, W) inverse-depth in model units
-* ``NNNN_face_depth_vis.png``  – uint8 colormapped visualisation
+* ``NNNN_face.npy``  – float32 (H, W) raw DA2 disparity (high = near, low = far,
+                      0 = sky after masking)
+* ``NNNN_face.png``  – uint16 (H, W) inverse-depth, percentile-normalized to
+                      [0, 65535]. Compatible with ``make_depth_scale.py`` and
+                      the trainer's depth-supervision pipeline (which divides
+                      by 2**16). Sky pixels are 0.
 
 Usage
 -----
@@ -115,21 +119,23 @@ def main():
         npy_path = os.path.join(args.output_dir, f"{stem}.npy")
         np.save(npy_path, depth)
 
-        # ── Save colormapped visualisation ────────────────────────────
+        # ── Save 16-bit inverse-depth PNG (depth-supervision signal) ──
+        # DA2 emits disparity-like values; percentile-clip the (rare) sky-edge
+        # outliers where disparity → 0⁺ would otherwise crush the dynamic range.
         valid = depth[depth > 0]
         if valid.size > 0:
-            d_min, d_max = valid.min(), valid.max()
-            depth_norm = np.clip(
-                (depth - d_min) / (d_max - d_min + 1e-8), 0.0, 1.0)
+            d_lo, d_hi = np.percentile(valid, [0.5, 99.5])
+            d_lo = max(float(d_lo), 0.0)
+            denom = max(float(d_hi) - d_lo, 1e-8)
+            depth_norm = np.clip((depth - d_lo) / denom, 0.0, 1.0)
+            depth_norm[depth <= 0] = 0.0  # sky + any negative artifacts
         else:
             depth_norm = np.zeros_like(depth)
 
-        # Sky stays black
-        depth_norm[depth == 0] = 0.0
-        depth_u8 = (depth_norm * 255).astype(np.uint8)
+        depth_u16 = (depth_norm * 65535.0).astype(np.uint16)
 
-        vis_path = os.path.join(args.output_dir, f"{stem}.png")
-        cv2.imwrite(vis_path, depth_u8)
+        png_path = os.path.join(args.output_dir, f"{stem}.png")
+        cv2.imwrite(png_path, depth_u16)
 
         print(f"  [{i+1}/{len(paths)}] {stem}  "
               f"depth range [{depth[depth > 0].min():.2f}, "

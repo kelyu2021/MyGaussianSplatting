@@ -16,7 +16,7 @@ python utils/convert_depth_npy_to_png.py \
 # generate depth images
 python depth_anything_v2.py \
     --image_dir  data/cubemap_faces \
-    --mask_dir   data/cubemap_faces_mass13k \
+    --mask_dir   data/cubemap_faces_mass13k_manual \
     --output_dir data/cubemap_faces_da2
 
 # Step 2: compute scale/offset alignment with COLMAP
@@ -36,15 +36,15 @@ CUDA_VISIBLE_DEVICES=0 python train_neighbour.py \
   --depths ../cubemap_faces_da2_png \
   --depth_l1_weight_init 1.0 \
   --depth_l1_weight_final 0.01 \
-  -m output/run_01 \
+  -m output/run_02 \
   --disable_viewer
 
 CUDA_VISIBLE_DEVICES=1 python train_neighbour.py \
   -s data/colmap_pointcloud_sparse \
   --images ../cubemap_faces \
   --depths ../cubemap_faces_da2 \
-  --depth_l1_weight_init 1.0 \
-  --depth_l1_weight_final 0.01 \
+  --depth_l1_weight_init 0.1 \
+  --depth_l1_weight_final 0.001 \
   -m output/run_04 \
   --disable_viewer
 
