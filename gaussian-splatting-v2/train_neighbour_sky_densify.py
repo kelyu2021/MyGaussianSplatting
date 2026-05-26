@@ -136,15 +136,15 @@ class Critic(nn.Module):
         return self.head(self.features(x))
 
 
-def _critic_saliency_map(critic, img, smooth_kernel=5):
+def _critic_saliency_map(critic, img):
     """|∂(-C(img))/∂img|: per-pixel gradient saliency of the critic w.r.t. the
-    rendered image. Bright = "pixels the critic deciders is fake."
+    rendered image. Bright = "pixels the critic considers fake."
 
-    Returns (1, H, W) in [0, 1] — channel-averaged absolute gradient,
-    sqrt-transformed for dynamic range (raw |∇| is heavy-tailed), box-smoothed,
-    then per-image max-normalised. Uses `torch.autograd.grad` so the critic's
-    parameters' `.grad` is left untouched (no interference with the WGAN-GP
-    optimiser state).
+    Returns (1, H, W) — raw L2 norm of gradient across channels.
+    No smoothing, no sqrt compression, no normalization. Absolute scale
+    is preserved so comparisons across images/iterations are meaningful.
+    Uses `torch.autograd.grad` so the critic's parameters' `.grad` is
+    left untouched (no interference with the WGAN-GP optimiser state).
     """
     was_training = critic.training
     critic.eval()
@@ -158,14 +158,7 @@ def _critic_saliency_map(critic, img, smooth_kernel=5):
         )[0]
     if was_training:
         critic.train()
-    sal = grads.detach().abs().mean(dim=0, keepdim=True).sqrt()             # (1, H, W)
-    if smooth_kernel > 1:
-        k = smooth_kernel
-        pad = k // 2
-        kern = torch.ones(1, 1, k, k, dtype=sal.dtype, device=sal.device) / (k * k)
-        sal = F.conv2d(sal.unsqueeze(0), kern, padding=pad).squeeze(0)
-    m = sal.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
-    return sal / m
+    return grads.detach().abs().sum(dim=0, keepdim=True)                    # (1, H, W)
 
 
 def _hot_colormap(g):
@@ -343,12 +336,11 @@ def _composite_render(viewpoint_cam, gaussians, sky_model, pipe, separate_sh,
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
              sky_sh_degree, lambda_sky_opacity, sky_lr_init, sky_lr_final,
-             use_critic, critic_start_iter, critic_iters, lambda_adv, lambda_gp,
-             lr_critic, critic_base_channels,
+             critic_start_iter, critic_iters, lambda_adv, lambda_gp,
+             lambda_drift, lr_critic, critic_base_channels,
              use_hf_prior, lambda_hf_loss,
              use_offroad_critic, road_width, road_width_init_frac,
-             road_width_warmup_iters, jitter_directions, jitter_faces,
-             n_jitter_eval):
+             road_width_warmup_iters, jitter_directions, jitter_faces):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -411,13 +403,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     n_with_skymask = sum(1 for c in train_cams if getattr(c, "invmonodepth_raw", None) is not None)
     print(f"[sky] train viewpoints: total={n_total}  with_skymask_loaded={n_with_skymask}")
 
-    # ── WGAN-GP critic (optional) ────────────────────────────────────────
-    # The critic scores the composited render (fake) vs the GT image (real).
-    # The generator (Gaussians + sky) gets λ_adv·(-C(fake)) added to its
-    # loss; the critic is updated for K WGAN-GP micro-steps each iter.
+    # ── WGAN-GP critic (off-path adversarial supervision) ────────────────
+    # The critic scores the off-path (jittered) render as fake and the
+    # on-path render as real. The generator (Gaussians + sky) gets
+    # λ_adv·(-C(fake)) added to its loss; the critic is updated for K
+    # WGAN-GP micro-steps each iter. Created iff --use_offroad_critic.
     critic = None
     critic_optimizer = None
-    if use_critic:
+    if use_offroad_critic:
         critic = Critic(in_channels=3, base_channels=critic_base_channels).cuda()
         critic_optimizer = torch.optim.Adam(
             critic.parameters(), lr=lr_critic, betas=(0.0, 0.9))
@@ -427,8 +420,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 critic.load_state_dict(torch.load(critic_ckpt, map_location="cuda"))
                 print(f"[critic] resumed from {critic_ckpt}")
         print(f"[critic] enabled  base_ch={critic_base_channels}  "
-              f"start_iter={critic_start_iter}  K={critic_iters}  "
-              f"λ_adv={lambda_adv}  λ_gp={lambda_gp}  lr={lr_critic}")
+              f"critic_start_iter={critic_start_iter}  K={critic_iters}  "
+              f"λ_adv={lambda_adv}  λ_gp={lambda_gp}  λ_drift={lambda_drift}  lr={lr_critic}")
     else:
         print("[critic] disabled")
 
@@ -445,8 +438,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     traj_forward, traj_up, traj_lateral = _compute_trajectory_basis(train_cams)
 
     if use_offroad_critic:
-        if not use_critic:
-            sys.exit("[off-road] --use_offroad_critic requires --use_critic to instantiate the critic.")
         if road_width <= 0:
             sys.exit("[off-road] --use_offroad_critic requires --road_width > 0 (world units).")
         for d in jitter_directions:
@@ -610,13 +601,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
             depth_branch_skipped += 1
 
-        # WGAN adversarial term.
-        # Two modes:
-        #   identity     (use_critic only): fake = on-path render `image`,
-        #                                   real = GT (set in the critic step).
-        #   off-path     (--use_offroad_critic): fake = render from a
-        #                                   centre-shifted camera (no GT),
-        #                                   real = on-path render `image`.
+        # WGAN adversarial term (off-path only).
+        #   real = on-path render `image`
+        #   fake = render from a centre-shifted (jittered) camera, no GT.
         # The off-path branch needs a 2nd render per iter so we keep it
         # cheap by gating on critic_start_iter and the face filter.
         loss_adv_val = 0.0
@@ -649,12 +636,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_adv = lambda_adv * (-fake_score_g.mean())
             loss = loss + loss_adv
             loss_adv_val = loss_adv.item()
-        elif critic_active and not use_offroad_critic:
-            critic.eval()
-            fake_score_g = critic(image.unsqueeze(0))
-            loss_adv = lambda_adv * (-fake_score_g.mean())
-            loss = loss + loss_adv
-            loss_adv_val = loss_adv.item()
 
         loss.backward()
 
@@ -673,7 +654,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_psnr_for_log = 0.4 * psnr_live + 0.6 * ema_psnr_for_log
             ema_ssim_for_log = 0.4 * ssim_live + 0.6 * ema_ssim_for_log
 
-            if tb_writer and iteration % 10 == 0:
+            if tb_writer and iteration % 500 == 0:
                 seen = depth_branch_taken + depth_branch_skipped
                 hit_pct = 100.0 * depth_branch_taken / max(seen, 1)
                 gauss_n = scene.gaussians.get_xyz.shape[0]
@@ -692,7 +673,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     sky_model.optimizer.param_groups[0]['lr'] if sky_model.optimizer else 0.0,
                     iteration)
 
-            if iteration % 10 == 0:
+            if iteration % 500 == 0:
                 seen = depth_branch_taken + depth_branch_skipped
                 dpct = (100.0 * depth_branch_taken / seen) if seen else 0.0
                 pb = {
@@ -704,7 +685,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Hit%":  f"{dpct:.1f}",
                     "G":     f"{scene.gaussians.get_xyz.shape[0]/1000:.0f}k",
                 }
-                if use_critic:
+                if use_offroad_critic:
                     # W↑ = critic learning faster than gen. W↓ = gen catching up.
                     # GP near 0–1 is healthy; >>1 means lambda_gp too low.
                     pb["Adv"] = f"{ema_loss_adv_for_log:+.4f}"
@@ -718,7 +699,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 dpct = (100.0 * depth_branch_taken / seen) if seen else 0.0
                 print(f"[depth-reg] iterations: total={seen}  depth_branch_taken={depth_branch_taken} "
                       f"({dpct:.1f}%)  depth_branch_skipped={depth_branch_skipped}")
-                if use_critic:
+                if use_offroad_critic:
                     crun_pct = (100.0 * critic_iters_run / max(1, n_post_warmup))
                     print(f"[critic] final EMAs:  W={ema_w_dist_for_log:+.4f}  "
                           f"real={ema_real_score_for_log:+.4f}  fake={ema_fake_score_for_log:+.4f}  "
@@ -726,25 +707,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                           f"L_adv={ema_loss_adv_for_log:+.4f}")
                     print(f"[critic] iters fired: {critic_iters_run}/{n_post_warmup} "
                           f"({crun_pct:.1f}% of post-start iters)")
-                    if use_offroad_critic:
-                        elig_pct = (100.0 * offroad_iters_run / max(1, n_post_warmup))
-                        ramp_t_end = min(1.0,
-                            (iteration - critic_start_iter) / max(1, road_width_warmup_iters))
-                        cur_rw_end = road_width * (road_width_init_frac
-                                                   + (1.0 - road_width_init_frac) * ramp_t_end)
-                        print(f"[off-road] final road_width={cur_rw_end:.3f}  ramp_t={ramp_t_end:.3f}  "
-                              f"eligible_iters={offroad_iters_run}/{n_post_warmup} "
-                              f"({elig_pct:.1f}%)")
+                    elig_pct = (100.0 * offroad_iters_run / max(1, n_post_warmup))
+                    ramp_t_end = min(1.0,
+                        (iteration - critic_start_iter) / max(1, road_width_warmup_iters))
+                    cur_rw_end = road_width * (road_width_init_frac
+                                               + (1.0 - road_width_init_frac) * ramp_t_end)
+                    print(f"[off-road] final road_width={cur_rw_end:.3f}  ramp_t={ramp_t_end:.3f}  "
+                          f"eligible_iters={offroad_iters_run}/{n_post_warmup} "
+                          f"({elig_pct:.1f}%)")
 
             # Periodic eval + image logging
             training_report(tb_writer, iteration, train_cams, test_cams, scene,
                             sky_model, pipe, SPARSE_ADAM_AVAILABLE,
                             lpips_model, dataset.train_test_exp, testing_iterations,
                             traj_forward=traj_forward, traj_up=traj_up,
-                            traj_lateral=traj_lateral, n_jitter_eval=n_jitter_eval,
+                            traj_lateral=traj_lateral,
                             critic=critic, jitter_face_set=jitter_face_set)
             # Critic health snapshot at every test iteration.
-            if iteration in testing_iterations and use_critic:
+            if iteration in testing_iterations and use_offroad_critic:
                 crun_pct = (100.0 * critic_iters_run / max(1, n_post_warmup))
                 print(f"[ITER {iteration}] critic: "
                       f"W={ema_w_dist_for_log:+.4f}  "
@@ -754,7 +734,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                       f"L_c={ema_loss_critic_for_log:+.4f}  "
                       f"L_adv={ema_loss_adv_for_log:+.4f}  "
                       f"fired={critic_iters_run}/{n_post_warmup}({crun_pct:.0f}%)")
-                if use_offroad_critic and critic_active:
+                if critic_active:
                     ramp_t_log = min(1.0,
                         (iteration - critic_start_iter) / max(1, road_width_warmup_iters))
                     cur_rw_log = road_width * (road_width_init_frac
@@ -813,35 +793,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 sky_model.step()
 
         # ── Critic update (WGAN-GP, K micro-steps with detached renders) ──
-        # Outside no_grad because GP needs autograd. The (real, fake) pair
-        # depends on the mode:
-        #   identity:  real = GT (alpha-masked to match `image`),
-        #              fake = on-path composited render.
-        #   off-path:  real = on-path composited render,
-        #              fake = off-path (jittered) composited render.
-        # Only runs in off-path mode when the picked cam passed the face
-        # filter (we already have jit_image then).
+        # Outside no_grad because GP needs autograd.
+        #   real = on-path composited render
+        #   fake = off-path (jittered) composited render
+        # Only runs when the picked cam passed the face filter (we have
+        # jit_image then) and we are past the warmup.
         # Per-iteration critic-side scalars (default 0 when critic didn't fire
-        # this iter — face filter / pre-warmup / off-road only branch).
+        # this iter — face filter / pre-warmup).
         loss_critic_val = 0.0
         w_dist_val = 0.0
         gp_val = 0.0
         real_score_val = 0.0
         fake_score_val = 0.0
-        run_critic_step = critic_active and (
-            (use_offroad_critic and jit_image is not None)
-            or (not use_offroad_critic))
+        run_critic_step = critic_active and jit_image is not None
         if run_critic_step:
             critic.train()
-            if use_offroad_critic:
-                real_img_d = image.detach().clamp(0.0, 1.0)
-                fake_img_d = jit_image.detach().clamp(0.0, 1.0)
-            else:
-                fake_img_d = image.detach().clamp(0.0, 1.0)
-                real_img_d = gt_image
-                if viewpoint_cam.alpha_mask is not None:
-                    real_img_d = real_img_d * alpha_mask_view
-                real_img_d = real_img_d.detach().clamp(0.0, 1.0)
+            real_img_d = image.detach().clamp(0.0, 1.0)
+            fake_img_d = jit_image.detach().clamp(0.0, 1.0)
             for _ in range(max(1, critic_iters)):
                 real_score = critic(real_img_d.unsqueeze(0))
                 fake_score = critic(fake_img_d.unsqueeze(0))
@@ -849,7 +817,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss_c = -w_dist
                 gp = _gradient_penalty(critic, real_img_d.unsqueeze(0),
                                        fake_img_d.unsqueeze(0), real_img_d.device)
-                loss_c = loss_c + lambda_gp * gp
+                # Epsilon-drift: anchors raw scores near 0 so the critic learns
+                # to separate real/fake instead of inflating output magnitude
+                # (PGGAN/Karras). Does not affect the input-gradient the
+                # generator sees, only the absolute score scale.
+                drift = real_score.pow(2).mean() + fake_score.pow(2).mean()
+                loss_c = loss_c + lambda_gp * gp + lambda_drift * drift
                 critic_optimizer.zero_grad(set_to_none=True)
                 loss_c.backward()
                 critic_optimizer.step()
@@ -857,8 +830,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # primary signal: it tends to grow while the critic is still
             # learning, then plateau / shrink as the generator catches up.
             # GP should hover near 0–1; runaway GP ⇒ critic isn't Lipschitz,
-            # raise --lambda_gp. real/fake both drifting together ⇒
-            # collapse / weak signal.
+            # raise --lambda_gp. real/fake both drifting up together ⇒
+            # score inflation / weak signal, raise --lambda_drift.
             loss_critic_val = loss_c.item()
             w_dist_val = w_dist.item()
             gp_val = gp.item()
@@ -878,7 +851,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_real_score_for_log  = 0.4 * real_score_val  + 0.6 * ema_real_score_for_log
             ema_fake_score_for_log  = 0.4 * fake_score_val  + 0.6 * ema_fake_score_for_log
 
-            if tb_writer and iteration % 10 == 0:
+            if tb_writer and iteration % 500 == 0:
                 # Generator-side adversarial term + reconstruction balance.
                 tb_writer.add_scalar('train/loss_adv', loss_adv_val, iteration)
                 # Critic loss components (raw, this iter):
@@ -955,6 +928,63 @@ def _depth_to_gray(d):
     return d_norm.unsqueeze(0).expand(3, -1, -1).contiguous()
 
 
+def _depth_saliency(depth_3ch):
+    """Sobel gradient magnitude of a (3,H,W) depth map → (3,H,W).
+    Raw absolute scale is preserved (no per-image normalization) so
+    comparisons across columns and iterations are meaningful.
+    """
+    gray = depth_3ch[:1].unsqueeze(0)                                       # (1,1,H,W)
+    dtype, device = gray.dtype, gray.device
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                            dtype=dtype, device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                            dtype=dtype, device=device).view(1, 1, 3, 3)
+    gx = F.conv2d(gray, sobel_x, padding=1)
+    gy = F.conv2d(gray, sobel_y, padding=1)
+    mag = (gx ** 2 + gy ** 2).sqrt().squeeze(0)                            # (1,H,W)
+    return mag.expand(3, -1, -1).contiguous()                              # (3,H,W)
+
+
+def _depth_preproc(d):
+    """Preprocess raw inv-depth: inf/nan→0, squeeze to (1,H,W). No normalization."""
+    d = d.detach().float()
+    if d.dim() == 3 and d.shape[0] > 1:
+        d = d[0:1]
+    if d.dim() == 2:
+        d = d.unsqueeze(0)
+    return torch.where(torch.isfinite(d), d, torch.zeros_like(d))          # (1,H,W)
+
+
+def _joint_depth_to_gray(raw_list):
+    """Jointly normalize a list of (1,H,W) raw depths → list of (3,H,W) in [0,1].
+    All images share the same 2nd–98th percentile range so brightness is comparable
+    across columns within the row."""
+    valid_cats = [d.reshape(-1)[d.reshape(-1) > 0] for d in raw_list]
+    valid_cats = [v for v in valid_cats if v.numel() > 0]
+    if valid_cats:
+        all_v = torch.cat(valid_cats)
+        lo = torch.quantile(all_v, 0.02)
+        hi = torch.quantile(all_v, 0.98)
+    else:
+        lo = torch.tensor(0.0, device=raw_list[0].device)
+        hi = torch.tensor(1.0, device=raw_list[0].device)
+    denom = (hi - lo).clamp(min=1e-8)
+    result = []
+    for d in raw_list:
+        valid = d > 0
+        d_norm = ((d - lo) / denom).clamp(0.0, 1.0) * valid.float()
+        result.append(d_norm.expand(3, -1, -1).contiguous())
+    return result
+
+
+def _joint_scale(tensors):
+    """Scale a list of (C,H,W) tensors by their shared global maximum → [0,1].
+    Preserves relative magnitudes across all images in the row."""
+    g_max = max(t.amax().item() for t in tensors)
+    denom = max(g_max, 1e-8)
+    return [(t / denom).clamp(0.0, 1.0) for t in tensors]
+
+
 def _to_3ch(x):
     """Promote any (H,W) / (1,H,W) / (3,H,W) tensor to (3,H,W) in [0,1]."""
     if x.dim() == 2:
@@ -983,7 +1013,7 @@ def training_report(tb_writer, iteration, train_cams, test_cams, scene: Scene,
                     sky_model, pipe, separate_sh,
                     lpips_model, train_test_exp, testing_iterations,
                     traj_forward=None, traj_up=None, traj_lateral=None,
-                    n_jitter_eval=0, critic=None, jitter_face_set=None):
+                    critic=None, jitter_face_set=None):
     if iteration not in testing_iterations:
         return
 
@@ -1016,7 +1046,6 @@ def training_report(tb_writer, iteration, train_cams, test_cams, scene: Scene,
         jitter_face_eff = (jitter_face_set if jitter_face_set is not None
                            else {"front", "back"})
         do_jitter_split = (config['name'] == 'test')
-        n_jitter_done = 0
         for i, viewpoint in enumerate(cams):
             pkg = _composite_render(
                 viewpoint, scene.gaussians, sky_model, pipe,
@@ -1073,16 +1102,18 @@ def training_report(tb_writer, iteration, train_cams, test_cams, scene: Scene,
             Image.fromarray(grid_np).save(img_path)
 
             # ── Jitter-eval grid ──────────────────────────────────────
-            # For the first `n_jitter_eval` eligible test cams, dump an
-            # 8-row × 5-col image (or 6 rows when no critic is available):
-            #   row1: on-path | left  +1u render  | +2u | +3u | +4u
-            #   row2: GT depth| left  +1u depth   | +2u | +3u | +4u           (α·inv-depth)
-            #   row3: GT depth| left  +1u opacity | +2u | +3u | +4u           (accumulated α)
-            #   row4: <blank> | left  +1u heatmap | +2u | +3u | +4u           (critic only)
-            #   row5: on-path | right +1u render  | +2u | +3u | +4u
-            #   row6: GT depth| right +1u depth   | +2u | +3u | +4u
-            #   row7: GT depth| right +1u opacity | +2u | +3u | +4u
-            #   row8: <blank> | right +1u heatmap | +2u | +3u | +4u           (critic only)
+            # For all eligible test cams, dump an
+            # 10-row × 5-col image (or 8 rows when no critic is available):
+            #   row1:  on-path  | left  +1u render  | +2u | +3u | +4u
+            #   row2:  GT depth | left  +1u depth   | +2u | +3u | +4u         (α·inv-depth)
+            #   row3:  GT depth saliency | left +1u depth saliency | +2u | +3u | +4u (Sobel |∇depth|)
+            #   row4:  on-path α| left  +1u opacity | +2u | +3u | +4u         (accumulated α)
+            #   row5:  on-path heat | left  +1u heatmap | +2u | +3u | +4u     (critic only)
+            #   row6:  on-path  | right +1u render  | +2u | +3u | +4u
+            #   row7:  GT depth | right +1u depth   | +2u | +3u | +4u
+            #   row8:  GT depth saliency | right +1u depth saliency | +2u | +3u | +4u (Sobel |∇depth|)
+            #   row9:  on-path α| right +1u opacity | +2u | +3u | +4u         (accumulated α)
+            #   row10: on-path heat | right +1u heatmap | +2u | +3u | +4u     (critic only)
             # Reading guide:
             #   render  : black non-sky region ⇒ hole.
             #   depth   : alpha-weighted inv-depth; dark region surrounded by
@@ -1097,8 +1128,7 @@ def training_report(tb_writer, iteration, train_cams, test_cams, scene: Scene,
                           and traj_up is not None
                           and traj_lateral is not None)
             face_ok = (_camera_face(viewpoint) in jitter_face_eff)
-            if (do_jitter_split and face_ok
-                    and n_jitter_done < n_jitter_eval and have_basis):
+            if (do_jitter_split and face_ok and have_basis):
                 jit_distances = (1.0, 2.0, 3.0, 4.0)
                 def _render_jitter(direction, dist):
                     jc = _build_jittered_camera(
@@ -1120,35 +1150,54 @@ def training_report(tb_writer, iteration, train_cams, test_cams, scene: Scene,
                 left_packs  = [_render_jitter("left",  d) for d in jit_distances]
                 right_packs = [_render_jitter("right", d) for d in jit_distances]
                 left_renders   = [p[0] for p in left_packs]
-                left_depths    = [_depth_to_gray(p[1]) for p in left_packs]
-                left_opacities = [_to_3ch(p[2])        for p in left_packs]
+                left_opacities = [_to_3ch(p[2]) for p in left_packs]
                 right_renders   = [p[0] for p in right_packs]
-                right_depths    = [_depth_to_gray(p[1]) for p in right_packs]
-                right_opacities = [_to_3ch(p[2])        for p in right_packs]
-                gt_d_gray = _depth_to_gray(gt_depth_t)
+                right_opacities = [_to_3ch(p[2]) for p in right_packs]
 
-                row_render_l = torch.cat([rendered]  + left_renders,    dim=-1)
-                row_depth_l  = torch.cat([gt_d_gray] + left_depths,     dim=-1)
-                row_opa_l    = torch.cat([gt_d_gray] + left_opacities,  dim=-1)
-                row_render_r = torch.cat([rendered]  + right_renders,   dim=-1)
-                row_depth_r  = torch.cat([gt_d_gray] + right_depths,    dim=-1)
-                row_opa_r    = torch.cat([gt_d_gray] + right_opacities, dim=-1)
+                # ── Depth rows: joint normalization so all cols share same range ──
+                gt_raw_d      = _depth_preproc(gt_depth_t)
+                left_raw_d    = [_depth_preproc(p[1]) for p in left_packs]
+                right_raw_d   = [_depth_preproc(p[1]) for p in right_packs]
+                l_depth_joint = _joint_depth_to_gray([gt_raw_d] + left_raw_d)
+                r_depth_joint = _joint_depth_to_gray([gt_raw_d] + right_raw_d)
+                gt_d_gray_l   = l_depth_joint[0];  left_depths  = l_depth_joint[1:]
+                gt_d_gray_r   = r_depth_joint[0];  right_depths = r_depth_joint[1:]
+
+                # ── Depth saliency rows: computed on jointly-normalised depths,
+                #    then jointly scaled within each row ─────────────────────────
+                l_dsal_raw = _joint_scale(
+                    [_depth_saliency(gt_d_gray_l)] + [_depth_saliency(d) for d in left_depths])
+                r_dsal_raw = _joint_scale(
+                    [_depth_saliency(gt_d_gray_r)] + [_depth_saliency(d) for d in right_depths])
+                gt_dsal_l  = l_dsal_raw[0];  left_dsal  = l_dsal_raw[1:]
+                gt_dsal_r  = r_dsal_raw[0];  right_dsal = r_dsal_raw[1:]
+
+                row_render_l = torch.cat([rendered]    + left_renders,   dim=-1)
+                row_depth_l  = torch.cat([gt_d_gray_l] + left_depths,    dim=-1)
+                row_dsal_l   = torch.cat([gt_dsal_l]   + left_dsal,      dim=-1)
+                on_path_opa  = _to_3ch(alpha)
+                row_opa_l    = torch.cat([on_path_opa] + left_opacities,  dim=-1)
+                row_render_r = torch.cat([rendered]    + right_renders,   dim=-1)
+                row_depth_r  = torch.cat([gt_d_gray_r] + right_depths,    dim=-1)
+                row_dsal_r   = torch.cat([gt_dsal_r]   + right_dsal,      dim=-1)
+                row_opa_r    = torch.cat([on_path_opa] + right_opacities, dim=-1)
                 if critic is not None:
-                    blank = torch.zeros_like(rendered)
-                    left_heats  = [_hot_colormap(_critic_saliency_map(critic, r))
-                                   for r in left_renders]
-                    right_heats = [_hot_colormap(_critic_saliency_map(critic, r))
-                                   for r in right_renders]
-                    row_heat_l = torch.cat([blank] + left_heats,  dim=-1)
-                    row_heat_r = torch.cat([blank] + right_heats, dim=-1)
+                    # ── Heatmap rows: jointly scale raw saliencies before colormap ──
+                    on_sal_raw   = _critic_saliency_map(critic, rendered)
+                    l_sals_raw   = [_critic_saliency_map(critic, r) for r in left_renders]
+                    r_sals_raw   = [_critic_saliency_map(critic, r) for r in right_renders]
+                    l_sals = _joint_scale([on_sal_raw] + l_sals_raw)
+                    r_sals = _joint_scale([on_sal_raw] + r_sals_raw)
+                    row_heat_l = torch.cat([_hot_colormap(s) for s in l_sals], dim=-1)
+                    row_heat_r = torch.cat([_hot_colormap(s) for s in r_sals], dim=-1)
                     jit_grid = torch.cat([
-                        row_render_l, row_depth_l, row_opa_l, row_heat_l,
-                        row_render_r, row_depth_r, row_opa_r, row_heat_r,
+                        row_render_l, row_depth_l, row_dsal_l, row_opa_l, row_heat_l,
+                        row_render_r, row_depth_r, row_dsal_r, row_opa_r, row_heat_r,
                     ], dim=-2)
                 else:
                     jit_grid = torch.cat([
-                        row_render_l, row_depth_l, row_opa_l,
-                        row_render_r, row_depth_r, row_opa_r,
+                        row_render_l, row_depth_l, row_dsal_l, row_opa_l,
+                        row_render_r, row_depth_r, row_dsal_r, row_opa_r,
                     ], dim=-2)
                 jit_dir = os.path.join(scene.model_path, "log_images",
                                        f"iter_{iteration:06d}", "jitter_images")
@@ -1158,7 +1207,6 @@ def training_report(tb_writer, iteration, train_cams, test_cams, scene: Scene,
                 jg_np = (jit_grid.permute(1, 2, 0).clamp(0.0, 1.0)
                          .cpu().numpy() * 255).astype(np.uint8)
                 Image.fromarray(jg_np).save(jit_path)
-                n_jitter_done += 1
 
         l1_mean    = l1_sum    / n
         psnr_mean  = psnr_sum  / n
@@ -1208,16 +1256,19 @@ if __name__ == "__main__":
     parser.add_argument("--sky_lr_final", type=float, default=1e-4)
 
     # WGAN-GP critic (ported from gopromax_neighbour/train_da2loss_critic.py).
-    parser.add_argument("--use_critic", action="store_true",
-                        help="Enable PatchGAN WGAN-GP critic on the composited render.")
+    # Only used by --use_offroad_critic; the critic is built iff that flag is set.
     parser.add_argument("--critic_start_iter", type=int, default=3000,
                         help="Iteration at which the adversarial term and critic updates kick in.")
-    parser.add_argument("--critic_iters", type=int, default=1,
+    parser.add_argument("--critic_iters", type=int, default=5,
                         help="Critic micro-updates per training iteration (K in WGAN-GP).")
     parser.add_argument("--lambda_adv", type=float, default=0.01,
                         help="Weight of the adversarial (-C(fake)) term on the generator loss.")
     parser.add_argument("--lambda_gp", type=float, default=10.0,
                         help="WGAN-GP gradient-penalty weight.")
+    parser.add_argument("--lambda_drift", type=float, default=1e-3,
+                        help="Epsilon-drift weight: penalizes critic score magnitude "
+                             "(eps*(real^2+fake^2)) to anchor scores near 0 and prevent "
+                             "output-magnitude drift. PGGAN/Karras; typical 1e-3.")
     parser.add_argument("--lr_critic", type=float, default=1e-4)
     parser.add_argument("--critic_base_channels", type=int, default=64)
 
@@ -1230,11 +1281,12 @@ if __name__ == "__main__":
 
     # Off-path adversarial supervision (ported from train_da2loss_critic.py).
     # Trains the splats to render well from camera centres shifted off the
-    # captured trajectory (e.g. several world-units left/right). Requires
-    # --use_critic so a critic exists; flips the critic's (real, fake) pair
-    # from (GT, render) → (on-path render, off-path render).
+    # captured trajectory (e.g. several world-units left/right). This flag
+    # is the master toggle: it builds the WGAN-GP critic and pairs
+    # (real, fake) = (on-path render, off-path render).
     parser.add_argument("--use_offroad_critic", action="store_true",
-                        help="Enable off-path jittered-camera adversarial supervision.")
+                        help="Enable off-path jittered-camera adversarial supervision "
+                             "(also builds the WGAN-GP critic).")
     parser.add_argument("--road_width", type=float, default=0.0,
                         help="Target lateral shift of the jittered camera, in world units.")
     parser.add_argument("--road_width_init_frac", type=float, default=0.1,
@@ -1247,11 +1299,6 @@ if __name__ == "__main__":
     parser.add_argument("--jitter_faces", nargs="*", default=[],
                         help="Cubemap-face suffixes that are eligible for off-path supervision "
                              "(e.g. front back). Empty = all cameras eligible.")
-    parser.add_argument("--n_jitter_eval", type=int, default=3,
-                        help="Per-split number of sample cameras for the jitter-eval grid "
-                             "(2 rows × 5 cols; on-path | +1u | +2u | +3u | +4u, "
-                             "row1=left / row2=right). Saved at every test_iteration to "
-                             "log_images/iter_*/jitter_images/. 0 disables.")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -1276,11 +1323,11 @@ if __name__ == "__main__":
         lambda_sky_opacity=args.lambda_sky_opacity,
         sky_lr_init=args.sky_lr_init,
         sky_lr_final=args.sky_lr_final,
-        use_critic=args.use_critic,
         critic_start_iter=args.critic_start_iter,
         critic_iters=args.critic_iters,
         lambda_adv=args.lambda_adv,
         lambda_gp=args.lambda_gp,
+        lambda_drift=args.lambda_drift,
         lr_critic=args.lr_critic,
         critic_base_channels=args.critic_base_channels,
         use_hf_prior=args.use_hf_prior,
@@ -1291,7 +1338,6 @@ if __name__ == "__main__":
         road_width_warmup_iters=args.road_width_warmup_iters,
         jitter_directions=args.jitter_directions,
         jitter_faces=args.jitter_faces,
-        n_jitter_eval=args.n_jitter_eval,
     )
 
     print("\nTraining complete.")
