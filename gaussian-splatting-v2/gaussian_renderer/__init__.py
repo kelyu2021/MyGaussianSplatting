@@ -112,7 +112,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
     rendered_image, radii, depth_image = raster_out[0], raster_out[1], raster_out[2]
-        
+    # Some rasterizer forks (e.g. the gopro360 fork used in this env) also return
+    # accumulated alpha at raster_out[3]. Plumb it through when present so callers
+    # that need a transmittance channel (sky compositing, opacity supervision) can
+    # use it without a second render pass. Older / vanilla forks that return only
+    # (color, radii, depth) keep working — `alpha` is simply None.
+    alpha_image = raster_out[3] if len(raster_out) > 3 else None
+
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
         exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
@@ -126,7 +132,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0).nonzero(),
         "radii": radii,
-        "depth" : depth_image
+        "depth" : depth_image,
+        "alpha" : alpha_image,
         }
-    
+
     return out

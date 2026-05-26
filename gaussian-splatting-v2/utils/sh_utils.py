@@ -67,7 +67,7 @@ def eval_sh(deg, sh, dirs):
     Returns:
         [..., C]
     """
-    assert deg <= 4 and deg >= 0
+    assert deg <= 8 and deg >= 0
     coeff = (deg + 1) ** 2
     assert sh.shape[-1] >= coeff
 

@@ -30,23 +30,83 @@ cp data/colmap_pointcloud_dense/fused.ply \
 cd /home/lyuk4/GitHub/MyGaussianSplatting/gaussian-splatting 
 conda activate gopro_360 
 
-CUDA_VISIBLE_DEVICES=0 python train_neighbour.py \
-  -s data/colmap_pointcloud_sparse \
-  --images ../cubemap_faces \
-  --depths ../cubemap_faces_da2_png \
-  --depth_l1_weight_init 1.0 \
-  --depth_l1_weight_final 0.01 \
-  -m output/run_02 \
-  --disable_viewer
+# perfect without sky
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour.py   -s data/colmap_pointcloud_sparse   --images ../cubemap_faces   --depths ../cubemap_faces_da2   --depth_l1_weight_init 0.1   --depth_l1_weight_final 0.001   -m output/run_05   --disable_viewer > output/run_05/train.log 2>&1 &
 
-CUDA_VISIBLE_DEVICES=1 python train_neighbour.py \
-  -s data/colmap_pointcloud_sparse \
-  --images ../cubemap_faces \
-  --depths ../cubemap_faces_da2 \
-  --depth_l1_weight_init 0.1 \
-  --depth_l1_weight_final 0.001 \
-  -m output/run_04 \
-  --disable_viewer
+# with sky model
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky.py   -s data/colmap_pointcloud_sparse   --images ../cubemap_faces   --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.06  --depth_l1_weight_init 0.1   --depth_l1_weight_final 0.001   -m output/run_06   --disable_viewer > output/run_06/train.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky.py   -s data/colmap_pointcloud_sparse   --images ../cubemap_faces   --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.1 --depth_l1_weight_init 0.2   --depth_l1_weight_final 0.001   -m output/run_08   --disable_viewer > output/run_08/train.log 2>&1 &
+
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky.py   -s data/colmap_pointcloud_sparse   --images ../cubemap_faces   --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.2 --depth_l1_weight_init 0.4   --depth_l1_weight_final 0.001   -m output/run_09   --disable_viewer > output/run_09/train.log 2>&1 &
+
+# critic
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify.py   -s data/colmap_pointcloud_sparse   --images ../cubemap_faces   --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.06  --depth_l1_weight_init 0.1   --depth_l1_weight_final 0.001   -m output/run_06_critic   --disable_viewer --use_critic --critic_start_iter 20000 --iterations 40000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_hf_prior --lambda_hf_loss 1.0 > output/run_06_critic/train.log 2>&1 &
+
+mkdir -p output/run_07_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py \
+  -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 \
+  --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.2 --depth_l1_weight_final 0.001 \
+  -m output/run_07_critic --disable_viewer \
+  --densify_until_iter 25000 --densify_grad_threshold 0.00015 \
+  --use_critic --critic_start_iter 5000 --critic_iters 1 \
+  --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 \
+  --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 \
+  --road_width_warmup_iters 10000 \
+  --jitter_directions left right --jitter_faces front back \
+  --use_hf_prior --lambda_hf_loss 1.0 > output/run_07_critic/train.log 2>&1 &
+
+mkdir -p output/run_08_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py \
+  -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 \
+  --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.2 --depth_l1_weight_final 0.001 \
+  -m output/run_08_critic --disable_viewer \
+  --densify_until_iter 25000 --densify_grad_threshold 0.00015 \
+  --use_critic --critic_start_iter 5000 --critic_iters 1 \
+  --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 \
+  --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 \
+  --road_width_warmup_iters 15000 \
+  --jitter_directions left right --jitter_faces front back \
+  --use_hf_prior --lambda_hf_loss 1.0 > output/run_08_critic/train.log 2>&1 &
+
+mkdir -p output/run_09_critic
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify.py \
+  -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 \
+  --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.2 --depth_l1_weight_final 0.001 \
+  -m output/run_09_critic --disable_viewer \
+  --densify_until_iter 25000 --densify_grad_threshold 0.00015 \
+  --use_critic --critic_start_iter 5000 --critic_iters 1 \
+  --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 \
+  --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 \
+  --road_width_warmup_iters 10000 \
+  --jitter_directions left right --jitter_faces front back \
+  --use_hf_prior --lambda_hf_loss 1.0 > output/run_09_critic/train.log 2>&1 &
+
+mkdir -p output/run_10_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py \
+  -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 \
+  --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 \
+  -m output/run_10_critic --disable_viewer \
+  --densify_until_iter 25000 --densify_grad_threshold 0.00015 \
+  --use_critic --critic_start_iter 5000 --critic_iters 1 \
+  --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 \
+  --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 \
+  --road_width_warmup_iters 15000 \
+  --jitter_directions left right --jitter_faces front back \
+  --use_hf_prior --lambda_hf_loss 1.0 > output/run_10_critic/train.log 2>&1 &
+
+mkdir -p output/run_11_critic
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify.py \
+  -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 \
+  --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 \
+  -m output/run_11_critic --disable_viewer \
+  --densify_until_iter 25000 --densify_grad_threshold 0.00015 \
+  --use_critic --critic_start_iter 5000 --critic_iters 1 \
+  --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 \
+  --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 \
+  --road_width_warmup_iters 15000 \
+  --jitter_directions left right --jitter_faces front back \
+  --use_hf_prior --lambda_hf_loss 1.0 > output/run_11_critic/train.log 2>&1 &
 
 cd C:\Users\lyuk4\Documents\MiamiUniversity\GaussianSplatting\viewers\bin
 
