@@ -95,18 +95,31 @@ CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py \
   --jitter_directions left right --jitter_faces front back \
   --use_hf_prior --lambda_hf_loss 1.0 > output/run_10_critic/train.log 2>&1 &
 
-mkdir -p output/run_11_critic
-CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify.py \
+mkdir -p output/run_12_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 -m output/run_12_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 10000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_12_critic/train.log 2>&1 &
+
+<!-- mkdir -p output/run_14_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 -m output/run_14_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 10000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_14_critic/train.log 2>&1 &
+
+mkdir -p output/run_13_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 -m output/run_13_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 10000 --critic_iters 5 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_13_critic/train.log 2>&1 &
+
+mkdir -p output/run_13_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py \
   -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 \
   --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 \
-  -m output/run_11_critic --disable_viewer \
+  -m output/run_13_critic --disable_viewer \
   --densify_until_iter 25000 --densify_grad_threshold 0.00015 \
-  --use_critic --critic_start_iter 5000 --critic_iters 1 \
+  --critic_start_iter 10000 --critic_iters 5 \
   --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 \
   --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 \
   --road_width_warmup_iters 15000 \
   --jitter_directions left right --jitter_faces front back \
-  --use_hf_prior --lambda_hf_loss 1.0 > output/run_11_critic/train.log 2>&1 &
+  --use_hf_prior --lambda_hf_loss 1.0 > output/run_13_critic/train.log 2>&1 & -->
+
+# 2026-05-27 slightly add lamda_depth
+mkdir -p output/run_12_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 -m output/run_12_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 10000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_12_critic/train.log 2>&1 &
 
 cd C:\Users\lyuk4\Documents\MiamiUniversity\GaussianSplatting\viewers\bin
 

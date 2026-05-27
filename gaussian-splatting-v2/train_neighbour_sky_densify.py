@@ -419,9 +419,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if os.path.isfile(critic_ckpt):
                 critic.load_state_dict(torch.load(critic_ckpt, map_location="cuda"))
                 print(f"[critic] resumed from {critic_ckpt}")
-        print(f"[critic] enabled  base_ch={critic_base_channels}  "
-              f"critic_start_iter={critic_start_iter}  K={critic_iters}  "
-              f"λ_adv={lambda_adv}  λ_gp={lambda_gp}  λ_drift={lambda_drift}  lr={lr_critic}")
+        print(f"[critic] enabled  critic_base_channels={critic_base_channels}  "
+              f"critic_start_iter={critic_start_iter}  critic_iters={critic_iters}  "
+              f"lambda_adv={lambda_adv}  lambda_gp={lambda_gp}  lambda_drift={lambda_drift}  lr_critic={lr_critic}")
     else:
         print("[critic] disabled")
 
@@ -691,8 +691,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     pb["Adv"] = f"{ema_loss_adv_for_log:+.4f}"
                     pb["W"]   = f"{ema_w_dist_for_log:+.3f}"
                     pb["GP"]  = f"{ema_gp_for_log:.3f}"
-                progress_bar.set_postfix(pb)
-                progress_bar.update(10)
+                progress_bar.set_postfix(pb, refresh=False)
+                progress_bar.update(500)
             if iteration == opt.iterations:
                 progress_bar.close()
                 seen = depth_branch_taken + depth_branch_skipped
@@ -928,12 +928,12 @@ def _depth_to_gray(d):
     return d_norm.unsqueeze(0).expand(3, -1, -1).contiguous()
 
 
-def _depth_saliency(depth_3ch):
-    """Sobel gradient magnitude of a (3,H,W) depth map → (3,H,W).
-    Raw absolute scale is preserved (no per-image normalization) so
-    comparisons across columns and iterations are meaningful.
+def _depth_saliency(depth):
+    """Sobel gradient magnitude of a depth map → (3,H,W). Accepts (1,H,W) or
+    (3,H,W); only the first channel is used. Raw absolute scale is preserved
+    (no per-image normalization) so comparisons across columns are meaningful.
     """
-    gray = depth_3ch[:1].unsqueeze(0)                                       # (1,1,H,W)
+    gray = depth[:1].unsqueeze(0)                                          # (1,1,H,W)
     dtype, device = gray.dtype, gray.device
     sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
                             dtype=dtype, device=device).view(1, 1, 3, 3)
@@ -1019,7 +1019,8 @@ def training_report(tb_writer, iteration, train_cams, test_cams, scene: Scene,
 
     torch.cuda.empty_cache()
 
-    n_train_sample = min(5, len(train_cams))
+    # n_train_sample = min(5, len(train_cams))
+    n_train_sample = len(train_cams)
     if n_train_sample > 0:
         stride = max(1, len(train_cams) // n_train_sample)
         train_sample = train_cams[::stride][:n_train_sample]
@@ -1102,22 +1103,23 @@ def training_report(tb_writer, iteration, train_cams, test_cams, scene: Scene,
             Image.fromarray(grid_np).save(img_path)
 
             # ── Jitter-eval grid ──────────────────────────────────────
-            # For all eligible test cams, dump an
-            # 10-row × 5-col image (or 8 rows when no critic is available):
-            #   row1:  on-path  | left  +1u render  | +2u | +3u | +4u
-            #   row2:  GT depth | left  +1u depth   | +2u | +3u | +4u         (α·inv-depth)
-            #   row3:  GT depth saliency | left +1u depth saliency | +2u | +3u | +4u (Sobel |∇depth|)
-            #   row4:  on-path α| left  +1u opacity | +2u | +3u | +4u         (accumulated α)
-            #   row5:  on-path heat | left  +1u heatmap | +2u | +3u | +4u     (critic only)
-            #   row6:  on-path  | right +1u render  | +2u | +3u | +4u
-            #   row7:  GT depth | right +1u depth   | +2u | +3u | +4u
-            #   row8:  GT depth saliency | right +1u depth saliency | +2u | +3u | +4u (Sobel |∇depth|)
-            #   row9:  on-path α| right +1u opacity | +2u | +3u | +4u         (accumulated α)
-            #   row10: on-path heat | right +1u heatmap | +2u | +3u | +4u     (critic only)
+            # For all eligible test cams, dump a 5-row × 9-col image (4 rows
+            # when no critic). Columns are ordered by physical camera position,
+            # on-path in the centre:
+            #   col order:  L+4u | L+3u | L+2u | L+1u | on-path | R+1u | R+2u | R+3u | R+4u
+            #   row1: render   (black non-sky ⇒ hole)
+            #   row2: depth    (log1p α·inv-depth, joint-normalised across the row)
+            #   row3: depth-grad × critic saliency (fused; Sobel|∇raw-depth| gating
+            #         critic interest. Plain depth gradient if no critic)
+            #   row4: opacity  (accumulated α)
+            #   row5: critic heatmap (|∂(-C)/∂pixels|, joint-scaled; critic only)
             # Reading guide:
             #   render  : black non-sky region ⇒ hole.
             #   depth   : alpha-weighted inv-depth; dark region surrounded by
             #             structured depth ⇒ missing geometry.
+            #   depth-grad×critic : bright only where a depth edge and critic
+            #             interest coincide ⇒ candidate splat sites on geometry
+            #             boundaries the critic flags as fake.
             #   opacity : accumulated α; α≈0 outside sky ⇒ no splats covering
             #             this pixel from the shifted view. Fills with α≈1 as
             #             densification lands new splats.
@@ -1149,56 +1151,64 @@ def training_report(tb_writer, iteration, train_cams, test_cams, scene: Scene,
                     return rgb_, inv_d_, alp_
                 left_packs  = [_render_jitter("left",  d) for d in jit_distances]
                 right_packs = [_render_jitter("right", d) for d in jit_distances]
-                left_renders   = [p[0] for p in left_packs]
-                left_opacities = [_to_3ch(p[2]) for p in left_packs]
-                right_renders   = [p[0] for p in right_packs]
+                # Physical left→right order: L+4u..L+1u | on-path | R+1u..R+4u.
+                # left_packs is [+1u..+4u], so reverse it for the left half.
+                left_renders   = [p[0] for p in reversed(left_packs)]
+                right_renders  = [p[0] for p in right_packs]
+                left_opacities  = [_to_3ch(p[2]) for p in reversed(left_packs)]
                 right_opacities = [_to_3ch(p[2]) for p in right_packs]
+                on_path_opa     = _to_3ch(alpha)
 
-                # ── Depth rows: joint normalization so all cols share same range ──
-                gt_raw_d      = _depth_preproc(gt_depth_t)
-                left_raw_d    = [_depth_preproc(p[1]) for p in left_packs]
-                right_raw_d   = [_depth_preproc(p[1]) for p in right_packs]
-                l_depth_joint = _joint_depth_to_gray([gt_raw_d] + left_raw_d)
-                r_depth_joint = _joint_depth_to_gray([gt_raw_d] + right_raw_d)
-                gt_d_gray_l   = l_depth_joint[0];  left_depths  = l_depth_joint[1:]
-                gt_d_gray_r   = r_depth_joint[0];  right_depths = r_depth_joint[1:]
+                # ── Row 1: render ──
+                row_render = torch.cat(left_renders + [rendered] + right_renders, dim=-1)
 
-                # ── Depth saliency rows: computed on jointly-normalised depths,
-                #    then jointly scaled within each row ─────────────────────────
-                l_dsal_raw = _joint_scale(
-                    [_depth_saliency(gt_d_gray_l)] + [_depth_saliency(d) for d in left_depths])
-                r_dsal_raw = _joint_scale(
-                    [_depth_saliency(gt_d_gray_r)] + [_depth_saliency(d) for d in right_depths])
-                gt_dsal_l  = l_dsal_raw[0];  left_dsal  = l_dsal_raw[1:]
-                gt_dsal_r  = r_dsal_raw[0];  right_dsal = r_dsal_raw[1:]
+                # ── Row 2: depth — log1p, jointly normalised across all 9 cols ──
+                gt_raw_d    = _depth_preproc(gt_depth_t)
+                left_raw_d  = [_depth_preproc(p[1]) for p in reversed(left_packs)]
+                right_raw_d = [_depth_preproc(p[1]) for p in right_packs]
+                raw_sweep   = left_raw_d + [gt_raw_d] + right_raw_d
+                depth_joint = _joint_depth_to_gray([torch.log1p(d) for d in raw_sweep])
+                row_depth   = torch.cat(depth_joint, dim=-1)
 
-                row_render_l = torch.cat([rendered]    + left_renders,   dim=-1)
-                row_depth_l  = torch.cat([gt_d_gray_l] + left_depths,    dim=-1)
-                row_dsal_l   = torch.cat([gt_dsal_l]   + left_dsal,      dim=-1)
-                on_path_opa  = _to_3ch(alpha)
-                row_opa_l    = torch.cat([on_path_opa] + left_opacities,  dim=-1)
-                row_render_r = torch.cat([rendered]    + right_renders,   dim=-1)
-                row_depth_r  = torch.cat([gt_d_gray_r] + right_depths,    dim=-1)
-                row_dsal_r   = torch.cat([gt_dsal_r]   + right_dsal,      dim=-1)
-                row_opa_r    = torch.cat([on_path_opa] + right_opacities, dim=-1)
+                # Critic saliency sweep (raw |∂(-C)/∂pixels|), shared by the
+                # fused row 3 and the row 5 heatmap. None if no critic.
                 if critic is not None:
-                    # ── Heatmap rows: jointly scale raw saliencies before colormap ──
-                    on_sal_raw   = _critic_saliency_map(critic, rendered)
-                    l_sals_raw   = [_critic_saliency_map(critic, r) for r in left_renders]
-                    r_sals_raw   = [_critic_saliency_map(critic, r) for r in right_renders]
-                    l_sals = _joint_scale([on_sal_raw] + l_sals_raw)
-                    r_sals = _joint_scale([on_sal_raw] + r_sals_raw)
-                    row_heat_l = torch.cat([_hot_colormap(s) for s in l_sals], dim=-1)
-                    row_heat_r = torch.cat([_hot_colormap(s) for s in r_sals], dim=-1)
-                    jit_grid = torch.cat([
-                        row_render_l, row_depth_l, row_dsal_l, row_opa_l, row_heat_l,
-                        row_render_r, row_depth_r, row_dsal_r, row_opa_r, row_heat_r,
-                    ], dim=-2)
+                    sal_sweep = ([_critic_saliency_map(critic, r) for r in left_renders]
+                                 + [_critic_saliency_map(critic, rendered)]
+                                 + [_critic_saliency_map(critic, r) for r in right_renders])
                 else:
-                    jit_grid = torch.cat([
-                        row_render_l, row_depth_l, row_dsal_l, row_opa_l,
-                        row_render_r, row_depth_r, row_dsal_r, row_opa_r,
-                    ], dim=-2)
+                    sal_sweep = None
+
+                # ── Row 3: depth-gradient signal. Sobel on raw inv-depth, then
+                #    (if a critic exists) fused multiplicatively with the critic
+                #    saliency so depth edges GATE where the critic wants splats —
+                #    bright only where a depth discontinuity AND critic interest
+                #    coincide. Each modality is joint-scaled to [0,1] first so
+                #    neither dominates by raw scale; the product is re-scaled for
+                #    visibility. Falls back to plain depth gradient w/o critic. ──
+                depth_g = [_depth_saliency(d)[:1] for d in raw_sweep]       # (1,H,W) each
+                if sal_sweep is not None:
+                    dg_n  = _joint_scale(depth_g)
+                    cs_n  = _joint_scale(sal_sweep)
+                    fused = _joint_scale([dg * cs for dg, cs in zip(dg_n, cs_n)])
+                    row_dsal = torch.cat([_to_3ch(f) for f in fused], dim=-1)
+                else:
+                    dsal     = _joint_scale(depth_g)
+                    row_dsal = torch.cat([_to_3ch(d) for d in dsal], dim=-1)
+
+                # ── Row 4: opacity ──
+                row_opa = torch.cat(left_opacities + [on_path_opa] + right_opacities, dim=-1)
+
+                if sal_sweep is not None:
+                    # ── Row 5: critic heatmap — jointly scale raw saliencies,
+                    #    then colormap ──
+                    heats = _joint_scale(sal_sweep)
+                    row_heat = torch.cat([_hot_colormap(s) for s in heats], dim=-1)
+                    jit_grid = torch.cat(
+                        [row_render, row_depth, row_dsal, row_opa, row_heat], dim=-2)
+                else:
+                    jit_grid = torch.cat(
+                        [row_render, row_depth, row_dsal, row_opa], dim=-2)
                 jit_dir = os.path.join(scene.model_path, "log_images",
                                        f"iter_{iteration:06d}", "jitter_images")
                 os.makedirs(jit_dir, exist_ok=True)
@@ -1259,7 +1269,7 @@ if __name__ == "__main__":
     # Only used by --use_offroad_critic; the critic is built iff that flag is set.
     parser.add_argument("--critic_start_iter", type=int, default=3000,
                         help="Iteration at which the adversarial term and critic updates kick in.")
-    parser.add_argument("--critic_iters", type=int, default=5,
+    parser.add_argument("--critic_iters", type=int, default=1,
                         help="Critic micro-updates per training iteration (K in WGAN-GP).")
     parser.add_argument("--lambda_adv", type=float, default=0.01,
                         help="Weight of the adversarial (-C(fake)) term on the generator loss.")
