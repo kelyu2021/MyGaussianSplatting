@@ -80,111 +80,6 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-try:
-    from diffusers import StableDiffusionPipeline
-    DIFFUSERS_FOUND = True
-except ImportError:
-    DIFFUSERS_FOUND = False
-
-
-# ----------------------------------------------------------------------
-# Score Distillation Sampling (SDS) via a latent diffusion prior
-# ----------------------------------------------------------------------
-class _SDS:
-    """Data-free perceptual oracle for off-path renders using SDS.
-
-    Wraps a HuggingFace Stable Diffusion pipeline (fp16).  For a rendered
-    image x (3, H, W) in [0, 1], the SDS loss gradient pushes x toward
-    the image manifold of the diffusion prior conditioned on `prompt`.
-
-    Reference: DreamFusion (Poole et al., 2022) arXiv:2209.14988.
-
-    Note: requires ~4 GB additional VRAM in fp16.  The UNet runs without
-    grad; only the VAE encode → latent path is differentiable.
-    """
-
-    def __init__(self, model_id, prompt, t_min=0.02, t_max=0.98,
-                 guidance_scale=7.5, resolution=512, device='cuda'):
-        if not DIFFUSERS_FOUND:
-            raise RuntimeError(
-                "diffusers not installed. Run: pip install diffusers transformers accelerate")
-
-        pipe = StableDiffusionPipeline.from_pretrained(
-            model_id, torch_dtype=torch.float16,
-            safety_checker=None, requires_safety_checker=False,
-        ).to(device)
-        pipe.set_progress_bar_config(disable=True)
-
-        self.vae          = pipe.vae
-        self.unet         = pipe.unet
-        self.scheduler    = pipe.scheduler
-        self.tokenizer    = pipe.tokenizer
-        self.text_encoder = pipe.text_encoder
-        self.resolution   = resolution
-        self.guidance     = guidance_scale
-        self.device       = device
-
-        for m in [self.vae, self.unet, self.text_encoder]:
-            for p in m.parameters():
-                p.requires_grad_(False)
-
-        n_steps   = self.scheduler.config.num_train_timesteps
-        self.t_lo = max(1, int(t_min * n_steps))
-        self.t_hi = min(n_steps - 1, int(t_max * n_steps))
-
-        self._text_emb = self._encode(prompt)                    # (2, 77, D) fp16
-
-    def _encode(self, prompt):
-        tok = self.tokenizer
-        with torch.no_grad():
-            def _emb(texts):
-                ids = tok(texts, padding='max_length',
-                          max_length=tok.model_max_length,
-                          truncation=True, return_tensors='pt').input_ids.to(self.device)
-                return self.text_encoder(ids)[0]
-            cond   = _emb([prompt])
-            uncond = _emb([''])
-        return torch.cat([uncond, cond], dim=0)                  # (2, 77, D)
-
-    def loss(self, img):
-        """SDS loss for a single rendered image.
-
-        img : (3, H, W) float32 in [0, 1], on CUDA.  Gradients flow back
-              through the VAE encoder into the Gaussian parameters.
-        Returns a scalar loss (fp32).
-        """
-        R = self.resolution
-        x = img.unsqueeze(0)                                     # (1, 3, H, W)
-        if x.shape[-2] != R or x.shape[-1] != R:
-            x = F.interpolate(x, size=(R, R), mode='bilinear', align_corners=False)
-
-        # Encode: [0,1] → [-1,1] → latent (fp16, keeps grad path)
-        x16 = (x * 2.0 - 1.0).half()
-        z   = self.vae.encode(x16).latent_dist.sample() * self.vae.config.scaling_factor
-
-        t = torch.randint(self.t_lo, self.t_hi + 1, (1,), device=self.device)
-
-        with torch.no_grad():
-            noise = torch.randn_like(z)
-            z_t   = self.scheduler.add_noise(z.detach(), noise, t)
-
-            # Classifier-free guidance: one forward pass with doubled batch
-            z_in     = z_t.repeat(2, 1, 1, 1)
-            eps_pred = self.unet(
-                z_in, t.repeat(2),
-                encoder_hidden_states=self._text_emb,
-            ).sample
-            eps_u, eps_c = eps_pred.chunk(2)
-            eps_guided   = eps_u + self.guidance * (eps_c - eps_u)
-
-            # SDS weight: w(t) = 1 - ᾱ_t  (larger at high noise = stronger pull)
-            alpha_bar = self.scheduler.alphas_cumprod[t.item()].to(self.device).half()
-            w_t  = (1.0 - alpha_bar)
-            grad = w_t * (eps_guided - noise)                   # (1, C, H', W')
-
-        # Inject gradient: ∂L/∂z = grad  →  ∂L/∂θ flows through VAE + renderer
-        return (z.float() * grad.float().detach()).sum()
-
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -461,10 +356,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
              critic_patch_size, critic_n_patches,
              use_hf_prior, lambda_hf_loss,
              use_offroad_critic, road_width, road_width_init_frac,
-             road_width_warmup_iters, jitter_directions, jitter_faces,
-             sds_model_id='', sds_prompt='', lambda_sds=0.0,
-             sds_guidance_scale=7.5, sds_t_min=0.02, sds_t_max=0.98,
-             sds_resolution=512, sds_start_iter=5000):
+             road_width_warmup_iters, jitter_directions, jitter_faces):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -586,29 +478,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         jitter_face_set = None
         print("[off-road] disabled")
 
-    # ── SDS diffusion prior ──────────────────────────────────────────────
-    sds_model = None
-    if lambda_sds > 0 and sds_model_id:
-        if not DIFFUSERS_FOUND:
-            sys.exit("[sds] diffusers not installed. Run: pip install diffusers transformers accelerate")
-        print(f"[sds] loading diffusion model: {sds_model_id!r}  prompt={sds_prompt!r}  "
-              f"λ_sds={lambda_sds}  guidance={sds_guidance_scale}  "
-              f"t=[{sds_t_min:.2f},{sds_t_max:.2f}]  res={sds_resolution}  "
-              f"start_iter={sds_start_iter}")
-        sds_model = _SDS(
-            model_id=sds_model_id, prompt=sds_prompt,
-            t_min=sds_t_min, t_max=sds_t_max,
-            guidance_scale=sds_guidance_scale,
-            resolution=sds_resolution,
-        )
-        print("[sds] model loaded")
-        if road_width <= 0:
-            sys.exit("[sds] --lambda_sds requires --road_width > 0 (lateral shift for off-path render)")
-        if not jitter_directions:
-            sys.exit("[sds] --lambda_sds requires --jitter_directions (e.g. left right)")
-    else:
-        print("[sds] disabled (set --lambda_sds > 0 and --sds_model_id to enable)")
-
     # ── LPIPS network (instantiated once, reused for eval) ──────────────
     lpips_model = LPIPS(net_type='vgg').to("cuda").eval()
     for p in lpips_model.parameters():
@@ -639,7 +508,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_gp_for_log = 0.0
     ema_real_score_for_log = 0.0
     ema_fake_score_for_log = 0.0
-    ema_loss_sds_for_log = 0.0
     critic_iters_run = 0
     offroad_iters_run = 0
     n_post_warmup = 0                       # iters with iteration > critic_start_iter
@@ -758,19 +626,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # The off-path branch needs a 2nd render per iter so we keep it
         # cheap by gating on critic_start_iter and the face filter.
         loss_adv_val = 0.0
-        loss_sds_val = 0.0
         jit_pkg = None
         jit_image = None
-        jit_cam = None
         offroad_eligible = (
-            (use_offroad_critic or sds_model is not None)
+            use_offroad_critic
             and (jitter_face_set is None
                  or _camera_face(viewpoint_cam) in jitter_face_set)
         )
         critic_active = (critic is not None and iteration >= critic_start_iter)
-        sds_iter_active = (sds_model is not None and iteration >= sds_start_iter)
-        need_jit = offroad_eligible and (critic_active or sds_iter_active)
-        if need_jit:
+        if critic_active and offroad_eligible:
             ramp_t = min(1.0,
                          (iteration - critic_start_iter) / max(1, road_width_warmup_iters))
             cur_road_width = road_width * (
@@ -786,26 +650,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 use_trained_exp=dataset.train_test_exp,
             )
             jit_image = jit_pkg["composited"]
-
-            if critic_active:
-                critic.eval()
-                fake_patches_g = _crop_random_patches(
-                    jit_image, critic_patch_size, critic_n_patches)
-                fake_score_g = critic(fake_patches_g)
-                loss_adv = lambda_adv * (-fake_score_g.mean())
-                loss = loss + loss_adv
-                loss_adv_val = loss_adv.item()
-
-            # ── Approach #3: SDS diffusion prior ────────────────────────
-            # The diffusion model acts as a data-free oracle for what the
-            # off-path view should look like.  The SDS gradient pulls the
-            # jit render toward the image manifold of the prior without
-            # requiring any ground-truth off-path images.
-            if sds_iter_active:
-                loss_sds_raw = sds_model.loss(jit_image)
-                loss_sds = lambda_sds * loss_sds_raw
-                loss = loss + loss_sds
-                loss_sds_val = loss_sds.item()
+            critic.eval()
+            fake_patches_g = _crop_random_patches(
+                jit_image, critic_patch_size, critic_n_patches)
+            fake_score_g = critic(fake_patches_g)
+            loss_adv = lambda_adv * (-fake_score_g.mean())
+            loss = loss + loss_adv
+            loss_adv_val = loss_adv.item()
 
         loss.backward()
 
@@ -1041,7 +892,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_gp_for_log          = 0.4 * gp_val          + 0.6 * ema_gp_for_log
             ema_real_score_for_log  = 0.4 * real_score_val  + 0.6 * ema_real_score_for_log
             ema_fake_score_for_log  = 0.4 * fake_score_val  + 0.6 * ema_fake_score_for_log
-            ema_loss_sds_for_log    = 0.4 * loss_sds_val    + 0.6 * ema_loss_sds_for_log
 
             if tb_writer and iteration % 500 == 0:
                 # Generator-side adversarial term + reconstruction balance.
@@ -1070,8 +920,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                              100.0 * offroad_iters_run /
                                              max(1, n_post_warmup),
                                              iteration)
-                if sds_model is not None:
-                    tb_writer.add_scalar('sds/loss', loss_sds_val, iteration)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -1520,33 +1368,6 @@ if __name__ == "__main__":
                         help="Cubemap-face suffixes that are eligible for off-path supervision "
                              "(e.g. front back). Empty = all cameras eligible.")
 
-    # Score Distillation Sampling (SDS) diffusion prior (approach #3).
-    # Applies a data-free perceptual regularizer to the off-path (jittered)
-    # renders using a pre-trained latent diffusion model as the image prior.
-    # Requires `pip install diffusers transformers accelerate` and ~4 GB VRAM.
-    # Use --use_offroad_critic (or just --road_width > 0 + --jitter_directions)
-    # to enable off-path rendering; SDS can be used with or without the critic.
-    parser.add_argument("--sds_model_id", type=str, default="",
-                        help="HuggingFace model ID for SDS (e.g. 'stabilityai/stable-diffusion-2-1-base'). "
-                             "Empty disables SDS.")
-    parser.add_argument("--sds_prompt", type=str, default="a photo of a road scene",
-                        help="Text prompt conditioning the SDS diffusion prior.")
-    parser.add_argument("--lambda_sds", type=float, default=0.0,
-                        help="Weight of the SDS loss. Typical range 1e-4–1e-2. "
-                             "Start small and increase if on-path quality degrades.")
-    parser.add_argument("--sds_guidance_scale", type=float, default=7.5,
-                        help="Classifier-free guidance scale for SDS. "
-                             "Higher = stronger pull toward the prompt; >15 can over-saturate.")
-    parser.add_argument("--sds_t_min", type=float, default=0.02,
-                        help="Lower timestep fraction for SDS noise sampling (0–1).")
-    parser.add_argument("--sds_t_max", type=float, default=0.98,
-                        help="Upper timestep fraction for SDS noise sampling (0–1). "
-                             "Narrow the range (e.g. 0.4–0.7) to focus on mid-frequency detail.")
-    parser.add_argument("--sds_resolution", type=int, default=512,
-                        help="Resolution the rendered image is resized to before SDS encoding.")
-    parser.add_argument("--sds_start_iter", type=int, default=5000,
-                        help="Iteration at which SDS loss starts (allows geometry to stabilize first).")
-
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.test_iterations is None:
@@ -1587,14 +1408,6 @@ if __name__ == "__main__":
         road_width_warmup_iters=args.road_width_warmup_iters,
         jitter_directions=args.jitter_directions,
         jitter_faces=args.jitter_faces,
-        sds_model_id=args.sds_model_id,
-        sds_prompt=args.sds_prompt,
-        lambda_sds=args.lambda_sds,
-        sds_guidance_scale=args.sds_guidance_scale,
-        sds_t_min=args.sds_t_min,
-        sds_t_max=args.sds_t_max,
-        sds_resolution=args.sds_resolution,
-        sds_start_iter=args.sds_start_iter,
     )
 
     print("\nTraining complete.")

@@ -1046,6 +1046,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                              100.0 * offroad_iters_run /
                                              max(1, n_post_warmup),
                                              iteration)
+                # Warp losses (approach #1 + #2).
+                if lambda_warp_rgb > 0 or lambda_warp_depth > 0:
+                    tb_writer.add_scalar('warp/loss_rgb',   loss_warp_rgb_val,   iteration)
+                    tb_writer.add_scalar('warp/loss_depth', loss_warp_depth_val, iteration)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -1494,6 +1498,19 @@ if __name__ == "__main__":
                         help="Cubemap-face suffixes that are eligible for off-path supervision "
                              "(e.g. front back). Empty = all cameras eligible.")
 
+    # Depth-warp pseudo-GT losses (approach #1 + #2, requires --use_offroad_critic).
+    # For each off-path (jittered) render, we unproject jit pixels → world 3D via
+    # the rendered depth, then reproject into the on-path camera to sample its GT
+    # image and DA2 depth map as pseudo-GT targets.
+    parser.add_argument("--lambda_warp_rgb", type=float, default=0.0,
+                        help="Weight of the photometric L1 consistency loss between the "
+                             "jittered render and the warped on-path GT image (#2). "
+                             "Typical range 0.05–0.5.")
+    parser.add_argument("--lambda_warp_depth", type=float, default=0.0,
+                        help="Weight of the inverse-depth consistency loss between the "
+                             "jittered render depth and the warped on-path DA2 depth (#1). "
+                             "Typical range 0.05–0.5.")
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     if args.test_iterations is None:
@@ -1534,6 +1551,8 @@ if __name__ == "__main__":
         road_width_warmup_iters=args.road_width_warmup_iters,
         jitter_directions=args.jitter_directions,
         jitter_faces=args.jitter_faces,
+        lambda_warp_rgb=args.lambda_warp_rgb,
+        lambda_warp_depth=args.lambda_warp_depth,
     )
 
     print("\nTraining complete.")

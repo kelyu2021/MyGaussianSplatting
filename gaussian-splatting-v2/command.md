@@ -39,6 +39,26 @@ CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify_v2_wgan.py -s da
 mkdir -p output/run_21_gan
 CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify_v2_gan.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.1 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_21_gan --disable_viewer --densify_until_iter 28000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.1 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --critic_n_patches 16 > output/run_21_gan/train.log 2>&1 &
 
+# colmap restriction: WGAN + depth-warp pseudo-GT (approach #1 + #2)
+#   --lambda_warp_depth: jit rendered inv-depth ≈ warped on-path DA2 inv-depth
+#   --lambda_warp_rgb:   jit rendered RGB        ≈ warped on-path GT image
+# Both losses reuse the existing jit (off-path) render and the on-path camera's
+# COLMAP pose + DA2 depth — no extra data needed. Start with 0.1; raise if
+# off-path geometry still drifts, lower if on-path PSNR regresses.
+mkdir -p output/run_22_gan
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify_v3_wgan.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.1 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_22_gan --disable_viewer --densify_until_iter 28000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --critic_n_patches 16 --lambda_warp_rgb 0.1 --lambda_warp_depth 0.1 > output/run_22_gan/train.log 2>&1 &
+
+# diffusion: WGAN + SDS diffusion prior (approach #3)
+#   Requires: pip install diffusers transformers accelerate  (~4 GB extra VRAM)
+#   --sds_model_id:       any HF Stable Diffusion checkpoint (SD2.1-base = 512px)
+#   --sds_prompt:         text condition for what the off-path view should look like
+#   --lambda_sds:         start small (1e-3); higher = stronger prior pull
+#   --sds_t_min/_t_max:   noise range; narrow (e.g. 0.4–0.7) to focus on mid-freq
+#   --sds_start_iter:     let geometry stabilize before injecting prior
+mkdir -p output/run_23_gan
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify_v2_wgan_diffusion.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.1 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_23_gan --disable_viewer --densify_until_iter 28000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --critic_n_patches 16 --sds_model_id Manojb/stable-diffusion-2-1-base --sds_prompt "a photo of an empty road, realistic street scene, daylight" --lambda_sds 1e-3 --sds_guidance_scale 7.5 --sds_t_min 0.2 --sds_t_max 0.8 --sds_resolution 512 --sds_start_iter 8000 > output/run_23_gan/train.log 2>&1 &
+
+
 # visualize tensor board data
 cd /home/lyuk4/GitHub/MyGaussianSplatting/gaussian-splatting-v2
 tensorboard --logdir output/run_12_critic
