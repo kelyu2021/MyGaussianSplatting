@@ -808,8 +808,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         run_critic_step = critic_active and jit_image is not None
         if run_critic_step:
             critic.train()
-            real_img_d = gt_image.detach().clamp(0.0, 1.0)
+            # Real: a random GT photo from the train set, not paired with this
+            # iter's fake. Exposes the critic to the full empirical photo
+            # distribution instead of locking it to the current view.
+            real_cam = choice(train_cams)
+            real_photo = real_cam.original_image.cuda()
             fake_img_d = jit_image.detach().clamp(0.0, 1.0)
+            if real_photo.shape[-2:] != fake_img_d.shape[-2:]:
+                real_photo = F.interpolate(
+                    real_photo.unsqueeze(0), size=fake_img_d.shape[-2:],
+                    mode='bilinear', align_corners=False,
+                ).squeeze(0)
+            real_img_d = real_photo.detach().clamp(0.0, 1.0)
             for _ in range(max(1, critic_iters)):
                 real_score = critic(real_img_d.unsqueeze(0))
                 fake_score = critic(fake_img_d.unsqueeze(0))

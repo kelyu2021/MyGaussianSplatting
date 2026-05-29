@@ -39,7 +39,7 @@ import sys
 from scene import Scene, GaussianModel
 from scene.sky_model import SkySHModel
 from utils.general_utils import safe_state, get_expon_lr_func
-from utils.graphics_utils import getWorld2View2
+from utils.graphics_utils import getWorld2View2, fov2focal
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -184,6 +184,21 @@ def _gradient_penalty(critic, real, fake, device):
         create_graph=True, retain_graph=True,
     )[0].view(B, -1)
     return ((grad.norm(2, dim=1) - 1.0) ** 2).mean()
+
+
+def _crop_random_patches(img, patch_size, n_patches):
+    """n_patches random patch_size×patch_size crops from a (C, H, W) image.
+    Returns (n_patches, C, ph, pw). Slice views preserve autograd; clamps
+    patch_size to image bounds when the image is smaller."""
+    _, H, W = img.shape
+    ph = min(patch_size, H)
+    pw = min(patch_size, W)
+    out = []
+    for _ in range(n_patches):
+        y = torch.randint(0, H - ph + 1, (1,)).item() if H > ph else 0
+        x = torch.randint(0, W - pw + 1, (1,)).item() if W > pw else 0
+        out.append(img[:, y:y + ph, x:x + pw])
+    return torch.stack(out, dim=0)
 
 
 # ----------------------------------------------------------------------
@@ -334,13 +349,97 @@ def _composite_render(viewpoint_cam, gaussians, sky_model, pipe, separate_sh,
     return pkg
 
 
+# ----------------------------------------------------------------------
+# Depth-warping helpers (approach #1 + #2)
+# ----------------------------------------------------------------------
+def _warp_src_to_jit(src_cam, jit_cam, jit_depth):
+    """Reverse-warp src_cam's image and depth into jit_cam's view.
+
+    For each pixel (u, v) in jit_cam: unproject with jit_depth → world 3D
+    → reproject into src_cam pixel coords → bilinear sample src image/depth.
+
+    jit_depth : (1, H, W) or (H, W) rendered depth (metric, detached).
+
+    Returns:
+        warped_rgb   (3, H, W)       — src image sampled at correspondences
+        warped_depth (1, H, W)|None  — src metric depth, or None if unavailable
+        valid_mask   (1, H, W)       — 1 where depth > 0 and within src bounds
+    """
+    H, W = jit_cam.image_height, jit_cam.image_width
+    fx_j = fov2focal(jit_cam.FoVx, W)
+    fy_j = fov2focal(jit_cam.FoVy, H)
+
+    d = jit_depth.detach()
+    if d.dim() == 3:
+        d = d.squeeze(0)   # (H, W)
+
+    ys, xs = torch.meshgrid(
+        torch.arange(H, device='cuda', dtype=torch.float32),
+        torch.arange(W, device='cuda', dtype=torch.float32),
+        indexing='ij',
+    )
+    # Unproject jit pixels → jit camera frame (COLMAP: x right, y down, z fwd)
+    x_c = (xs - W * 0.5) * d / fx_j
+    y_c = (ys - H * 0.5) * d / fy_j
+    ones = torch.ones_like(d)
+    pts_jit = torch.stack([x_c, y_c, d, ones], dim=-1).reshape(-1, 4)  # (HW, 4)
+
+    # world_view_transform stores W2C^T; standard W2C = .T
+    C2W_jit = torch.inverse(jit_cam.world_view_transform.T)              # (4, 4)
+    pts_world = (C2W_jit @ pts_jit.T).T[:, :3]                          # (HW, 3)
+
+    # Project world → src_cam pixel coords
+    fx_s = fov2focal(src_cam.FoVx, src_cam.image_width)
+    fy_s = fov2focal(src_cam.FoVy, src_cam.image_height)
+    Hs, Ws = src_cam.image_height, src_cam.image_width
+    W2C_src = src_cam.world_view_transform.T                             # (4, 4)
+    pts_w_h = torch.cat(
+        [pts_world, torch.ones(pts_world.shape[0], 1, device='cuda')], dim=-1)
+    pts_src = (W2C_src @ pts_w_h.T).T                                   # (HW, 4)
+
+    z_src = pts_src[:, 2]
+    u_src = pts_src[:, 0] / z_src.clamp(min=1e-6) * fx_s + Ws * 0.5
+    v_src = pts_src[:, 1] / z_src.clamp(min=1e-6) * fy_s + Hs * 0.5
+
+    valid = (
+        (z_src > 0.01) &
+        (u_src >= 0) & (u_src < Ws) &
+        (v_src >= 0) & (v_src < Hs)
+    ).reshape(1, H, W).float()
+
+    # Normalise to [-1, 1] for grid_sample (x=col, y=row)
+    u_n = (u_src / (Ws - 1)) * 2.0 - 1.0
+    v_n = (v_src / (Hs - 1)) * 2.0 - 1.0
+    grid = torch.stack([u_n, v_n], dim=-1).reshape(1, H, W, 2)
+
+    src_img = src_cam.original_image.cuda().unsqueeze(0)    # (1, 3, Hs, Ws)
+    warped_rgb = F.grid_sample(
+        src_img, grid, mode='bilinear', padding_mode='zeros', align_corners=True,
+    ).squeeze(0)                                            # (3, H, W)
+
+    warped_depth = None
+    inv_d = getattr(src_cam, 'invdepthmap', None)
+    if inv_d is not None and getattr(src_cam, 'depth_reliable', False):
+        metric = (1.0 / inv_d.clamp(min=1e-6)).cuda()      # (1,Hs,Ws) or (Hs,Ws)
+        if metric.dim() == 2:
+            metric = metric.unsqueeze(0)
+        warped_depth = F.grid_sample(
+            metric.unsqueeze(0), grid, mode='bilinear',
+            padding_mode='zeros', align_corners=True,
+        ).squeeze(0)                                        # (1, H, W)
+
+    return warped_rgb, warped_depth, valid                  # valid: (1, H, W)
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
              sky_sh_degree, lambda_sky_opacity, sky_lr_init, sky_lr_final,
              critic_start_iter, critic_iters, lambda_adv, lambda_gp,
              lambda_drift, lr_critic, critic_base_channels,
+             critic_patch_size, critic_n_patches,
              use_hf_prior, lambda_hf_loss,
              use_offroad_critic, road_width, road_width_init_frac,
-             road_width_warmup_iters, jitter_directions, jitter_faces):
+             road_width_warmup_iters, jitter_directions, jitter_faces,
+             lambda_warp_rgb=0.0, lambda_warp_depth=0.0):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -422,6 +521,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[critic] enabled  critic_base_channels={critic_base_channels}  "
               f"critic_start_iter={critic_start_iter}  critic_iters={critic_iters}  "
               f"lambda_adv={lambda_adv}  lambda_gp={lambda_gp}  lambda_drift={lambda_drift}  lr_critic={lr_critic}")
+        print(f"[critic] patch supervision  patch_size={critic_patch_size}  "
+              f"critic_n_patches={critic_n_patches}  "
+              f"(real = random crops of one random GT photo per iter)")
     else:
         print("[critic] disabled")
 
@@ -430,6 +532,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
               f"(Haar-DWT high-freq weighting on L1; SplatWeaver arXiv 2605.07287)")
     else:
         print("[hf-prior] disabled")
+
+    if lambda_warp_rgb > 0 or lambda_warp_depth > 0:
+        print(f"[warp] depth-warping losses enabled  "
+              f"λ_warp_rgb={lambda_warp_rgb}  λ_warp_depth={lambda_warp_depth}  "
+              f"(pseudo-GT from src→jit reprojection; requires --use_offroad_critic)")
+    else:
+        print("[warp] depth-warping losses disabled (set λ_warp_rgb / λ_warp_depth > 0 to enable)")
 
     # ── Trajectory basis (always computed; needed for jitter eval grid) ──
     # Used both by the off-path adversarial branch and by `training_report`
@@ -489,6 +598,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_gp_for_log = 0.0
     ema_real_score_for_log = 0.0
     ema_fake_score_for_log = 0.0
+    ema_loss_warp_rgb_for_log = 0.0
+    ema_loss_warp_depth_for_log = 0.0
     critic_iters_run = 0
     offroad_iters_run = 0
     n_post_warmup = 0                       # iters with iteration > critic_start_iter
@@ -607,6 +718,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # The off-path branch needs a 2nd render per iter so we keep it
         # cheap by gating on critic_start_iter and the face filter.
         loss_adv_val = 0.0
+        loss_warp_rgb_val = 0.0
+        loss_warp_depth_val = 0.0
         jit_pkg = None
         jit_image = None
         offroad_eligible = (
@@ -632,10 +745,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             )
             jit_image = jit_pkg["composited"]
             critic.eval()
-            fake_score_g = critic(jit_image.unsqueeze(0))
+            fake_patches_g = _crop_random_patches(
+                jit_image, critic_patch_size, critic_n_patches)
+            fake_score_g = critic(fake_patches_g)
             loss_adv = lambda_adv * (-fake_score_g.mean())
             loss = loss + loss_adv
             loss_adv_val = loss_adv.item()
+
+            # ── Approaches #1 + #2: depth-warp pseudo-GT supervision ────
+            # Unproject jit pixels via rendered depth → world → src_cam,
+            # then sample the on-path GT image and depth as pseudo-GT targets.
+            #   #1 (lambda_warp_depth): inv-depth consistency between the
+            #      jit render and the warped on-path DA2 depth map.
+            #   #2 (lambda_warp_rgb): photometric L1 between the jit render
+            #      and the warped on-path GT image (valid pixels only).
+            loss_warp_rgb_val = 0.0
+            loss_warp_depth_val = 0.0
+            if lambda_warp_rgb > 0 or lambda_warp_depth > 0:
+                warped_rgb, warped_depth, warp_valid = _warp_src_to_jit(
+                    viewpoint_cam, jit_cam, jit_pkg["depth"])
+                n_valid = warp_valid.sum().clamp(min=1.0)
+
+                if lambda_warp_rgb > 0:
+                    loss_w_rgb = lambda_warp_rgb * (
+                        torch.abs(jit_image - warped_rgb.detach()) * warp_valid
+                    ).sum() / n_valid
+                    loss = loss + loss_w_rgb
+                    loss_warp_rgb_val = loss_w_rgb.item()
+
+                if lambda_warp_depth > 0 and warped_depth is not None:
+                    jit_inv_rend  = 1.0 / jit_pkg["depth"].clamp(min=1e-6)
+                    jit_inv_warp  = 1.0 / warped_depth.clamp(min=1e-6).detach()
+                    loss_w_depth = lambda_warp_depth * (
+                        torch.abs(jit_inv_rend - jit_inv_warp) * warp_valid
+                    ).sum() / n_valid
+                    loss = loss + loss_w_depth
+                    loss_warp_depth_val = loss_w_depth.item()
 
         loss.backward()
 
@@ -808,15 +953,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         run_critic_step = critic_active and jit_image is not None
         if run_critic_step:
             critic.train()
-            real_img_d = gt_image.detach().clamp(0.0, 1.0)
+            # Real: a random GT photo from the train set, not paired with this
+            # iter's fake. Exposes the critic to the full empirical photo
+            # distribution instead of locking it to the current view (#2).
+            real_cam = choice(train_cams)
+            real_photo = real_cam.original_image.cuda()
             fake_img_d = jit_image.detach().clamp(0.0, 1.0)
+            if real_photo.shape[-2:] != fake_img_d.shape[-2:]:
+                real_photo = F.interpolate(
+                    real_photo.unsqueeze(0), size=fake_img_d.shape[-2:],
+                    mode='bilinear', align_corners=False,
+                ).squeeze(0)
+            real_img_d = real_photo.detach().clamp(0.0, 1.0)
+            # Patch supervision (#3): crop N random patches from each side
+            # so the critic scores local texture. Random crops are sampled
+            # independently for real and fake. Many fake patches will fall on
+            # the black holes left by under-densified off-path regions; the
+            # generator-side `-C(fake_patches)` then pulls those regions
+            # toward real-photo statistics rather than toward whole-frame
+            # composition.
+            real_patches = _crop_random_patches(
+                real_img_d, critic_patch_size, critic_n_patches)
+            fake_patches = _crop_random_patches(
+                fake_img_d, critic_patch_size, critic_n_patches)
             for _ in range(max(1, critic_iters)):
-                real_score = critic(real_img_d.unsqueeze(0))
-                fake_score = critic(fake_img_d.unsqueeze(0))
+                real_score = critic(real_patches)
+                fake_score = critic(fake_patches)
                 w_dist = real_score.mean() - fake_score.mean()
                 loss_c = -w_dist
-                gp = _gradient_penalty(critic, real_img_d.unsqueeze(0),
-                                       fake_img_d.unsqueeze(0), real_img_d.device)
+                gp = _gradient_penalty(critic, real_patches, fake_patches,
+                                       real_patches.device)
                 # Epsilon-drift: anchors raw scores near 0 so the critic learns
                 # to separate real/fake instead of inflating output magnitude
                 # (PGGAN/Karras). Does not affect the input-gradient the
@@ -844,12 +1010,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             n_post_warmup += 1
 
         with torch.no_grad():
-            ema_loss_adv_for_log    = 0.4 * loss_adv_val    + 0.6 * ema_loss_adv_for_log
-            ema_loss_critic_for_log = 0.4 * loss_critic_val + 0.6 * ema_loss_critic_for_log
-            ema_w_dist_for_log      = 0.4 * w_dist_val      + 0.6 * ema_w_dist_for_log
-            ema_gp_for_log          = 0.4 * gp_val          + 0.6 * ema_gp_for_log
-            ema_real_score_for_log  = 0.4 * real_score_val  + 0.6 * ema_real_score_for_log
-            ema_fake_score_for_log  = 0.4 * fake_score_val  + 0.6 * ema_fake_score_for_log
+            ema_loss_adv_for_log      = 0.4 * loss_adv_val        + 0.6 * ema_loss_adv_for_log
+            ema_loss_critic_for_log   = 0.4 * loss_critic_val      + 0.6 * ema_loss_critic_for_log
+            ema_w_dist_for_log        = 0.4 * w_dist_val           + 0.6 * ema_w_dist_for_log
+            ema_gp_for_log            = 0.4 * gp_val               + 0.6 * ema_gp_for_log
+            ema_real_score_for_log    = 0.4 * real_score_val        + 0.6 * ema_real_score_for_log
+            ema_fake_score_for_log    = 0.4 * fake_score_val        + 0.6 * ema_fake_score_for_log
+            ema_loss_warp_rgb_for_log   = 0.4 * loss_warp_rgb_val   + 0.6 * ema_loss_warp_rgb_for_log
+            ema_loss_warp_depth_for_log = 0.4 * loss_warp_depth_val + 0.6 * ema_loss_warp_depth_for_log
 
             if tb_writer and iteration % 500 == 0:
                 # Generator-side adversarial term + reconstruction balance.
@@ -1281,6 +1449,22 @@ if __name__ == "__main__":
                              "output-magnitude drift. PGGAN/Karras; typical 1e-3.")
     parser.add_argument("--lr_critic", type=float, default=1e-4)
     parser.add_argument("--critic_base_channels", type=int, default=64)
+    parser.add_argument("--critic_patch_size", type=int, default=128,
+                        help="Side length (px) of the random patches the critic sees. "
+                             "For uniformly-scattered small defects, the score shift "
+                             "from real is ~hole_density and is patch_size-invariant; "
+                             "bigger patches do NOT raise per-patch signal, only its "
+                             "smoothness. Keep modest (>=64; below that the pre-pool "
+                             "grid is too small to average meaningfully) and spend "
+                             "compute on --critic_n_patches instead.")
+    parser.add_argument("--critic_n_patches", type=int, default=8,
+                        help="Number of random patch crops per image per iteration "
+                             "(used for both real and fake batches). For small, "
+                             "scattered holes raise this rather than patch_size: "
+                             "more crop locations = more holes hit per iter and a "
+                             "less noisy W-distance estimate. 16 at ps=128 gives the "
+                             "same total FLOPs and coverage as 4 at ps=256, but with "
+                             "4x the spatial diversity.")
 
     # SplatWeaver high-frequency densification prior (arXiv 2605.07287, Eq. 5).
     parser.add_argument("--use_hf_prior", action="store_true",
@@ -1340,6 +1524,8 @@ if __name__ == "__main__":
         lambda_drift=args.lambda_drift,
         lr_critic=args.lr_critic,
         critic_base_channels=args.critic_base_channels,
+        critic_patch_size=args.critic_patch_size,
+        critic_n_patches=args.critic_n_patches,
         use_hf_prior=args.use_hf_prior,
         lambda_hf_loss=args.lambda_hf_loss,
         use_offroad_critic=args.use_offroad_critic,

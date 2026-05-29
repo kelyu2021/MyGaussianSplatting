@@ -1,3 +1,48 @@
+# 05-27-2026 introduce patchGan
+#  1. on-path ground truth = real image
+#  2. introduce local patch critic to decouple realism from "match on path"
+#  3. optional, use colmap to regularize depth and keep multi-view consistency
+
+mkdir -p output/run_13_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 -m output/run_13_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_13_critic/train.log 2>&1 &
+
+mkdir -p output/run_13_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify_v2.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 -m output/run_13_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_13_critic/train.log 2>&1 &
+
+mkdir -p output/run_14_critic
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify_v2_patchgan.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.06 --depth_l1_weight_init 0.3 --depth_l1_weight_final 0.001 -m output/run_14_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_14_critic/train.log 2>&1 &
+
+mkdir -p output/run_15_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify_v2.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.08 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_15_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_15_critic/train.log 2>&1 &
+
+mkdir -p output/run_16_critic
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify_v2_patchgan.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.08 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_16_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_16_critic/train.log 2>&1 &
+
+# increate lambda_sky_opacity
+mkdir -p output/run_17_critic
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify_v2_wgan.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.1 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_17_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 > output/run_17_critic/train.log 2>&1 &
+
+# increate lambda_sky_opacity and inscrease critic_patch_size from 128 to 256
+<!-- mkdir -p output/run_18_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify_v2_patchgan.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.1 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_18_critic --disable_viewer --densify_until_iter 25000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.01 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 --critic_patch_size 256 > output/run_18_critic/train.log 2>&1 &
+-->
+
+# increase lambda_adv from 0.01 to 0.1, n_patches from 8 to 16
+mkdir -p output/run_19_critic
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify_v2_wgan.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.1 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_19_critic --disable_viewer --densify_until_iter 28000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.1 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 1.0 --critic_n_patches 16 > output/run_19_critic/train.log 2>&1 &
+
+# increase lambda_adv from 0.01 to 0.1, n_patches from 8 to 16 disable lambda_hf_loss
+mkdir -p output/run_20_critic
+CUDA_VISIBLE_DEVICES=1 nohup python train_neighbour_sky_densify_v2_wgan.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.1 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_20_critic --disable_viewer --densify_until_iter 28000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.1 --lambda_gp 10.0 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --use_hf_prior --lambda_hf_loss 0.0 --critic_n_patches 16 > output/run_20_critic/train.log 2>&1 &
+
+# switch to BCE GAN (non-saturating), no HF prior, lambda_adv=0.1, n_patches=16
+mkdir -p output/run_21_gan
+CUDA_VISIBLE_DEVICES=0 nohup python train_neighbour_sky_densify_v2_gan.py -s data/colmap_pointcloud_sparse --images ../cubemap_faces --depths ../cubemap_faces_da2 --lambda_sky_opacity 0.1 --depth_l1_weight_init 0.5 --depth_l1_weight_final 0.001 -m output/run_21_gan --disable_viewer --densify_until_iter 28000 --densify_grad_threshold 0.00015 --critic_start_iter 5000 --critic_iters 1 --lambda_adv 0.1 --lr_critic 1e-4 --critic_base_channels 64 --use_offroad_critic --road_width 4.0 --road_width_init_frac 0.1 --road_width_warmup_iters 15000 --jitter_directions left right --jitter_faces front back --critic_n_patches 16 > output/run_21_gan/train.log 2>&1 &
+
+# visualize tensor board data
+cd /home/lyuk4/GitHub/MyGaussianSplatting/gaussian-splatting-v2
+tensorboard --logdir output/run_12_critic
+
 # sparse point cloud
 python colmap_pointcloud_sparse.py --image_dir data/cubemap_faces --output_dir data/colmap_pointcloud_sparse --use_gpu 0 --matcher exhaustive
 

@@ -100,10 +100,10 @@ def _sky_mask_from_cam(cam):
 
 
 # ----------------------------------------------------------------------
-# WGAN-GP critic (PatchGAN), ported from gopromax_neighbour/train_da2loss_critic.py
+# GAN discriminator (PatchGAN) with BCE loss
 # ----------------------------------------------------------------------
 class Critic(nn.Module):
-    """Lightweight PatchGAN critic for WGAN-GP. (B, 3, H, W) -> (B, 1)."""
+    """Lightweight PatchGAN discriminator with non-saturating BCE. (B, 3, H, W) -> (B, 1) logits."""
 
     def __init__(self, in_channels: int = 3, base_channels: int = 64):
         super().__init__()
@@ -144,7 +144,7 @@ def _critic_saliency_map(critic, img):
     No smoothing, no sqrt compression, no normalization. Absolute scale
     is preserved so comparisons across images/iterations are meaningful.
     Uses `torch.autograd.grad` so the critic's parameters' `.grad` is
-    left untouched (no interference with the WGAN-GP optimiser state).
+    left untouched (no interference with the discriminator optimiser state).
     """
     was_training = critic.training
     critic.eval()
@@ -172,18 +172,20 @@ def _hot_colormap(g):
     return torch.stack([r, grn, b], dim=0)                                  # (3, H, W)
 
 
-def _gradient_penalty(critic, real, fake, device):
-    """WGAN-GP gradient penalty on a linear real/fake interpolation."""
-    B = real.size(0)
-    alpha = torch.rand(B, 1, 1, 1, device=device)
-    interp = (alpha * real + (1.0 - alpha) * fake).requires_grad_(True)
-    scores = critic(interp)
-    grad = torch.autograd.grad(
-        outputs=scores, inputs=interp,
-        grad_outputs=torch.ones_like(scores),
-        create_graph=True, retain_graph=True,
-    )[0].view(B, -1)
-    return ((grad.norm(2, dim=1) - 1.0) ** 2).mean()
+
+def _crop_random_patches(img, patch_size, n_patches):
+    """n_patches random patch_size×patch_size crops from a (C, H, W) image.
+    Returns (n_patches, C, ph, pw). Slice views preserve autograd; clamps
+    patch_size to image bounds when the image is smaller."""
+    _, H, W = img.shape
+    ph = min(patch_size, H)
+    pw = min(patch_size, W)
+    out = []
+    for _ in range(n_patches):
+        y = torch.randint(0, H - ph + 1, (1,)).item() if H > ph else 0
+        x = torch.randint(0, W - pw + 1, (1,)).item() if W > pw else 0
+        out.append(img[:, y:y + ph, x:x + pw])
+    return torch.stack(out, dim=0)
 
 
 # ----------------------------------------------------------------------
@@ -336,8 +338,9 @@ def _composite_render(viewpoint_cam, gaussians, sky_model, pipe, separate_sh,
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from,
              sky_sh_degree, lambda_sky_opacity, sky_lr_init, sky_lr_final,
-             critic_start_iter, critic_iters, lambda_adv, lambda_gp,
-             lambda_drift, lr_critic, critic_base_channels,
+             critic_start_iter, critic_iters, lambda_adv,
+             lr_critic, critic_base_channels,
+             critic_patch_size, critic_n_patches,
              use_hf_prior, lambda_hf_loss,
              use_offroad_critic, road_width, road_width_init_frac,
              road_width_warmup_iters, jitter_directions, jitter_faces):
@@ -403,25 +406,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     n_with_skymask = sum(1 for c in train_cams if getattr(c, "invmonodepth_raw", None) is not None)
     print(f"[sky] train viewpoints: total={n_total}  with_skymask_loaded={n_with_skymask}")
 
-    # ── WGAN-GP critic (off-path adversarial supervision) ────────────────
-    # The critic scores the off-path (jittered) render as fake and the
-    # on-path render as real. The generator (Gaussians + sky) gets
-    # λ_adv·(-C(fake)) added to its loss; the critic is updated for K
-    # WGAN-GP micro-steps each iter. Created iff --use_offroad_critic.
+    # ── GAN discriminator (off-path adversarial supervision) ─────────────
+    # The discriminator scores the off-path (jittered) render as fake and a
+    # random GT photo as real. The generator (Gaussians + sky) gets
+    # λ_adv · BCE(D(fake), 1) added to its loss (non-saturating form);
+    # the discriminator is updated with BCE each iter. Created iff --use_offroad_critic.
     critic = None
     critic_optimizer = None
     if use_offroad_critic:
         critic = Critic(in_channels=3, base_channels=critic_base_channels).cuda()
         critic_optimizer = torch.optim.Adam(
-            critic.parameters(), lr=lr_critic, betas=(0.0, 0.9))
+            critic.parameters(), lr=lr_critic, betas=(0.5, 0.999))
         if checkpoint:
             critic_ckpt = os.path.join(scene.model_path, f"critic_iter_{first_iter}.pth")
             if os.path.isfile(critic_ckpt):
                 critic.load_state_dict(torch.load(critic_ckpt, map_location="cuda"))
                 print(f"[critic] resumed from {critic_ckpt}")
-        print(f"[critic] enabled  critic_base_channels={critic_base_channels}  "
+        print(f"[critic] enabled (BCE/non-saturating)  critic_base_channels={critic_base_channels}  "
               f"critic_start_iter={critic_start_iter}  critic_iters={critic_iters}  "
-              f"lambda_adv={lambda_adv}  lambda_gp={lambda_gp}  lambda_drift={lambda_drift}  lr_critic={lr_critic}")
+              f"lambda_adv={lambda_adv}  lr_critic={lr_critic}")
+        print(f"[critic] patch supervision  patch_size={critic_patch_size}  "
+              f"n_patches={critic_n_patches}  "
+              f"(real = random crops of one random GT photo per iter)")
     else:
         print("[critic] disabled")
 
@@ -485,10 +491,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_ssim_for_log = 0.0
     ema_loss_adv_for_log = 0.0
     ema_loss_critic_for_log = 0.0
-    ema_w_dist_for_log = 0.0
-    ema_gp_for_log = 0.0
-    ema_real_score_for_log = 0.0
-    ema_fake_score_for_log = 0.0
+    ema_real_score_for_log = 0.5   # D(real) probability; healthy: →1
+    ema_fake_score_for_log = 0.5   # D(fake) probability; healthy: →0
     critic_iters_run = 0
     offroad_iters_run = 0
     n_post_warmup = 0                       # iters with iteration > critic_start_iter
@@ -601,8 +605,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
             depth_branch_skipped += 1
 
-        # WGAN adversarial term (off-path only).
-        #   real = on-path render `image`
+        # GAN adversarial term (off-path only), non-saturating generator loss.
         #   fake = render from a centre-shifted (jittered) camera, no GT.
         # The off-path branch needs a 2nd render per iter so we keep it
         # cheap by gating on critic_start_iter and the face filter.
@@ -632,8 +635,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             )
             jit_image = jit_pkg["composited"]
             critic.eval()
-            fake_score_g = critic(jit_image.unsqueeze(0))
-            loss_adv = lambda_adv * (-fake_score_g.mean())
+            fake_patches_g = _crop_random_patches(
+                jit_image, critic_patch_size, critic_n_patches)
+            fake_score_g = critic(fake_patches_g)
+            # Non-saturating generator loss: -log(sigmoid(D(fake)))
+            loss_adv = lambda_adv * F.binary_cross_entropy_with_logits(
+                fake_score_g, torch.ones_like(fake_score_g))
             loss = loss + loss_adv
             loss_adv_val = loss_adv.item()
 
@@ -686,11 +693,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "G":     f"{scene.gaussians.get_xyz.shape[0]/1000:.0f}k",
                 }
                 if use_offroad_critic:
-                    # W↑ = critic learning faster than gen. W↓ = gen catching up.
-                    # GP near 0–1 is healthy; >>1 means lambda_gp too low.
+                    # D_r→1 and D_f→0 means discriminator is winning.
+                    # D_r≈D_f≈0.5 means generator is catching up.
                     pb["Adv"] = f"{ema_loss_adv_for_log:+.4f}"
-                    pb["W"]   = f"{ema_w_dist_for_log:+.3f}"
-                    pb["GP"]  = f"{ema_gp_for_log:.3f}"
+                    pb["D_r"] = f"{ema_real_score_for_log:.3f}"
+                    pb["D_f"] = f"{ema_fake_score_for_log:.3f}"
                 progress_bar.set_postfix(pb, refresh=False)
                 progress_bar.update(500)
             if iteration == opt.iterations:
@@ -701,9 +708,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                       f"({dpct:.1f}%)  depth_branch_skipped={depth_branch_skipped}")
                 if use_offroad_critic:
                     crun_pct = (100.0 * critic_iters_run / max(1, n_post_warmup))
-                    print(f"[critic] final EMAs:  W={ema_w_dist_for_log:+.4f}  "
-                          f"real={ema_real_score_for_log:+.4f}  fake={ema_fake_score_for_log:+.4f}  "
-                          f"GP={ema_gp_for_log:.4f}  L_c={ema_loss_critic_for_log:+.4f}  "
+                    print(f"[critic] final EMAs:  D_real={ema_real_score_for_log:.4f}  "
+                          f"D_fake={ema_fake_score_for_log:.4f}  "
+                          f"L_c={ema_loss_critic_for_log:+.4f}  "
                           f"L_adv={ema_loss_adv_for_log:+.4f}")
                     print(f"[critic] iters fired: {critic_iters_run}/{n_post_warmup} "
                           f"({crun_pct:.1f}% of post-start iters)")
@@ -727,10 +734,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration in testing_iterations and use_offroad_critic:
                 crun_pct = (100.0 * critic_iters_run / max(1, n_post_warmup))
                 print(f"[ITER {iteration}] critic: "
-                      f"W={ema_w_dist_for_log:+.4f}  "
-                      f"real={ema_real_score_for_log:+.4f}  "
-                      f"fake={ema_fake_score_for_log:+.4f}  "
-                      f"GP={ema_gp_for_log:.4f}  "
+                      f"D_real={ema_real_score_for_log:.4f}  "
+                      f"D_fake={ema_fake_score_for_log:.4f}  "
                       f"L_c={ema_loss_critic_for_log:+.4f}  "
                       f"L_adv={ema_loss_adv_for_log:+.4f}  "
                       f"fired={critic_iters_run}/{n_post_warmup}({crun_pct:.0f}%)")
@@ -792,51 +797,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.zero_grad(set_to_none = True)
                 sky_model.step()
 
-        # ── Critic update (WGAN-GP, K micro-steps with detached renders) ──
-        # Outside no_grad because GP needs autograd.
-        #   real = on-path composited render
-        #   fake = off-path (jittered) composited render
-        # Only runs when the picked cam passed the face filter (we have
-        # jit_image then) and we are past the warmup.
-        # Per-iteration critic-side scalars (default 0 when critic didn't fire
-        # this iter — face filter / pre-warmup).
+        # ── Discriminator update (BCE, K micro-steps with detached renders) ─
+        # real = random GT photo; fake = off-path (jittered) composited render.
+        # Only runs when the picked cam passed the face filter and we are past
+        # the warmup. Per-iteration scalars default to 0.5 when not fired.
         loss_critic_val = 0.0
-        w_dist_val = 0.0
-        gp_val = 0.0
-        real_score_val = 0.0
-        fake_score_val = 0.0
+        real_score_val = 0.5
+        fake_score_val = 0.5
         run_critic_step = critic_active and jit_image is not None
         if run_critic_step:
             critic.train()
-            real_img_d = gt_image.detach().clamp(0.0, 1.0)
+            real_cam = choice(train_cams)
+            real_photo = real_cam.original_image.cuda()
             fake_img_d = jit_image.detach().clamp(0.0, 1.0)
+            if real_photo.shape[-2:] != fake_img_d.shape[-2:]:
+                real_photo = F.interpolate(
+                    real_photo.unsqueeze(0), size=fake_img_d.shape[-2:],
+                    mode='bilinear', align_corners=False,
+                ).squeeze(0)
+            real_img_d = real_photo.detach().clamp(0.0, 1.0)
+            real_patches = _crop_random_patches(
+                real_img_d, critic_patch_size, critic_n_patches)
+            fake_patches = _crop_random_patches(
+                fake_img_d, critic_patch_size, critic_n_patches)
             for _ in range(max(1, critic_iters)):
-                real_score = critic(real_img_d.unsqueeze(0))
-                fake_score = critic(fake_img_d.unsqueeze(0))
-                w_dist = real_score.mean() - fake_score.mean()
-                loss_c = -w_dist
-                gp = _gradient_penalty(critic, real_img_d.unsqueeze(0),
-                                       fake_img_d.unsqueeze(0), real_img_d.device)
-                # Epsilon-drift: anchors raw scores near 0 so the critic learns
-                # to separate real/fake instead of inflating output magnitude
-                # (PGGAN/Karras). Does not affect the input-gradient the
-                # generator sees, only the absolute score scale.
-                drift = real_score.pow(2).mean() + fake_score.pow(2).mean()
-                loss_c = loss_c + lambda_gp * gp + lambda_drift * drift
+                real_score = critic(real_patches)
+                fake_score = critic(fake_patches)
+                # Label smoothing: real→0.9, fake→0.0 (prevents D from
+                # becoming overconfident and giving near-zero generator gradients).
+                real_labels = torch.full_like(real_score, 0.9)
+                fake_labels = torch.zeros_like(fake_score)
+                loss_c = 0.5 * (
+                    F.binary_cross_entropy_with_logits(real_score, real_labels) +
+                    F.binary_cross_entropy_with_logits(fake_score, fake_labels)
+                )
                 critic_optimizer.zero_grad(set_to_none=True)
                 loss_c.backward()
                 critic_optimizer.step()
-            # Snapshot last micro-step for logging. W_dist trend is the
-            # primary signal: it tends to grow while the critic is still
-            # learning, then plateau / shrink as the generator catches up.
-            # GP should hover near 0–1; runaway GP ⇒ critic isn't Lipschitz,
-            # raise --lambda_gp. real/fake both drifting up together ⇒
-            # score inflation / weak signal, raise --lambda_drift.
+            # D(real) and D(fake) probabilities — healthy training: D_real→1, D_fake→0.
             loss_critic_val = loss_c.item()
-            w_dist_val = w_dist.item()
-            gp_val = gp.item()
-            real_score_val = real_score.mean().item()
-            fake_score_val = fake_score.mean().item()
+            real_score_val = torch.sigmoid(real_score).mean().item()
+            fake_score_val = torch.sigmoid(fake_score).mean().item()
             critic_iters_run += 1
         if offroad_eligible and critic_active:
             offroad_iters_run += 1
@@ -846,22 +847,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             ema_loss_adv_for_log    = 0.4 * loss_adv_val    + 0.6 * ema_loss_adv_for_log
             ema_loss_critic_for_log = 0.4 * loss_critic_val + 0.6 * ema_loss_critic_for_log
-            ema_w_dist_for_log      = 0.4 * w_dist_val      + 0.6 * ema_w_dist_for_log
-            ema_gp_for_log          = 0.4 * gp_val          + 0.6 * ema_gp_for_log
             ema_real_score_for_log  = 0.4 * real_score_val  + 0.6 * ema_real_score_for_log
             ema_fake_score_for_log  = 0.4 * fake_score_val  + 0.6 * ema_fake_score_for_log
 
             if tb_writer and iteration % 500 == 0:
-                # Generator-side adversarial term + reconstruction balance.
-                tb_writer.add_scalar('train/loss_adv', loss_adv_val, iteration)
-                # Critic loss components (raw, this iter):
-                #   loss_c_total  = −W + λ_gp · GP
-                tb_writer.add_scalar('critic/loss_total',  loss_critic_val, iteration)
-                tb_writer.add_scalar('critic/w_dist',      w_dist_val,      iteration)
-                tb_writer.add_scalar('critic/real_score',  real_score_val,  iteration)
-                tb_writer.add_scalar('critic/fake_score',  fake_score_val,  iteration)
-                tb_writer.add_scalar('critic/gp_raw',      gp_val,          iteration)
-                tb_writer.add_scalar('critic/gp_weighted', lambda_gp * gp_val, iteration)
+                tb_writer.add_scalar('train/loss_adv',    loss_adv_val,    iteration)
+                tb_writer.add_scalar('critic/loss_total', loss_critic_val, iteration)
+                tb_writer.add_scalar('critic/d_real',     real_score_val,  iteration)
+                tb_writer.add_scalar('critic/d_fake',     fake_score_val,  iteration)
                 # Curriculum + branch firing rate (only after warmup).
                 if critic_active:
                     tb_writer.add_scalar('critic/fired',
@@ -1265,22 +1258,32 @@ if __name__ == "__main__":
     parser.add_argument("--sky_lr_init", type=float, default=1e-2)
     parser.add_argument("--sky_lr_final", type=float, default=1e-4)
 
-    # WGAN-GP critic (ported from gopromax_neighbour/train_da2loss_critic.py).
-    # Only used by --use_offroad_critic; the critic is built iff that flag is set.
+    # GAN discriminator with BCE loss.
+    # Only used by --use_offroad_critic; the discriminator is built iff that flag is set.
     parser.add_argument("--critic_start_iter", type=int, default=3000,
-                        help="Iteration at which the adversarial term and critic updates kick in.")
+                        help="Iteration at which the adversarial term and discriminator updates kick in.")
     parser.add_argument("--critic_iters", type=int, default=1,
-                        help="Critic micro-updates per training iteration (K in WGAN-GP).")
+                        help="Discriminator updates per training iteration.")
     parser.add_argument("--lambda_adv", type=float, default=0.01,
-                        help="Weight of the adversarial (-C(fake)) term on the generator loss.")
-    parser.add_argument("--lambda_gp", type=float, default=10.0,
-                        help="WGAN-GP gradient-penalty weight.")
-    parser.add_argument("--lambda_drift", type=float, default=1e-3,
-                        help="Epsilon-drift weight: penalizes critic score magnitude "
-                             "(eps*(real^2+fake^2)) to anchor scores near 0 and prevent "
-                             "output-magnitude drift. PGGAN/Karras; typical 1e-3.")
+                        help="Weight of the non-saturating adversarial BCE term on the generator loss.")
     parser.add_argument("--lr_critic", type=float, default=1e-4)
     parser.add_argument("--critic_base_channels", type=int, default=64)
+    parser.add_argument("--critic_patch_size", type=int, default=128,
+                        help="Side length (px) of the random patches the critic sees. "
+                             "For uniformly-scattered small defects, the score shift "
+                             "from real is ~hole_density and is patch_size-invariant; "
+                             "bigger patches do NOT raise per-patch signal, only its "
+                             "smoothness. Keep modest (>=64; below that the pre-pool "
+                             "grid is too small to average meaningfully) and spend "
+                             "compute on --critic_n_patches instead.")
+    parser.add_argument("--critic_n_patches", type=int, default=8,
+                        help="Number of random patch crops per image per iteration "
+                             "(used for both real and fake batches). For small, "
+                             "scattered holes raise this rather than patch_size: "
+                             "more crop locations = more holes hit per iter and a "
+                             "less noisy W-distance estimate. 16 at ps=128 gives the "
+                             "same total FLOPs and coverage as 4 at ps=256, but with "
+                             "4x the spatial diversity.")
 
     # SplatWeaver high-frequency densification prior (arXiv 2605.07287, Eq. 5).
     parser.add_argument("--use_hf_prior", action="store_true",
@@ -1289,14 +1292,12 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_hf_loss", type=float, default=1.0,
                         help="HF amplification: per-pixel L1 weight = 1 + λ_hf · HF_norm(GT).")
 
-    # Off-path adversarial supervision (ported from train_da2loss_critic.py).
+    # Off-path adversarial supervision.
     # Trains the splats to render well from camera centres shifted off the
-    # captured trajectory (e.g. several world-units left/right). This flag
-    # is the master toggle: it builds the WGAN-GP critic and pairs
-    # (real, fake) = (on-path render, off-path render).
+    # captured trajectory (e.g. several world-units left/right).
     parser.add_argument("--use_offroad_critic", action="store_true",
                         help="Enable off-path jittered-camera adversarial supervision "
-                             "(also builds the WGAN-GP critic).")
+                             "(builds the GAN discriminator).")
     parser.add_argument("--road_width", type=float, default=0.0,
                         help="Target lateral shift of the jittered camera, in world units.")
     parser.add_argument("--road_width_init_frac", type=float, default=0.1,
@@ -1336,10 +1337,10 @@ if __name__ == "__main__":
         critic_start_iter=args.critic_start_iter,
         critic_iters=args.critic_iters,
         lambda_adv=args.lambda_adv,
-        lambda_gp=args.lambda_gp,
-        lambda_drift=args.lambda_drift,
         lr_critic=args.lr_critic,
         critic_base_channels=args.critic_base_channels,
+        critic_patch_size=args.critic_patch_size,
+        critic_n_patches=args.critic_n_patches,
         use_hf_prior=args.use_hf_prior,
         lambda_hf_loss=args.lambda_hf_loss,
         use_offroad_critic=args.use_offroad_critic,

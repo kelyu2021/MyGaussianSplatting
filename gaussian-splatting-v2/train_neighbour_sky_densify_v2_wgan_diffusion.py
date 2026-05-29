@@ -186,6 +186,21 @@ def _gradient_penalty(critic, real, fake, device):
     return ((grad.norm(2, dim=1) - 1.0) ** 2).mean()
 
 
+def _crop_random_patches(img, patch_size, n_patches):
+    """n_patches random patch_size×patch_size crops from a (C, H, W) image.
+    Returns (n_patches, C, ph, pw). Slice views preserve autograd; clamps
+    patch_size to image bounds when the image is smaller."""
+    _, H, W = img.shape
+    ph = min(patch_size, H)
+    pw = min(patch_size, W)
+    out = []
+    for _ in range(n_patches):
+        y = torch.randint(0, H - ph + 1, (1,)).item() if H > ph else 0
+        x = torch.randint(0, W - pw + 1, (1,)).item() if W > pw else 0
+        out.append(img[:, y:y + ph, x:x + pw])
+    return torch.stack(out, dim=0)
+
+
 # ----------------------------------------------------------------------
 # SplatWeaver-style high-frequency prior (arXiv 2605.07287, Eq. 5)
 # ----------------------------------------------------------------------
@@ -338,6 +353,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
              sky_sh_degree, lambda_sky_opacity, sky_lr_init, sky_lr_final,
              critic_start_iter, critic_iters, lambda_adv, lambda_gp,
              lambda_drift, lr_critic, critic_base_channels,
+             critic_patch_size, critic_n_patches,
              use_hf_prior, lambda_hf_loss,
              use_offroad_critic, road_width, road_width_init_frac,
              road_width_warmup_iters, jitter_directions, jitter_faces):
@@ -422,6 +438,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         print(f"[critic] enabled  critic_base_channels={critic_base_channels}  "
               f"critic_start_iter={critic_start_iter}  critic_iters={critic_iters}  "
               f"lambda_adv={lambda_adv}  lambda_gp={lambda_gp}  lambda_drift={lambda_drift}  lr_critic={lr_critic}")
+        print(f"[critic] patch supervision  patch_size={critic_patch_size}  "
+              f"critic_n_patches={critic_n_patches}  "
+              f"(real = random crops of one random GT photo per iter)")
     else:
         print("[critic] disabled")
 
@@ -632,7 +651,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             )
             jit_image = jit_pkg["composited"]
             critic.eval()
-            fake_score_g = critic(jit_image.unsqueeze(0))
+            fake_patches_g = _crop_random_patches(
+                jit_image, critic_patch_size, critic_n_patches)
+            fake_score_g = critic(fake_patches_g)
             loss_adv = lambda_adv * (-fake_score_g.mean())
             loss = loss + loss_adv
             loss_adv_val = loss_adv.item()
@@ -808,15 +829,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         run_critic_step = critic_active and jit_image is not None
         if run_critic_step:
             critic.train()
-            real_img_d = gt_image.detach().clamp(0.0, 1.0)
+            # Real: a random GT photo from the train set, not paired with this
+            # iter's fake. Exposes the critic to the full empirical photo
+            # distribution instead of locking it to the current view (#2).
+            real_cam = choice(train_cams)
+            real_photo = real_cam.original_image.cuda()
             fake_img_d = jit_image.detach().clamp(0.0, 1.0)
+            if real_photo.shape[-2:] != fake_img_d.shape[-2:]:
+                real_photo = F.interpolate(
+                    real_photo.unsqueeze(0), size=fake_img_d.shape[-2:],
+                    mode='bilinear', align_corners=False,
+                ).squeeze(0)
+            real_img_d = real_photo.detach().clamp(0.0, 1.0)
+            # Patch supervision (#3): crop N random patches from each side
+            # so the critic scores local texture. Random crops are sampled
+            # independently for real and fake. Many fake patches will fall on
+            # the black holes left by under-densified off-path regions; the
+            # generator-side `-C(fake_patches)` then pulls those regions
+            # toward real-photo statistics rather than toward whole-frame
+            # composition.
+            real_patches = _crop_random_patches(
+                real_img_d, critic_patch_size, critic_n_patches)
+            fake_patches = _crop_random_patches(
+                fake_img_d, critic_patch_size, critic_n_patches)
             for _ in range(max(1, critic_iters)):
-                real_score = critic(real_img_d.unsqueeze(0))
-                fake_score = critic(fake_img_d.unsqueeze(0))
+                real_score = critic(real_patches)
+                fake_score = critic(fake_patches)
                 w_dist = real_score.mean() - fake_score.mean()
                 loss_c = -w_dist
-                gp = _gradient_penalty(critic, real_img_d.unsqueeze(0),
-                                       fake_img_d.unsqueeze(0), real_img_d.device)
+                gp = _gradient_penalty(critic, real_patches, fake_patches,
+                                       real_patches.device)
                 # Epsilon-drift: anchors raw scores near 0 so the critic learns
                 # to separate real/fake instead of inflating output magnitude
                 # (PGGAN/Karras). Does not affect the input-gradient the
@@ -1281,6 +1323,22 @@ if __name__ == "__main__":
                              "output-magnitude drift. PGGAN/Karras; typical 1e-3.")
     parser.add_argument("--lr_critic", type=float, default=1e-4)
     parser.add_argument("--critic_base_channels", type=int, default=64)
+    parser.add_argument("--critic_patch_size", type=int, default=128,
+                        help="Side length (px) of the random patches the critic sees. "
+                             "For uniformly-scattered small defects, the score shift "
+                             "from real is ~hole_density and is patch_size-invariant; "
+                             "bigger patches do NOT raise per-patch signal, only its "
+                             "smoothness. Keep modest (>=64; below that the pre-pool "
+                             "grid is too small to average meaningfully) and spend "
+                             "compute on --critic_n_patches instead.")
+    parser.add_argument("--critic_n_patches", type=int, default=8,
+                        help="Number of random patch crops per image per iteration "
+                             "(used for both real and fake batches). For small, "
+                             "scattered holes raise this rather than patch_size: "
+                             "more crop locations = more holes hit per iter and a "
+                             "less noisy W-distance estimate. 16 at ps=128 gives the "
+                             "same total FLOPs and coverage as 4 at ps=256, but with "
+                             "4x the spatial diversity.")
 
     # SplatWeaver high-frequency densification prior (arXiv 2605.07287, Eq. 5).
     parser.add_argument("--use_hf_prior", action="store_true",
@@ -1340,6 +1398,8 @@ if __name__ == "__main__":
         lambda_drift=args.lambda_drift,
         lr_critic=args.lr_critic,
         critic_base_channels=args.critic_base_channels,
+        critic_patch_size=args.critic_patch_size,
+        critic_n_patches=args.critic_n_patches,
         use_hf_prior=args.use_hf_prior,
         lambda_hf_loss=args.lambda_hf_loss,
         use_offroad_critic=args.use_offroad_critic,
