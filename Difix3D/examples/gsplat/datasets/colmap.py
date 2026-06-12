@@ -179,8 +179,20 @@ class Parser:
         else:
             colmap_files = sorted(_get_rel_paths(colmap_image_dir))
             image_files = sorted(_get_rel_paths(image_dir))
-            colmap_to_image = dict(zip(colmap_files, image_files))
-            image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+            # Build mapping from original (unprefixed) name -> actual filename.
+            # Handles image_train_/image_eval_ prefixes added after COLMAP was run.
+            def _strip_split_prefix(name):
+                for pfx in ("image_train_", "image_eval_"):
+                    if name.startswith(pfx):
+                        return name[len(pfx):]
+                return name
+            strip_to_image = {_strip_split_prefix(f): f for f in image_files}
+            if all(_strip_split_prefix(f) in strip_to_image for f in colmap_files):
+                # renamed dataset: look up by stripped name
+                image_paths = [os.path.join(image_dir, strip_to_image[f]) for f in image_names]
+            else:
+                colmap_to_image = dict(zip(colmap_files, image_files))
+                image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -333,7 +345,16 @@ class Dataset:
         
         indices = np.arange(len(self.parser.image_names))
         if self.parser.test_every == 1:
-            image_names = sorted(_get_rel_paths(f"{self.parser.data_dir}/images"), key=lambda x: int(x.split(".")[0].split("_")[-1]))
+            # Filename-based split using image_train_/image_eval_ prefix.
+            # Sort the directory listing by the same key as parser.image_names
+            # (which is alphabetical on the COLMAP-recorded original names),
+            # by stripping any image_train_/image_eval_ prefix.
+            def _strip(name):
+                for pfx in ("image_train_", "image_eval_"):
+                    if name.startswith(pfx):
+                        return name[len(pfx):]
+                return name
+            image_names = sorted(_get_rel_paths(f"{self.parser.data_dir}/images"), key=_strip)
             assert len(image_names) == len(self.parser.image_names)
             if split == "train":
                 self.indices = [ind for ind in indices if "_train_" in image_names[ind]]
@@ -342,10 +363,11 @@ class Dataset:
         elif self.parser.test_every == 0:
             self.indices = indices
         else:
+            # Standard: every N-th image is held out for eval, the rest is training.
             if split == "train":
-                self.indices = indices[indices % self.parser.test_every == 0]
-            else:
                 self.indices = indices[indices % self.parser.test_every != 0]
+            else:
+                self.indices = indices[indices % self.parser.test_every == 0]
 
     def __len__(self):
         return len(self.indices)

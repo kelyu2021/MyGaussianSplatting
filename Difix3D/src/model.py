@@ -14,9 +14,10 @@ sys.path.append(p)
 from einops import rearrange, repeat
 
 
-def make_1step_sched():
+def make_1step_sched(timestep=999):
     noise_scheduler_1step = DDPMScheduler.from_pretrained("stabilityai/sd-turbo", subfolder="scheduler")
-    noise_scheduler_1step.set_timesteps(1, device="cuda")
+    # set_timesteps with explicit list so step() can resolve previous_timestep (diffusers>=0.27)
+    noise_scheduler_1step.set_timesteps(timesteps=[timestep], device="cuda")
     noise_scheduler_1step.alphas_cumprod = noise_scheduler_1step.alphas_cumprod.cuda()
     return noise_scheduler_1step
 
@@ -118,7 +119,7 @@ class Difix(torch.nn.Module):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").cuda()
-        self.sched = make_1step_sched()
+        self.sched = make_1step_sched(timestep)
 
         vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
